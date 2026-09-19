@@ -1,0 +1,18 @@
+[Desktop Entry]
+Name=GB4ME
+GenericName=Game Boy Color Emulator
+Comment=Visually accurate Game Boy / Game Boy Color emulator — DMG + CGB, banked VRAM/WRAM, HDMA, double-speed
+Exec=GB4ME %f
+Icon=GB4ME
+Terminal=false
+Type=Application
+Categories=Game;Emulator;
+Keywords=Game Boy;Game Boy Color;GB;GBC;Emulator;Nintendo;CGB;DMG;
+MimeType=application/x-gameboy-rom;application/x-gameboy-color-rom;
+StartupWMClass=GB4ME
+StartupNotify=true
+Actions=Play;
+
+[Desktop Action Play]
+Name=Open ROM…
+Exec=GB4ME

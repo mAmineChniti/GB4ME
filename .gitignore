@@ -1,0 +1,79 @@
+# === Build ===
+build/
+bin/
+out/
+dist/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.d
+*.su
+*.slo
+*.lo
+*.o.d
+compile_commands.json
+.cmake/
+_deps/
+
+# Shader compiled output (keep sources)
+*.spv
+
+# === Emulator runtime ===
+*.sav
+*.state
+*.log
+*.wav
+*.pcap
+
+# ROMs - uncomment to ignore copyrighted dumps (currently tracked for dev)
+# *.gb
+# *.gbc
+# *.gba
+
+# === IDE / OS ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.ccls-cache/
+.clangd/
+.cache/
+.cache
+*.code-workspace
+
+# === Python / misc generated ===
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# === Dependencies ===
+conan.lock
+vcpkg_installed/
+conanbuildinfo.*
+conaninfo.txt
+graphInfo.json
+
+# Testing
+test_*
+my_project/

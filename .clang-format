@@ -1,0 +1,12 @@
+---
+Language: Cpp
+Standard: C++17
+IndentWidth: 4
+UseTab: ForContinuationAndIndentation
+TabWidth: 4
+ColumnLimit: 100
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+BreakBeforeBraces: Linux
+SpaceAfterCStyleCast: true
+Cpp11BracedListStyle: true
