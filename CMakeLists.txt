@@ -32,6 +32,11 @@ target_compile_options(${PROJECT_NAME} PRIVATE ${SDL3_CFLAGS_OTHER})
 # Installation — only binary; desktop/icon/shaders/assets handled by PKGBUILD
 install(TARGETS ${PROJECT_NAME} DESTINATION bin)
 
+# GBA unit tests (self-contained, no external framework).
+include(CTest)
+enable_testing()
+add_subdirectory(tests)
+
 # Compile GLSL shaders to SPIR-V with glslc.
 find_program(GLSLC glslc)
 file(MAKE_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders)

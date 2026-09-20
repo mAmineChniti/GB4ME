@@ -56,6 +56,7 @@ public:
         std::string title;
         std::string path;
         bool cgb = false;
+        bool gba = false; // GBA image (routed to the GBA core, Phases 2+ execute)
     };
 
     enum class SettingsTab : u8 { General = 0, Inputs = 1 };

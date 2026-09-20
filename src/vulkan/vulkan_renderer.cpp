@@ -1328,9 +1328,10 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole& gui) {
             // Cell background
             push_rect(cx, cy, cw, ch, sel ? 0xFF3A3A8F : 0xFF22252B, 3.0f);
             if (sel) push_rect(cx + 1, cy + 1, cw - 2, ch - 2, 0xFF2E3190, 3.0f);
-            // CGB/DMG badge — top-right inside cell
-            const std::string badge = roms[static_cast<size_t>(i)].cgb ? "CGB" : "DMG";
-            const u32 bcol = roms[static_cast<size_t>(i)].cgb ? 0xFF3FA06B : 0xFF5A5A5A;
+            // System badge — top-right inside cell
+            const auto& rom = roms[static_cast<size_t>(i)];
+            const std::string badge = rom.gba ? "GBA" : (rom.cgb ? "CGB" : "DMG");
+            const u32 bcol = rom.gba ? 0xFF4F7FFF : (rom.cgb ? 0xFF3FA06B : 0xFF5A5A5A);
             const float bx = cx + cw - badge_w - 4;
             const float by = cy + 4;
             push_rect(bx - 2, by, badge_w, badge_h, bcol, 2.0f);

@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
     if (!list_folder.empty()) {
         for (const auto& e : gb::GameBoy::scan_rom_folder(list_folder)) {
             std::printf("%s | %s | %s\n", e.title.c_str(), e.path.c_str(),
-                        e.cgb ? "CGB" : "DMG");
+                        e.gba ? "GBA" : (e.cgb ? "CGB" : "DMG"));
         }
         return 0;
     }

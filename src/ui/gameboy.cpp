@@ -2,6 +2,7 @@
 // https://github.com/aquova/gb-book (SDL frontend chapter)
 
 #include "gb/gameboy.h"
+#include "gba/cartridge.h"
 #include "stb_image.h"
 #include <algorithm>
 #include <cctype>
@@ -97,7 +98,16 @@ bool GameBoy::load_rom(const std::string& rom_path) {
     {
         Cartridge probe;
         if (!probe.load(rom_path)) {
-            SDL_Log("load_rom: not a supported GB ROM: %s", rom_path.c_str());
+            // Content-based GBA routing (extension is only a hint): GB
+            // validation rejects GBA images, so probe the GBA header next.
+            gba::Cartridge gba_probe;
+            if (gba_probe.load(rom_path)) {
+                SDL_Log("load_rom: GBA ROM detected ('%s') — GBA execution "
+                        "lands after Phase 2+ (Phase 1 skeleton only)",
+                        rom_path.c_str());
+            } else {
+                SDL_Log("load_rom: not a supported ROM: %s", rom_path.c_str());
+            }
             return false;
         }
     }
@@ -392,7 +402,23 @@ std::vector<GUIConsole::RomEntry> GameBoy::scan_rom_folder(const std::string& fo
             std::string ext = entry.path().extension().string();
             std::transform(ext.begin(), ext.end(), ext.begin(),
                            [](unsigned char c) { return std::tolower(c); });
-            if (ext != ".gb" && ext != ".gbc") continue;
+            if (ext != ".gb" && ext != ".gbc" && ext != ".gba") continue;
+            if (ext == ".gba") {
+                // GBA images validate against the GBA header (fixed byte +
+                // complement check); the GB probe below would reject them.
+                gba::Cartridge gba_probe;
+                if (!gba_probe.load(entry.path().string())) continue;
+                GUIConsole::RomEntry r;
+                r.path = entry.path().string();
+                std::string t = gba_probe.title();
+                if (t.empty()) t = pretty_from_stem(entry.path().stem().string());
+                if (t.empty()) t = entry.path().stem().string();
+                r.title = t;
+                r.cgb = false;
+                r.gba = true;
+                entries.push_back(std::move(r));
+                continue;
+            }
             Cartridge probe;
             if (!probe.load(entry.path().string())) continue;
             GUIConsole::RomEntry r;
