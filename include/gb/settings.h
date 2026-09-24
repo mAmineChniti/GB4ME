@@ -3,7 +3,8 @@
 #include "types.h"
 #include <string>
 
-namespace gb {
+namespace gb
+{
 struct Settings;
 // Simple persistence without external JSON lib (avoids glaze dependency for now)
 // Stored as tiny key=value text file at ~/.config/GB4ME/settings.cfg
