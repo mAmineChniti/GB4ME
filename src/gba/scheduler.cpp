@@ -2,30 +2,54 @@
 
 #include "gba/scheduler.h"
 
-namespace gba {
+namespace gba
+{
 
-GbaScheduler::GbaScheduler() {
-    reset();
+GbaScheduler::GbaScheduler()
+{
+	reset();
 }
 
-void GbaScheduler::reset() {
-    now_ = 0;
-    seq_ = 0;
-    queue_ = decltype(queue_)();
+void GbaScheduler::reset()
+{
+	now_ = 0;
+	seq_ = 0;
+	queue_ = decltype(queue_)();
 }
 
-void GbaScheduler::schedule(u64 delay, Callback cb) {
-    queue_.push(Event{now_ + delay, seq_++, std::move(cb)});
+void GbaScheduler::schedule(u64 delay, Callback cb)
+{
+	queue_.push(Event{now_ + delay, seq_++, std::move(cb)});
 }
 
-void GbaScheduler::step(u64 target) {
-    while (!queue_.empty() && queue_.top().tick <= target) {
-        Event ev = queue_.top();
-        queue_.pop();
-        now_ = ev.tick;
-        ev.cb();
-    }
-    now_ = target;
+void GbaScheduler::step(u64 target)
+{
+	while (!queue_.empty() && queue_.top().tick <= target) {
+		Event ev = queue_.top();
+		queue_.pop();
+		now_ = ev.tick;
+		ev.cb();
+	}
+	now_ = target;
+}
+
+void GbaScheduler::save(StateBuffer &out) const
+{
+	out.write(now_);
+	out.write(seq_);
+	// Event queue is intentionally not serialized: callbacks are
+	// type-erased std::functions and cannot round-trip. This is safe
+	// today because the scheduler has no in-tree producers (the core
+	// drives timers/PPU/audio by direct step() calls); a producer must
+	// either re-schedule from serialized device state on load or make
+	// events serializable before relying on save states across waits.
+}
+
+void GbaScheduler::load(const StateBuffer &in)
+{
+	in.read(now_);
+	in.read(seq_);
+	queue_ = decltype(queue_)();
 }
 
 } // namespace gba

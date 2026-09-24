@@ -38,9 +38,14 @@ _deps/
 *.pcap
 
 # ROMs - uncomment to ignore copyrighted dumps (currently tracked for dev)
-# *.gb
-# *.gbc
-# *.gba
+*.gb
+*.gbc
+*.gba
+
+# === Aider & AI tools ===
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v4/
 
 # === IDE / OS ===
 .vscode/
@@ -77,3 +82,6 @@ graphInfo.json
 # Testing
 test_*
 my_project/
+
+# Local third-party reference copies (re-fetchable, never committed)
+docs/references/
