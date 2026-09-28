@@ -138,12 +138,10 @@ void GbaDma::transfer(unsigned ch, bool fifo)
 	// significant (GBATEK "Using DMA"). SRAM transfers run through the
 	// bus like any other region (slow 8-bit timing via accessCycles).
 	while (units != 0) {
-		const bool e_dst =
-			!fifo && bus_->eepromActive() && (c.dst >> 24) == 0x0Du;
-		const bool e_src =
-			!fifo && bus_->eepromActive() && (c.src >> 24) == 0x0Du;
+		const bool e_dst = !fifo && bus_->eepromActive() && (c.dst >> 24) == 0x0Du;
+		const bool e_src = !fifo && bus_->eepromActive() && (c.src >> 24) == 0x0Du;
 		if (wide) {
-			u32 v;
+			u32 v = 0;
 			if (e_src) {
 				// Decomposed 32-bit source: two serial bits.
 				const u16 lo = bus_->eepromDmaRead();
@@ -166,7 +164,7 @@ void GbaDma::transfer(unsigned ch, bool fifo)
 				pending_cycles_ += bus_->accessCycles(c.dst, 4, seq);
 			}
 		} else {
-			u16 v;
+			u16 v = 0;
 			if (e_src) {
 				v = bus_->eepromDmaRead();
 				pending_cycles_ += bus_->accessCycles(c.src, 2, seq);

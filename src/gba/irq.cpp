@@ -1,8 +1,10 @@
 // GBA interrupt controller: level-triggered IRQ delivery.
 
 #include "gba/irq.h"
+
 #include "gba/bus.h"
 #include "gba/cpu.h"
+#include "gba/scheduler.h"
 #include <cstdio>
 #include <cstdlib>
 
@@ -19,6 +21,8 @@ void GbaIrq::reset()
 	ie_ = 0;
 	if_ = 0;
 	ime_ = 0;
+	delay_armed_ = false;
+	deliveries_ = 0;
 #ifndef GB4ME_RELEASE
 	trace_ = std::getenv("GB4ME_IRQ_TRACE") != nullptr;
 #endif
@@ -47,7 +51,35 @@ void GbaIrq::writeIme(u16 v)
 void GbaIrq::raise(u16 mask)
 {
 	if_ |= mask & 0x3FFFu;
-	update();
+	// The flag is live now; the CPU sees it kIrqDelay cycles later. With no
+	// scheduler (unit tests, headless bring-up) that collapses to "now",
+	// which is what it always was.
+	if (scheduler_ == nullptr || delay_armed_) {
+		update();
+		return;
+	}
+	delay_armed_ = true;
+	scheduler_->schedule(kIrqDelay, [this] {
+		delay_armed_ = false;
+		// Re-check IE/IME at the deadline: a source that is masked (or IME
+		// cleared) by then simply stays latched, and enabling it later
+		// delivers through the normal writeIe/writeIme path.
+		update();
+	});
+}
+
+void GbaIrq::rearmPending()
+{
+	// Only meaningful when a flag is set but the deferred delivery was lost
+	// with the (unserialized) scheduler queue. Re-scheduling the full delay
+	// is safe: it is at most two cycles.
+	if (!delay_armed_ || scheduler_ == nullptr)
+		return;
+	delay_armed_ = true;
+	scheduler_->schedule(kIrqDelay, [this] {
+		delay_armed_ = false;
+		update();
+	});
 }
 
 void GbaIrq::tick(u64 cycles)
@@ -60,6 +92,7 @@ void GbaIrq::update()
 	if (cpu_ == nullptr)
 		return;
 	if (ime_ != 0 && (ie_ & if_) != 0) {
+		++deliveries_;
 #ifndef GB4ME_RELEASE
 		if (trace_) {
 			const u32 handler = cpu_->bus() != nullptr ? cpu_->bus()->read32(0x03007FFCu) : 0;
@@ -75,6 +108,9 @@ void GbaIrq::update()
 
 void GbaIrq::save(StateBuffer &out) const
 {
+	// delay_armed_ is part of the state even though the callback is not: the
+	// loader re-arms it from this flag (see rearmPending).
+	out.write(delay_armed_);
 	out.write(ie_);
 	out.write(if_);
 	out.write(ime_);
@@ -82,6 +118,9 @@ void GbaIrq::save(StateBuffer &out) const
 
 void GbaIrq::load(const StateBuffer &in)
 {
+	if (!in.read(delay_armed_))
+		delay_armed_ = false; // Older states: no deferred delivery in flight.
+	deliveries_ = 0;
 	in.read(ie_);
 	in.read(if_);
 	in.read(ime_);

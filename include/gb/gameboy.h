@@ -1,6 +1,7 @@
 #pragma once
 
 #include "apu.h"
+#include "audio_sync.h"
 #include "cartridge.h"
 #include "cpu.h"
 #include "gba/core.h"
@@ -11,6 +12,7 @@
 #include "timer.h"
 #include "types.h"
 #include "vulkan_renderer.h"
+
 #include <SDL3/SDL.h>
 
 #include "gb/input.h"
@@ -78,7 +80,34 @@ class GameBoy
 	bool running = false;
 	bool paused = false;
 	bool rom_loaded_ = false;
+	// Fast-forward (hold Tab): skip frame pacing. Env GB4ME_FASTFORWARD
+	// forces it on (headless verification); never drives the game.
+	bool ff_held_ = false;
+	bool ff_env_ = false;
+	bool fast_forward() const
+	{
+		return ff_held_ || ff_env_;
+	}
 	u64 frame_count = 0;
+	// Audio-clock pacing (include/gb/audio_sync.h) plus the per-frame
+	// watermark that turns the cores' cumulative frame counters into a
+	// per-frame delta.
+	AudioSync audio_sync_{};
+	u64 audio_produced_ = 0;
+	u32 produced_audio();
+	int queued_audio() const;
+	// Rumble passthrough: the motor bit comes from the cartridge (MBC5
+	// bit 3), the effect is played on the first open gamepad. Best-effort -
+	// a pad with no rumble support just stays silent.
+	SDL_Gamepad *rumble_pad_ = nullptr;
+	bool rumble_on_ = false;
+	void open_rumble();
+	void update_rumble();
+	void stop_rumble();
+	// Emulated-cycle accounting for the debug overlay: T-cycles actually
+	// executed and the wall-clock second they were measured over.
+	u64 emu_tcycles_ = 0;
+	double emu_window_t_ = 0.0;
 	f64 last_time = 0.0;
 	u32 target_frame_time_ms = 16;
 	std::string last_rom_path_;
@@ -100,6 +129,13 @@ class GameBoy
 	void sync_input_from_settings();
 	// Push the upscaling settings (scale / filter / LCD grid) into the renderer.
 	void apply_video_settings();
+	// The same push, plus volume and the DMG palette, into both cores - the
+	// per-game overlay changes those too, and they are read once at load.
+	void push_display_settings();
+	void apply_game_override_to_systems();
+	// Drops the `<rom>.cfg` overlay when the user opens the settings panel,
+	// so panel edits are global instead of being overwritten on next load.
+	void leave_game_override();
 	// Names of the connected controllers, for the Inputs device dropdown.
 	std::vector<std::string> controller_names_;
 	// Rebuilds that list from the currently connected pads.
@@ -109,6 +145,8 @@ class GameBoy
 	// Persists the running game's battery save (GB SRAM or GBA flash/EEPROM)
 	// next to last_rom_path_. No-op when nothing is loaded.
 	void flush_active_save();
+	// Pushes the debug readout into the ImGui overlay (no-op when hidden).
+	void push_imgui_stats();
 	// Env-gated event tracer (GB4ME_INPUT_TRACE, Phase 7 diagnostics like
 	// the IRQ/DMA/IO traces): logs mouse/key dispositions so dead input
 	// can be told apart from missed hit-tests.

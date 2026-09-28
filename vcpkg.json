@@ -1,0 +1,35 @@
+{
+  "name": "gb4me",
+  "version-string": "0.1.0",
+  "description": "Game Boy / Game Boy Color / Game Boy Advance emulator in C++23 with SDL3 and Vulkan",
+  "homepage": "https://github.com/mAmineChniti/GB4ME",
+  "dependencies": [
+    {
+      "name": "sdl3",
+      "default-features": false
+    },
+    {
+      "name": "vulkan",
+      "default-features": false
+    },
+    {
+      "name": "glslang",
+      "default-features": false
+    },
+    "imgui"
+  ],
+  "features": {
+    "gui-tests": {
+      "description": "Build the Dear ImGui panels",
+      "dependencies": [
+        {
+          "name": "imgui",
+          "default-features": false,
+          "features": [
+            "docking-experimental"
+          ]
+        }
+      ]
+    }
+  }
+}

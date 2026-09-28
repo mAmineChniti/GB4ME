@@ -3,6 +3,8 @@
 
 #include "gba/ppu.h"
 
+#include "gba/scheduler.h"
+
 #include "gba/dma.h"
 #include "gba/irq.h"
 
@@ -139,11 +141,10 @@ u16 GbaPpu::readIo(u32 addr) const
 	case 0x0400000Cu:
 	case 0x0400000Eu:
 		return bgcnt_[(addr - 0x04000008u) / 2];
-	case 0x04000010u:
+	case 0x04000010u: // Write-only scroll offsets read back open bus...
 	case 0x04000014u:
 	case 0x04000018u:
 	case 0x0400001Cu:
-		return 0xFFFF; // Write-only scroll offsets read back open.
 	case 0x04000020u:
 	case 0x04000022u:
 	case 0x04000024u:
@@ -184,8 +185,8 @@ u16 GbaPpu::readIo(u32 addr) const
 		return bldcnt_;
 	case 0x04000052u:
 		return bldalpha_;
-	case 0x04000054u:
-		return 0xFFFF; // Write-only brightness.
+	case 0x04000054u: // Write-only brightness.
+					  // ...and so does everything unmapped: one open-bus answer for both.
 	default:
 		return 0xFFFF;
 	}
@@ -426,24 +427,67 @@ void GbaPpu::endLine()
 	}
 }
 
+void GbaPpu::armNextEvent()
+{
+	if (scheduler_ == nullptr || event_armed_)
+		return;
+	// Distance from the last boundary we have already applied to the next
+	// one: mid-draw that is the rest of the draw period, mid-HBlank the rest
+	// of the blank period.
+	const unsigned left = hblank_ ? (kDotsPerLine - kDrawEnd) : kDrawEnd;
+	if (left == 0) {
+		// Should not happen (the boundaries are applied by the event that
+		// reaches them), but never spin: apply it inline.
+		if (hblank_)
+			endLine();
+		else
+			enterHBlank();
+		return;
+	}
+	event_armed_ = true;
+	if (hblank_)
+		scheduler_->schedule(left, [this] { onLineEndEvent(); });
+	else
+		scheduler_->schedule(left, [this] { onHBlankEvent(); });
+}
+
+void GbaPpu::rearmEvents()
+{
+	// A save state restores the PPU but not the scheduler's queue (the
+	// callbacks are type-erased), so the next point has to be re-scheduled
+	// from the restored line/hblank position.
+	event_armed_ = false;
+	armNextEvent();
+}
+
+void GbaPpu::onHBlankEvent()
+{
+	event_armed_ = false;
+	// line_cycles_ is the dot position within the segment the event ends, so
+	// the renderers and the save state keep seeing the same numbers as the
+	// old polling code.
+	line_cycles_ = kDrawEnd;
+	enterHBlank();
+	armNextEvent();
+}
+
+void GbaPpu::onLineEndEvent()
+{
+	event_armed_ = false;
+	line_cycles_ = 0;
+	endLine();
+	armNextEvent();
+}
+
 void GbaPpu::step(u32 cycles)
 {
-	line_cycles_ += cycles;
-	while (true) {
-		if (!hblank_ && line_cycles_ >= kDrawEnd) {
-			// Draw portion finished: render, then count the remainder
-			// inside the blank period.
-			line_cycles_ -= kDrawEnd;
-			enterHBlank();
-			continue;
-		}
-		if (hblank_ && line_cycles_ >= (kDotsPerLine - kDrawEnd)) {
-			line_cycles_ -= (kDotsPerLine - kDrawEnd);
-			endLine();
-			continue;
-		}
-		break;
-	}
+	// The dot counter is owned by the events now: step() only makes sure a
+	// point is scheduled (the core arms the first one on reset, and a save
+	// state load re-arms through rearmEvents()). Keeping the old "advance
+	// until a boundary" loop here as well would double-apply every
+	// boundary.
+	(void) cycles;
+	armNextEvent();
 }
 
 u32 GbaPpu::rgb555(u16 c)

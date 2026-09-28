@@ -145,7 +145,7 @@ void HleBios::intrWait(u32 r0, u32 r1, Arm7Tdmi &cpu, GbaBus &bus)
 	// set (clearing it in [0x3007FF8]), r0=1 discards old flags first.
 	// CPSR.I and IME are don't-care for the wait itself.
 	bus.write16(0x04000208, 1); // IME.
-	
+
 	const u16 mask = static_cast<u16>(r1 & 0xFFFFu);
 	u16 flags = bus.read16(kIrqFlagsAddr);
 	if (r0 == 0) {

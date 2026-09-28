@@ -2,6 +2,7 @@
 
 #include "gb/types.h"
 #include <algorithm>
+#include <cstring>
 #include <iterator>
 #include <type_traits>
 #include <vector>
@@ -15,6 +16,8 @@ class StateBuffer
 	template <typename T> void write(const T &value) const
 	{
 		static_assert(std::is_trivially_copyable_v<T>, "Only trivially copyable types supported");
+		// memcpy, not std::copy: the reinterpret_cast pointer form makes
+		// GCC emit a bogus -Warray-bounds in sanitizer builds.
 		const u8 *bytes = reinterpret_cast<const u8 *>(&value);
 		data_.insert(data_.end(), bytes, bytes + sizeof(T));
 	}
@@ -24,8 +27,7 @@ class StateBuffer
 		static_assert(std::is_trivially_copyable_v<T>, "Only trivially copyable types supported");
 		if (pos_ + sizeof(T) > data_.size())
 			return false;
-		std::copy(data_.begin() + pos_, data_.begin() + pos_ + sizeof(T),
-				  reinterpret_cast<u8 *>(&out));
+		std::memcpy(&out, data_.data() + pos_, sizeof(T));
 		pos_ += sizeof(T);
 		return true;
 	}
@@ -39,7 +41,7 @@ class StateBuffer
 	{
 		if (pos_ + len > data_.size())
 			return false;
-		std::copy(data_.begin() + pos_, data_.begin() + pos_ + len, dst);
+		std::memcpy(dst, data_.data() + pos_, len);
 		pos_ += len;
 		return true;
 	}
@@ -82,6 +84,6 @@ class StateBuffer
 };
 
 constexpr u32 kStateMagic = 0x47423453; // "GB4S"
-constexpr u32 kStateVersion = 2; // v2 adds cartridge GPIO/RTC state.
+constexpr u32 kStateVersion = 2;        // v2 adds cartridge GPIO/RTC state.
 
 } // namespace gba

@@ -71,7 +71,7 @@ HleBios::Outcome HleBios::math(u8 num, Arm7Tdmi &cpu, GbaBus &bus)
 			(num == kDiv) ? static_cast<i32>(cpu.reg(0)) : static_cast<i32>(cpu.reg(1));
 		const i32 denom =
 			(num == kDiv) ? static_cast<i32>(cpu.reg(1)) : static_cast<i32>(cpu.reg(0));
-		u32 cycles;
+		u32 cycles = 0;
 		if (denom == 0) {
 			// Real BIOS hangs for |num|>1; HLE returns the
 			// sign/remainder contract instead (documented).
@@ -100,8 +100,8 @@ HleBios::Outcome HleBios::math(u8 num, Arm7Tdmi &cpu, GbaBus &bus)
 	case kSqrt: {
 		// Integer square root (mGBA-compatible).
 		const u32 x = cpu.reg(0);
-		u32 cycles;
-		u32 result;
+		u32 cycles = 0;
+		u32 result = 0;
 		if (x == 0) {
 			result = 0;
 			cycles = 53;
@@ -196,7 +196,7 @@ HleBios::Outcome HleBios::math(u8 num, Arm7Tdmi &cpu, GbaBus &bus)
 		const i32 x = static_cast<i32>(cpu.reg(0));
 		const i32 y = static_cast<i32>(cpu.reg(1));
 		u32 cycles = 11;
-		u32 out;
+		u32 out = 0;
 		i32 r1 = 0;
 		if (y == 0) {
 			out = (x >= 0) ? 0u : 0x8000u;

@@ -20,13 +20,19 @@ void Timer::reset()
 	tima_ = 0;
 	tma_ = 0;
 	tac_ = 0;
+	div_frozen_ = false;
+	double_speed_ = false;
 }
 
 void Timer::step(u32 mcycles)
 {
-	// GBC: T-cycles here scale with double_speed (KEY1); M-cycle counts from
-	// the CPU stay the same, so this loop is GBC-safe as written.
-	for (u32 i = 0; i < mcycles * 4; i++) {
+	// CGB STOP speed-switch stall: DIV (and TIMA with it) does not tick.
+	if (div_frozen_)
+		return;
+	// CGB double-speed: the divider advances twice per M-cycle (2x T rate),
+	// so DIV/TIMA run at double wall-rate while PPU/APU stay fixed.
+	const u32 scale = double_speed_ ? 8 : 4;
+	for (u32 i = 0; i < mcycles * scale; i++) {
 		const u16 prev = div_counter_;
 		div_counter_++;
 		static constexpr int kBits[4] = {9, 3, 5, 7};

@@ -19,10 +19,6 @@ namespace gb
 namespace
 {
 
-// Register index tables for the y/z decode fields.
-// Order: B, C, D, E, H, L, (HL), A.
-constexpr u8 kUnused = 0xFF;
-
 } // namespace
 
 CPU::CPU()
@@ -55,6 +51,10 @@ void CPU::reset(HardwareMode mode)
 	regs.pc = 0x0100;
 	ime = false;
 	ei_delay_ = false;
+	halt_bug_ = false;
+	if (mmu_)
+		mmu_->set_div_frozen(false);
+	speed_stall_ = 0;
 	halted = false;
 	stopped = false;
 	cycles = 0;
@@ -66,6 +66,10 @@ void CPU::reset(HardwareMode mode)
 
 u8 CPU::fetch()
 {
+	if (halt_bug_) {
+		halt_bug_ = false;
+		return mmu_->read(regs.pc); // Bug: PC fails to increment once.
+	}
 	return mmu_->read(regs.pc++);
 }
 
@@ -467,6 +471,19 @@ void CPU::service_interrupts()
 
 u32 CPU::step()
 {
+	if (speed_stall_ > 0) {
+		// CGB STOP speed-switch freeze (Pan Docs KEY1): the CPU is stopped
+		// for 2050 M-cycles (= 8200 T); DIV does not tick while stalled.
+		// Components still advance via the caller's per-M stepping.
+		if (mmu_)
+			mmu_->set_div_frozen(true);
+		speed_stall_--;
+		if (speed_stall_ == 0 && mmu_)
+			mmu_->set_div_frozen(false);
+		cycles += 1;
+		cycles_last_instruction = 1;
+		return 1;
+	}
 	if (halted) {
 		u8 pending = mmu_->read_ie() & (mmu_->read_if() & 0x1F);
 		if (pending == 0) {
@@ -475,8 +492,8 @@ u32 CPU::step()
 			return 1;
 		}
 		halted = false;
-		// NOTE: HALT bug (no IME + pending) quirks not emulated; DMG games
-		// and Blargg tests do not depend on it.
+		// HALT exit with IME=0: run next instruction without servicing.
+		// https://gbdev.io/pandocs/Interrupts.html
 		if (!ime) {
 			u8 opcode = fetch();
 			execute(opcode);
@@ -564,6 +581,9 @@ void CPU::execute(u8 opcode)
 				(void) stop_param; // consume 0x00
 				if (mmu_ && mmu_->is_cgb() && mmu_->prepare_speed_switch()) {
 					mmu_->do_speed_switch(this);
+					// Pan Docs KEY1: the CPU stops for 2050 M-cycles after
+					// the `stop` instruction (DIV frozen; drained in step()).
+					speed_stall_ = 2050;
 					cycles_last_instruction = 1;
 					return;
 				}
@@ -670,7 +690,7 @@ void CPU::execute(u8 opcode)
 			return;
 		}
 		case 3: { // INC rr / DEC rr (2).
-			u16 v;
+			u16 v = 0;
 			switch (p) {
 			case 0:
 				v = regs.bc();
@@ -768,7 +788,15 @@ void CPU::execute(u8 opcode)
 	}
 	case 1: {
 		if (opcode == 0x76) { // HALT
-			halted = true;
+			// HALT bug: IME=0 with pending interrupt -> don't halt,
+			// next fetch fails to increment PC.
+			// https://gbdev.io/pandocs/halt.html#halt-bug
+			if (!ime && (mmu_->read_ie() & (mmu_->read_if() & 0x1F)) != 0) {
+				halt_bug_ = true;
+				halted = false;
+			} else {
+				halted = true;
+			}
 			cycles_last_instruction = 1;
 			return;
 		}
@@ -788,32 +816,7 @@ void CPU::execute(u8 opcode)
 	case 2: {
 		// ALU[y] r[z]: ADD ADC SUB SBC AND XOR OR CP.
 		u8 v = (z == 6) ? read8(regs.hl()) : *r8[z];
-		switch (y) {
-		case 0:
-			add_a(v);
-			break;
-		case 1:
-			adc_a(v);
-			break;
-		case 2:
-			sub_a(v);
-			break;
-		case 3:
-			sbc_a(v);
-			break;
-		case 4:
-			and_a(v);
-			break;
-		case 5:
-			xor_a(v);
-			break;
-		case 6:
-			or_a(v);
-			break;
-		case 7:
-			cp_a(v);
-			break;
-		}
+		(this->*kAlu[y])(v);
 		cycles_last_instruction = (z == 6) ? 2 : 1;
 		return;
 	}
@@ -1077,33 +1080,7 @@ void CPU::execute_cb(u8 opcode)
 	switch (x) {
 	case 0: { // Rotates/shifts, y selects operation.
 		u8 v = is_hl ? read8(regs.hl()) : *r8[z];
-		u8 r = 0;
-		switch (y) {
-		case 0:
-			r = op_rlc(v);
-			break;
-		case 1:
-			r = op_rrc(v);
-			break;
-		case 2:
-			r = op_rl(v);
-			break;
-		case 3:
-			r = op_rr(v);
-			break;
-		case 4:
-			r = op_sla(v);
-			break;
-		case 5:
-			r = op_sra(v);
-			break;
-		case 6:
-			r = op_swap(v);
-			break;
-		default:
-			r = op_srl(v);
-			break;
-		}
+		u8 r = (this->*kRot[y])(v);
 		if (is_hl)
 			write8(regs.hl(), r);
 		else

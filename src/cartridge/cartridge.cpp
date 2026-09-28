@@ -4,6 +4,8 @@
 // https://gbdev.io/pandocs/MBCs.html
 
 #include "gb/cartridge.h"
+#include <cstdio>
+#include <ctime>
 #include <fstream>
 
 namespace gb
@@ -227,13 +229,13 @@ u8 MBC2::raw_read(u32 bank, u16 addr) const
 {
 	// MBC2 RAM is 512 x 4-bit cells stored in the low nibble. The 512-byte
 	// .sav format keeps one byte per cell, upper nibble unused.
-	(void)bank;
+	(void) bank;
 	return addr < 0x200 ? ram_[addr] : 0x0F;
 }
 
 void MBC2::raw_write(u32 bank, u16 addr, u8 value)
 {
-	(void)bank;
+	(void) bank;
 	if (addr < 0x200)
 		ram_[addr] = value & 0x0F;
 }
@@ -274,13 +276,111 @@ void MBC3::write_rom(u16 addr, u8 value)
 	} else if (addr < 0x6000) {
 		ram_bank_ = value;
 	} else {
-		// Latch clock data: 0->1 edge latches (stubbed to 0).
+		// Latch clock data: a 0->1 write latches the live time.
 		// https://gbdev.io/pandocs/MBC3.html#the-clock-counter-registers
-		if (latch_state_ == 0 && value == 1) {
-			rtc_regs_.fill(0);
-		}
+		if (latch_state_ == 0 && value == 1)
+			rtc_latch();
 		latch_state_ = value;
 	}
+}
+
+void MBC3::rtc_ensure_base()
+{
+	if (rtc_base_valid_)
+		return;
+	rtc_base_valid_ = true;
+	rtc_base_host_ = static_cast<std::int64_t>(std::time(nullptr));
+	rtc_base_secs_ = 0;
+	rtc_halt_ = false;
+}
+
+std::int64_t MBC3::rtc_total_seconds() const
+{
+	if (!rtc_base_valid_)
+		return 0;
+	if (rtc_halt_)
+		return rtc_base_secs_;
+	const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+	return rtc_base_secs_ + (now - rtc_base_host_);
+}
+
+void MBC3::rtc_latch()
+{
+	if (!rtc_)
+		return;
+	rtc_ensure_base();
+	std::int64_t total = rtc_total_seconds();
+	if (total < 0)
+		total = 0;
+	const std::int64_t days = total / 86400;
+	if (days >= 512)
+		rtc_carry_ = true; // Sticky until the time is (re)set.
+	const u16 day = static_cast<u16>(days % 512);
+	rtc_latched_[0] = static_cast<u8>((total % 60));
+	rtc_latched_[1] = static_cast<u8>((total / 60) % 60);
+	rtc_latched_[2] = static_cast<u8>((total / 3600) % 24);
+	rtc_latched_[3] = static_cast<u8>(day & 0xFF);
+	rtc_latched_[4] = static_cast<u8>(((day >> 8) & 0x01) | (rtc_halt_ ? 0x40 : 0x00) |
+									  (rtc_carry_ ? 0x80 : 0x00));
+}
+
+void MBC3::rtc_apply_write(u8 index, u8 value)
+{
+	if (!rtc_ || index > 4)
+		return;
+	rtc_ensure_base();
+	rtc_set_[index] = value;
+	// Rebase the clock on the newly written time. Masks match hardware
+	// ranges; DH carries halt (bit 6) and the sticky overflow (bit 7),
+	// which is cleared by any time-set that leaves it 0.
+	const u8 s = static_cast<u8>(rtc_set_[0] % 60);
+	const u8 m = static_cast<u8>(rtc_set_[1] % 60);
+	const u8 h = static_cast<u8>(rtc_set_[2] % 24);
+	const u16 day = static_cast<u16>((((rtc_set_[4] & 0x01) << 8) | rtc_set_[3]) & 0x1FF);
+	rtc_base_secs_ = ((static_cast<std::int64_t>(day) * 24 + h) * 60 + m) * 60 + s;
+	rtc_base_host_ = static_cast<std::int64_t>(std::time(nullptr));
+	rtc_halt_ = (rtc_set_[4] & 0x40) != 0;
+	rtc_carry_ = (rtc_set_[4] & 0x80) != 0;
+}
+
+bool MBC3::save_rtc(const std::string &path) const
+{
+	if (!rtc_)
+		return false;
+	std::ofstream file(path, std::ios::binary);
+	if (!file)
+		return false;
+	// Text sidecar: versioned, forward-compatible, debuggable.
+	file << "GB4ME-RTC-1 " << rtc_base_secs_ << ' ' << rtc_base_host_ << ' ' << (rtc_halt_ ? 1 : 0)
+		 << ' ' << (rtc_carry_ ? 1 : 0) << ' ' << (rtc_base_valid_ ? 1 : 0);
+	for (u8 v : rtc_set_)
+		file << ' ' << static_cast<unsigned>(v);
+	file << '\n';
+	return static_cast<bool>(file);
+}
+
+bool MBC3::load_rtc(const std::string &path)
+{
+	if (!rtc_)
+		return false;
+	std::ifstream file(path);
+	if (!file)
+		return false;
+	std::string magic;
+	int halt = 0, carry = 0, valid = 0;
+	unsigned regs[5] = {};
+	file >> magic >> rtc_base_secs_ >> rtc_base_host_ >> halt >> carry >> valid >> regs[0] >>
+		regs[1] >> regs[2] >> regs[3] >> regs[4];
+	if (!file || magic != "GB4ME-RTC-1")
+		return false;
+	rtc_halt_ = halt != 0;
+	rtc_carry_ = carry != 0;
+	rtc_base_valid_ = valid != 0;
+	for (int i = 0; i < 5; i++)
+		rtc_set_[i] = static_cast<u8>(regs[i] & 0xFF);
+	rtc_latched_.fill(0);
+	latch_state_ = 0;
+	return true;
 }
 
 u8 MBC3::read_ram(u16 addr) const
@@ -296,7 +396,9 @@ u8 MBC3::read_ram(u16 addr) const
 		return off < ram_.size() ? ram_[off] : 0xFF;
 	}
 	if (rtc_ && ram_bank_ >= 0x08 && ram_bank_ <= 0x0C) {
-		return rtc_regs_[ram_bank_ - 0x08];
+		if (!ram_enabled_)
+			return 0xFF;
+		return rtc_latched_[ram_bank_ - 0x08];
 	}
 	return 0xFF;
 }
@@ -316,7 +418,9 @@ void MBC3::write_ram(u16 addr, u8 value)
 		return;
 	}
 	if (rtc_ && ram_bank_ >= 0x08 && ram_bank_ <= 0x0C) {
-		rtc_regs_[ram_bank_ - 0x08] = value;
+		if (!ram_enabled_)
+			return;
+		rtc_apply_write(static_cast<u8>(ram_bank_ - 0x08), value);
 	}
 }
 
@@ -370,7 +474,9 @@ void MBC5::write_rom(u16 addr, u8 value)
 		// leaked into ram_bank_, a rumble cart addressing bank 0 would read
 		// bank 8.
 		ram_bank_ = value & 0x07;
-		// Bits 4-7 select the rumble motor (ignored).
+		// Bits 4-7 select the rumble motor (kept as on/off; which of the
+		// two motors a cart has is not observable from the bus).
+		rumble_ = (value & 0x08) != 0;
 	}
 }
 
@@ -427,22 +533,30 @@ bool Cartridge::load(const std::string &path)
 	// above the 8 MiB maximum for any real GB/GBC cartridge.
 	constexpr std::streamsize kMaxRomBytes = 64 * 1024 * 1024;
 	std::ifstream file(path, std::ios::binary | std::ios::ate);
-	if (!file)
+	if (!file) {
+		last_error_ = "cannot open file";
 		return false;
+	}
 	std::streamsize size = file.tellg();
-	if (size <= 0 || size > kMaxRomBytes)
+	if (size <= 0 || size > kMaxRomBytes) {
+		last_error_ = "bad file size";
 		return false;
+	}
 	file.seekg(0, std::ios::beg);
 	std::vector<u8> data(static_cast<size_t>(size));
-	if (!file.read(reinterpret_cast<char *>(data.data()), size))
+	if (!file.read(reinterpret_cast<char *>(data.data()), size)) {
+		last_error_ = "cannot read file";
 		return false;
+	}
 	return load_from_bytes(data);
 }
 
 bool Cartridge::load_from_bytes(const std::vector<u8> &data)
 {
-	if (data.size() < 0x150)
+	if (data.size() < 0x150) {
+		last_error_ = "file too small for a GB header";
 		return false;
+	}
 	// The Nintendo logo bytes are verified by the boot ROM on hardware; a
 	// ROM without them is not a Game Boy ROM (e.g. a .gg Game Gear dump).
 	// https://gbdev.io/pandocs/The_Cartridge_Header.html#0104-0133--nintendo-logo
@@ -453,8 +567,10 @@ bool Cartridge::load_from_bytes(const std::vector<u8> &data)
 		0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC, 0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
 	};
 	for (int i = 0; i < 48; i++) {
-		if (data[0x0104 + i] != kNintendoLogo[i])
+		if (data[0x0104 + i] != kNintendoLogo[i]) {
+			last_error_ = "missing Nintendo logo (not a GB/GBC ROM)";
 			return false;
+		}
 	}
 	rom_image_ = data;
 	if (!parse_header())
@@ -503,8 +619,42 @@ bool Cartridge::load_from_bytes(const std::vector<u8> &data)
 		mbc_ = std::make_unique<MBC5>(rom_image_, make_ram(calc_ram_size(header_.ram_size)), batt);
 	} else {
 		mbc_.reset();
+		// Name known-but-unsupported mappers so the failure is actionable.
+		// https://gbdev.io/pandocs/The_Cartridge_Header.html#0147--cartridge-type
+		const char *name = nullptr;
+		switch (type) {
+		case 0x0B:
+		case 0x0C:
+		case 0x0D:
+			name = "MMM01";
+			break;
+		case 0x20:
+			name = "MBC6";
+			break;
+		case 0x22:
+			name = "MBC7";
+			break;
+		case 0xFD:
+			name = "TAMA5";
+			break;
+		case 0xFE:
+			name = "HuC3";
+			break;
+		case 0xFF:
+			name = "HuC1";
+			break;
+		default:
+			break;
+		}
+		char buf[96];
+		if (name != nullptr)
+			std::snprintf(buf, sizeof(buf), "unsupported mapper %s (type 0x%02X)", name, type);
+		else
+			std::snprintf(buf, sizeof(buf), "unsupported mapper type 0x%02X", type);
+		last_error_ = buf;
 		return false;
 	}
+	last_error_.clear();
 	return true;
 }
 
@@ -541,6 +691,31 @@ void Cartridge::write_ram(u16 addr, u8 value)
 bool Cartridge::has_battery() const
 {
 	return mbc_ ? mbc_->has_battery() : false;
+}
+
+bool Cartridge::has_rtc() const
+{
+	return mbc_ ? mbc_->has_rtc() : false;
+}
+
+bool Cartridge::has_rumble() const
+{
+	return mbc_ != nullptr && mbc_->has_rumble();
+}
+
+bool Cartridge::rumble() const
+{
+	return mbc_ != nullptr && mbc_->rumble();
+}
+
+bool Cartridge::save_rtc(const std::string &path) const
+{
+	return mbc_ ? mbc_->save_rtc(path) : false;
+}
+
+bool Cartridge::load_rtc(const std::string &path)
+{
+	return mbc_ ? mbc_->load_rtc(path) : false;
 }
 
 void Cartridge::save_ram(const std::string &path) const

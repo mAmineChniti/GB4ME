@@ -450,12 +450,45 @@ void GbaAudio::generateSample()
 	emitStereo(clampToS16(soft_l), clampToS16(soft_r));
 }
 
+void GbaAudio::set_resample_ratio(float ratio)
+{
+	resample_ratio_ = ratio < 0.99f ? 0.99f : (ratio > 1.01f ? 1.01f : ratio);
+}
+
+int GbaAudio::queued() const
+{
+	return stream_ != nullptr ? SDL_GetAudioStreamQueued(stream_) : 0;
+}
+
 void GbaAudio::emitStereo(i16 left, i16 right)
 {
+	// Drift correction (+/-1% from the audio-clock pacer) as a sample hold
+	// with a fractional phase: above 1.0 the extra output frames hold the
+	// previous pair, below 1.0 one mixed frame in every 1/(1-ratio) is
+	// skipped. At 1% that is one sample every ~100 frames - the DC blocker
+	// smooths a hold, and dropping a whole batch (what the old fixed-pacing
+	// loop could do) was a click. nearest-neighbour is enough here: the GBA
+	// mixer already runs at the device rate, so there is no oversampled
+	// stage to re-stride.
+	resample_phase_ += resample_ratio_ - 1.0f;
+	if (resample_phase_ > 0.0f) {
+		resample_phase_ -= 1.0f;
+		sample_buffer_.push_back(prev_l_);
+		sample_buffer_.push_back(prev_r_);
+		++frames_emitted_;
+	} else if (resample_phase_ < -1.0f) {
+		resample_phase_ += 1.0f;
+		prev_l_ = left;
+		prev_r_ = right;
+		return; // Frame swallowed: this one is the correction.
+	}
 	sample_buffer_.push_back(left);
 	sample_buffer_.push_back(right);
+	++frames_emitted_;
 	// Push to SDL about once per frame (~16.7ms): larger batches add
 	// constant output latency that reads as delayed sound effects.
+	prev_l_ = left;
+	prev_r_ = right;
 	if (sample_buffer_.size() >= kSampleRate / 60 * 2)
 		flushSamples();
 }
@@ -469,6 +502,7 @@ void GbaAudio::flushSamples()
 	}
 	if (SDL_GetAudioStreamQueued(stream_) > static_cast<int>(kSampleRate)) {
 		SDL_ClearAudioStream(stream_);
+		++dropouts_;
 	}
 	SDL_PutAudioStreamData(stream_, sample_buffer_.data(),
 						   static_cast<int>(sample_buffer_.size() * sizeof(i16)));
@@ -502,55 +536,52 @@ u8 GbaAudio::read8(u32 addr) const
 	case 0x04000063u:
 		return nr12_;
 	case 0x04000064u:
-		return 0x00;
+		return 0x00; // Unmapped gap.
 	case 0x04000065u:
 		return nr14_ & 0x40u;
 	case 0x04000066u:
 	case 0x04000067u:
-		return 0x00; // Gap.
+		return 0x00; // Unmapped gap.
 	case 0x04000068u:
 		return nr21_ & 0xC0u;
 	case 0x04000069u:
 		return nr22_;
-	case 0x0400006Au:
+	case 0x0400006Au: // Unmapped gaps all read as 0.
 	case 0x0400006Bu:
-		return 0x00; // Gap.
 	case 0x0400006Cu:
 		return 0x00;
 	case 0x0400006Du:
 		return nr24_ & 0x40u;
 	case 0x0400006Eu:
 	case 0x0400006Fu:
-		return 0x00; // Gap.
+		return 0x00; // Unmapped gap.
 	case 0x04000070u:
 		return nr30_ & 0xE0u;
 	case 0x04000071u:
-		return 0x00; // Gap.
 	case 0x04000072u:
-		return 0x00;
+		return 0x00; // Unmapped gap.
 	case 0x04000073u:
 		return nr32_ & 0xE0u;
 	case 0x04000074u:
-		return 0x00;
+		return 0x00; // Unmapped gap (grouped below).
 	case 0x04000075u:
 		return nr34_ & 0x40u;
 	case 0x04000076u:
 	case 0x04000077u:
-		return 0x00; // Gap.
 	case 0x04000078u:
-		return 0x00;
+		return 0x00; // Unmapped gap. // Unmapped gap.
 	case 0x04000079u:
 		return nr42_;
 	case 0x0400007Au:
 	case 0x0400007Bu:
-		return 0x00; // Gap.
+		return 0x00; // Unmapped gap.
 	case 0x0400007Cu:
 		return nr43_;
 	case 0x0400007Du:
 		return nr44_ & 0x40u;
 	case 0x0400007Eu:
 	case 0x0400007Fu:
-		return 0x00; // Gap.
+		return 0x00; // Unmapped gap.
 	case 0x04000080u:
 		return nr50_ & 0x77u; // No Vin on GBA: bits 3,7 read 0.
 	case 0x04000081u:
@@ -573,11 +604,10 @@ u8 GbaAudio::read8(u32 addr) const
 			v |= 0x08;
 		return v;
 	}
-	case 0x04000085u:
-		return 0x00; // Gap.
+	case 0x04000085u: // Unmapped gap.
 	case 0x04000086u:
 	case 0x04000087u:
-		return 0x00; // Gap.
+		return 0x00;
 	case 0x04000088u:
 		return static_cast<u8>(soundbias_ & 0xFFu);
 	case 0x04000089u:
@@ -765,7 +795,7 @@ void GbaAudio::write16(u32 addr, u16 value)
 			// SOUNDCNT_H stays readable and writable while the master
 			// enable is off (GBATEK 4000082h); only the channel/MIX
 			// registers are cleared. mGBA's disable path preserves it too.
-			(void)was;
+			(void) was;
 		}
 		break;
 	}

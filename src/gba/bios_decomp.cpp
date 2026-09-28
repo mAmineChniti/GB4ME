@@ -119,7 +119,7 @@ HleBios::Outcome HleBios::decomp(u8 num, Arm7Tdmi &cpu, GbaBus &bus)
 			source += 4;
 			for (int left = 32; left > 0 && remaining > 0; --left, bitstream <<= 1) {
 				const u32 next = (node_ptr & ~1u) + ((node & 0x3F) * 2) + 2;
-				u8 leaf;
+				u8 leaf = 0;
 				if ((bitstream & 0x80000000u) != 0) { // Right.
 					if ((node & 0x40) != 0) {
 						leaf = cpu.loadByte(next + 1);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "audio_dsp.h"
 #include "types.h"
 #include <SDL3/SDL_audio.h>
 #include <algorithm>
@@ -17,10 +18,12 @@ class MMU; // Bus. APU register access goes through MMU::read/write.
 // https://gbdev.io/pandocs/Audio.html
 // GBC: sample timing derives from the CPU clock (double_speed scales the
 // T-cycle rate; M-cycle accounting here is unchanged).
+// The mix runs 8x oversampled and is band-limited on the way out
+// (dsp::OutputStage) instead of being sampled straight at 44.1kHz.
 class APU
 {
   public:
-	static constexpr u32 kSampleRate = 44100;
+	static constexpr u32 kSampleRate = dsp::kOutputRate;
 
 	APU();
 	~APU();
@@ -44,14 +47,34 @@ class APU
 	}
 	void set_master_volume(float v)
 	{
-		master_volume_ = std::clamp(v, 0.0f, 1.0f);
+		output_.set_volume(v);
 	}
 	float master_volume() const
 	{
-		return master_volume_;
+		return output_.volume();
 	}
 	// Hand buffered samples to the caller (used by --debug WAV capture).
 	void take_samples(std::vector<i16> &out);
+	// Output frames produced since reset, whether or not a device took them
+	// (flush_samples drops the buffer when running silent).
+	u64 frames_emitted() const
+	{
+		return frames_emitted_;
+	}
+	// Audio batches dropped because the device fell behind (SDL's queued
+	// backlog overran). A non-zero value is the audible-crackle signal the
+	// debug overlay reports.
+	u32 dropouts() const
+	{
+		return dropouts_;
+	}
+	// Frames the device has not played yet (0 with no device), and the
+	// drift-correction ratio the audio-clock pacer asks for.
+	int queued() const;
+	void set_resample_ratio(float ratio)
+	{
+		output_.set_resample_ratio(ratio);
+	}
 
 	u8 read_reg(u16 addr) const;
 	void write_reg(u16 addr, u8 value);
@@ -120,23 +143,43 @@ class APU
 	Wave ch3_;
 	Noise ch4_;
 
+	// DAC power-down "pop": a disabled channel's output capacitor does not
+	// vanish, it discharges over a few microseconds, so the mix gets a
+	// short linear fade instead of a step (the classic click at the end of
+	// every note). Indexed 0..3 for ch1..ch4, counted in mix samples.
+	static constexpr u8 kFadeMixSamples = 176; // 176/352800 = 0.5ms
+	std::array<u8, 4> fade_left_{};
+	std::array<u8, 4> fade_level_{};
+	// Last non-zero level each channel emitted. The output capacitor holds
+	// that level, so a power-down fade starts from it (sampling the live
+	// output would often catch a square wave's low phase and skip the
+	// click that is being smoothed).
+	std::array<u8, 4> last_level_{};
+	// Power channel `i` (0..3) down with a fade instead of a hard cut.
+	void disable_channel(unsigned index);
+
 	u8 nr50_ = 0; // Master volume L/R.
 	u8 nr51_ = 0; // Channel routing L/R.
 	bool power_ = false;
 
-	u8 frame_step_ = 0;    // 0-7 frame sequencer position.
-	u32 frame_clock_ = 0;  // T-cycles into the current 8192-cycle step.
-	u32 sample_clock_ = 0; // T-cycles into the current audio sample.
+	u8 frame_step_ = 0;   // 0-7 frame sequencer position.
+	u32 frame_clock_ = 0; // T-cycles into the current 8192-cycle step.
+	u32 mix_phase_ = 0;   // 16.16 T-cycles since the last mix sample.
 
-	// One-pole DC-blocking high-pass state per side (output capacitor
-	// emulation). Without this, channel on/off steps leave a wandering DC
-	// bias and silence would sit at full-scale negative instead of zero.
-	float hp_x_l_ = 0, hp_y_l_ = 0;
-	float hp_x_r_ = 0, hp_y_r_ = 0;
+	// Band-limited output: 8x oversampled mix -> FIR decimate -> DC
+	// blocker -> volume -> s16. Its kernel/ring own the rate constants.
+	dsp::OutputStage output_{};
+
+	// Length counters survive an APU power cycle on DMG hardware (the
+	// registers are cleared, the counters are not - SameBoy Core/apu.c
+	// restores them after GB_apu_init). Saved when powering off; ch3
+	// counts to 256, hence 16 bits.
+	std::array<u16, 4> length_shadow_{};
 
 	SDL_AudioStream *stream_ = nullptr;
 	std::vector<i16> sample_buffer_;
-	float master_volume_ = 1.0f;
+	u64 frames_emitted_ = 0;
+	u32 dropouts_ = 0;
 
 	// Register shadows for readable bits.
 	u8 nr10_ = 0, nr11_ = 0, nr12_ = 0, nr14_ = 0;
@@ -153,8 +196,14 @@ class APU
 	void trigger_noise();
 	void set_length_enabled(bool &flag, bool &enabled, u8 &timer, u8 value);
 	u8 pulse_output(Pulse &ch);
+	u8 wave_level();
+	u8 noise_level();
 	void generate_sample();
+	// True while the wave DAC owns the wave RAM bus (imminent fetch).
+	bool wave_bus_busy() const;
 	void flush_samples();
+	void power_off_channels();
+	void power_on_channels();
 };
 
 } // namespace gb

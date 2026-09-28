@@ -7,6 +7,7 @@ namespace gba
 {
 
 class GbaIrq;
+class GbaScheduler;
 
 // GBA timers 0-3 (Phase 5). Prescalers F/1, F/64, F/256, F/1024; timers 1-3
 // support count-up (cascade) on the previous timer's overflow. Overflow
@@ -38,11 +39,36 @@ class GbaTimers
 		overflow_hook_ = hook;
 	}
 
+	// Scheduler wiring: every prescaled increment is an event, so an
+	// overflow (and its IRQ) lands on the exact tick instead of whenever the
+	// current step() slice stops. Events are guarded by a per-channel
+	// generation counter rather than cancelled, so a prescaler/enable write
+	// simply invalidates the pending one (GbaScheduler has no cancel).
+	void setScheduler(GbaScheduler *scheduler)
+	{
+		scheduler_ = scheduler;
+	}
+	// Re-arm from restored state; the queue itself is not serialized.
+	void rearmEvents();
+	// Events still queued for a channel (tests / diagnostics).
+	bool event_armed(unsigned i) const
+	{
+		return armed_[i];
+	}
+	// Ticks until this channel's next increment (tests / diagnostics).
+	u32 ticks_to_next(unsigned i) const;
+	// Increments performed (tests / diagnostics).
+	u32 increments() const
+	{
+		return increments_;
+	}
+
 	// Save state serialization.
 	void save(StateBuffer &out) const;
 	void load(const StateBuffer &in);
 
-	// Advance all timers by `cycles` ticks.
+	// Called every step by the core; with a scheduler attached the events do
+	// the counting and this only makes sure they are armed.
 	void step(u32 cycles);
 
 	u16 read(u32 addr) const; // CNT_L (live counter) / CNT_H (control).
@@ -66,8 +92,14 @@ class GbaTimers
 	};
 
 	GbaIrq *irq_ = nullptr;
+	GbaScheduler *scheduler_ = nullptr;
 	std::function<void(unsigned)> overflow_hook_;
 	Channel channels_[kCount]{};
+	// Per-channel event state: `gen_` invalidates a pending event when the
+	// prescaler or enable changes under it.
+	bool armed_[kCount]{};
+	u32 gen_[kCount]{};
+	u32 increments_ = 0;
 
 	static u32 prescaler(u16 control)
 	{
@@ -84,6 +116,10 @@ class GbaTimers
 		return i != 0 && (channels_[i].control & kCascade) != 0;
 	}
 
+	void armChannel(unsigned i);
+	void armAll();
+	void onTimerTick(unsigned i, u32 gen);
+	void invalidate(unsigned i);
 	void clockChannel(unsigned i); // One counter increment (may overflow).
 	void overflow(unsigned i);
 };

@@ -12,9 +12,8 @@ namespace gba
 namespace
 {
 
-// BG sizes in tiles: text {w,h} in screens, affine pixel dimensions.
-constexpr unsigned kTextW[4] = {1, 2, 1, 2};
-constexpr unsigned kTextH[4] = {1, 1, 2, 2};
+// Affine BG sizes in pixels (text BG sizes are the 1/2/1/2-screen table in
+// GbaPpu; it derives them from the same control bits at use time).
 constexpr unsigned kAffSize[4] = {128, 256, 512, 1024};
 
 // OBJ shape/size -> (w, h).
@@ -119,17 +118,16 @@ void renderScanline(GbaPpu &ppu, unsigned y)
 				screen = ((ty >> 8) & 1) * 2;
 			else if (size == 3)
 				screen = (((ty >> 8) & 1) * 2) | ((tx >> 8) & 1);
-			const u32 me = map_base + screen * 0x800u +
-						   (((ty & 255u) / 8) * 32 + ((tx & 255u) / 8)) * 2;
-			const u32 entry =
-				static_cast<u16>(vread(me) | (vread(me + 1) << 8));
+			const u32 me =
+				map_base + screen * 0x800u + (((ty & 255u) / 8) * 32 + ((tx & 255u) / 8)) * 2;
+			const u32 entry = static_cast<u16>(vread(me) | (vread(me + 1) << 8));
 			const unsigned tile = entry & 0x3FFu;
 			unsigned px = tx & 7u, row = ty & 7u;
 			if ((entry & 0x0400u) != 0)
 				px = 7 - px;
 			if ((entry & 0x0800u) != 0)
 				row = 7 - row;
-			u32 color;
+			u32 color = 0;
 			if (!is8) {
 				const u32 addr = char_base + tile * 32u + row * 4u + px / 2;
 				if (addr >= 0x10000u)
@@ -377,11 +375,10 @@ void renderScanline(GbaPpu &ppu, unsigned y)
 			// software-obj.c:168-170), so 256..511 read as negative, i.e.
 			// off-screen LEFT rather than right.
 			const int sx9 = (a1 & 0x100) != 0 ? static_cast<int>(a1 & 0x1FFu) - 512
-											 : static_cast<int>(a1 & 0x1FFu);
+											  : static_cast<int>(a1 & 0x1FFu);
 			if (obj_y >= GbaPpu::kHeight && obj_y + rows < GbaPpu::kLines)
 				continue;
-			if (sx9 >= static_cast<int>(GbaPpu::kWidth) &&
-				sx9 + static_cast<int>(cols) < 512)
+			if (sx9 >= static_cast<int>(GbaPpu::kWidth) && sx9 + static_cast<int>(cols) < 512)
 				continue;
 			if (sx9 + static_cast<int>(cols) < 0)
 				continue;
@@ -440,7 +437,7 @@ void renderScanline(GbaPpu &ppu, unsigned y)
 				const unsigned sx = (obj_x + px) & 0x1FFu; // Wraps.
 				if (sx >= GbaPpu::kWidth)
 					continue;
-				unsigned tx, ty;
+				unsigned tx = 0, ty = 0;
 				if (rot) {
 					// Mosaic applies to transformed OBJs too (GBATEK: every
 					// BG and OBJ layer). The phase is SCREEN-space: mGBA uses
@@ -477,9 +474,9 @@ void renderScanline(GbaPpu &ppu, unsigned y)
 					}
 					ty = sry;
 				}
-				u32 color;
+				u32 color = 0;
 				if (!is8) {
-					u32 tile_no;
+					u32 tile_no = 0;
 					if (map1d) {
 						tile_no = tile + (ty / 8) * (w / 8) + tx / 8;
 					} else {
@@ -504,8 +501,8 @@ void renderScanline(GbaPpu &ppu, unsigned y)
 					// columns step one tile (+64), 1D rows step (w/8)
 					// tiles, 2D rows step 16 tiles (1024 bytes).
 					const u32 row_step = map1d ? (w / 8) : 16;
-					const u32 addr = 0x10000u + tile * 32u +
-						((ty / 8) * row_step + tx / 8) * 64u + (ty % 8) * 8u + (tx % 8);
+					const u32 addr = 0x10000u + tile * 32u + ((ty / 8) * row_step + tx / 8) * 64u +
+									 (ty % 8) * 8u + (tx % 8);
 					color = vread(addr);
 					if (color == 0) {
 						if (obj_mode == 2) { /* transparent: no window bit */
@@ -576,8 +573,8 @@ void renderScanline(GbaPpu &ppu, unsigned y)
 	const unsigned evy = evy_raw > 16 ? 16 : evy_raw;
 	for (unsigned x = 0; x < GbaPpu::kWidth; x++) {
 		// Region enables (WIN0 > WIN1 > OBJWIN > outside).
-		u32 layer_en;
-		bool blend_en;
+		u32 layer_en = 0;
+		bool blend_en = 0;
 		if (!win0_on && !win1_on && !objwin_on) {
 			layer_en = (dispcnt >> 8) & 0x1Fu;
 			blend_en = true;
@@ -613,7 +610,7 @@ void renderScanline(GbaPpu &ppu, unsigned y)
 			unsigned k = n;
 			while (k > 0 && (bg_prio[b] < stack[k - 1].prio ||
 							 (bg_prio[b] == stack[k - 1].prio && stack[k - 1].kind != 4 &&
-								 b < stack[k - 1].kind))) {
+							  b < stack[k - 1].kind))) {
 				stack[k] = stack[k - 1];
 				k--;
 			}

@@ -1,0 +1,73 @@
+# clang-tidy configuration for GB4ME.
+#
+# The list is deliberately small and behaviour-focused: it is a CI gate, so
+# every check here must be actionable and must not fight the project's style
+# (formatting is clang-format's job, enforced separately by the `format`
+# job). The checks below are the ones that found real bugs in this codebase:
+# branch mistakes, suspicious arithmetic, unchecked return values.
+#
+# Header-filter keeps third-party headers out; src/stb_*.h are vendored and
+# would drown the report.
+Checks: >
+  bugprone-branch-clone,
+  bugprone-integer-division,
+  bugprone-macro-parentheses,
+  bugprone-macro-repeated-side-effects,
+  bugprone-misplaced-widening-cast,
+  bugprone-redundant-branch-condition,
+  bugprone-sizeof-expression,
+  bugprone-suspicious-memset-usage,
+  bugprone-swapped-arguments,
+  bugprone-unhandled-self-assignment,
+  bugprone-unused-raii,
+  bugprone-use-after-move,
+  cert-dcl21-cpp,
+  cert-err52-cpp,
+  cert-flp30-c,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-slicing,
+  hicpp-exception-baseclass,
+  llvm-namespace-comment,
+  misc-definitions-in-headers,
+  misc-redundant-expression,
+  modernize-use-equals-default,
+  modernize-use-override,
+  modernize-use-nullptr,
+  performance-no-int-to-ptr,
+  performance-unnecessary-value-param,
+  readability-const-return-type,
+  readability-container-size-empty,
+  readability-delete-null-pointer,
+  readability-duplicate-include,
+  readability-misleading-indentation,
+  readability-misplaced-array-index,
+  readability-redundant-control-flow,
+  readability-redundant-declaration,
+  readability-redundant-member-init,
+  readability-redundant-preprocessor,
+  readability-simplify-boolean-expr,
+  readability-static-accessed-through-instance,
+  readability-uniqueptr-delete-release
+
+# The gate: a finding fails CI. Keep this in sync with the removals above.
+WarningsAsErrors: '*'
+HeaderFilterRegex: '^(src|include)/'
+FormatStyle: file
+
+# Checks deliberately NOT enabled, with the reason (a check that cannot tell
+# intent from accident only produces noise nobody acts on):
+#   bugprone-signed-char-misuse / cert-str34-c - the GB data model is full of
+#     *deliberate* signed chars: tile numbers in 8800-97FF addressing mode are
+#     signed and sign extension is the point.
+#   cppcoreguidelines-narrowing-conversions - an emulator is register masks
+#     and pixel arithmetic; nearly every hit is `static_cast<u8>(x & 0xFF)`
+#     where the mask is the range proof. Turning it on would mean 80 casts of
+#     pure ceremony.
+#   cppcoreguidelines-no-malloc / -owning-memory, cert-err34-c - the only
+#     users are the `--dump-gba` stdio paths (FILE*) and CLI atoi parsing
+#     where "unparseable = 0" is the intended behaviour.
+CheckOptions:
+  # The codebase uses reinterpret_cast deliberately (state serialization,
+  # typed VRAM views) and SDL3 headers do the same in their inline helpers.
+  - key: cppcoreguidelines-pro-type-reinterpret-cast
+    value: 'false'

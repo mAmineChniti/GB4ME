@@ -13,17 +13,13 @@ namespace
 {
 
 // I/O register addresses (GBATEK "GBA I/O Map").
-constexpr u32 kDispcnt = 0x04000000;
 constexpr u32 kSiocnt = 0x04000128;
 constexpr u32 kSiomltSend = 0x0400012A;
 constexpr u32 kRcnt = 0x04000134;
 constexpr u32 kJoycnt = 0x04000140;
 constexpr u32 kJoyRecv = 0x04000150;
 constexpr u32 kJoyTrans = 0x04000154;
-constexpr u32 kSoundBias = 0x04000088;
 constexpr u32 kIme = 0x04000208;
-constexpr u32 kIf = 0x04000202;
-constexpr u32 kIe = 0x04000200;
 
 void write16(GbaBus &bus, u32 addr, u16 v)
 {
@@ -143,17 +139,14 @@ HleBios::Outcome HleBios::system(u8 num, Arm7Tdmi &cpu, GbaBus &bus)
 		cpu.halt();
 		return {Result::Return, 8};
 	}
-	case kStop: {
-		// Very-low-power stop; wakes on joypad/cart/SIO only. Without
-		// the wake-set model the wait would deadlock, so this halts like
-		// Halt (documented simplification). HALT does not enable IRQs.
-		cpu.halt();
-		return {Result::Return, 8};
-	}
+	case kStop:
+		// Very-low-power stop; wakes on joypad/cart/SIO only. Without the
+		// wake-set model the wait would deadlock, so this waits like Halt
+		// (documented simplification).
 	case kCustomHalt:
-		// Debugger-oriented halt variant; exact parameter contract is
-		// undocumented in GBATEK, so this waits like Halt (documented).
-		// HALT does not enable IRQs (same as kHalt).
+		// Debugger-oriented halt variant; the exact parameter contract is
+		// undocumented in GBATEK, so it waits like Halt too. Neither
+		// enables IRQs (only IntrWait forces IME=1).
 		cpu.halt();
 		return {Result::Return, 8};
 	case kIntrWait:

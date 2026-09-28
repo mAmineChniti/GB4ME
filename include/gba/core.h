@@ -55,6 +55,10 @@ class GameBoyAdvance
 	{
 		return scheduler_.now();
 	}
+	Cartridge &cartridge()
+	{
+		return cartridge_;
+	}
 	const Cartridge &cartridge() const
 	{
 		return cartridge_;

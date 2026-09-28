@@ -62,6 +62,8 @@ void PPU::reset()
 	wx_ = 0;
 	current_mode_ = Mode::OAMScan;
 	line_cycles_ = 0;
+	dot_ = 0;
+	hdma_block_until_ = 0;
 	window_line_ = 0;
 	frame_buffer_.pixels.fill(dmg_shades_[0]);
 	frame_ready_flag_ = false;
@@ -95,6 +97,9 @@ u8 PPU::read_vram(u16 addr) const
 {
 	if (addr >= 0x2000)
 		return 0xFF;
+	// CGB: an HDMA block in flight owns the bus whatever the PPU mode is.
+	if (is_cgb_mode(hardware_mode_) && hdma_bus_busy())
+		return 0xFF;
 	// VRAM blocked during Drawing (mode 3) when LCD on — per Pan Docs
 	// https://gbdev.io/pandocs/Accessing_VRAM_and_OAM.html
 	if ((lcdc_ & 0x80) && current_mode_ == Mode::Drawing)
@@ -108,6 +113,9 @@ u8 PPU::read_vram(u16 addr) const
 void PPU::write_vram(u16 addr, u8 value)
 {
 	if (addr >= 0x2000)
+		return;
+	// CGB: HDMA owns the bus; the write is lost.
+	if (is_cgb_mode(hardware_mode_) && hdma_bus_busy())
 		return;
 	if ((lcdc_ & 0x80) && current_mode_ == Mode::Drawing)
 		return;
@@ -228,6 +236,9 @@ u8 PPU::read_oam(u16 addr) const
 {
 	if (addr >= 0xA0)
 		return 0xFF;
+	// CGB: OAM is unreachable while an HDMA block moves (Pan Docs).
+	if (is_cgb_mode(hardware_mode_) && hdma_bus_busy())
+		return 0xFF;
 	// OAM blocked during OAMScan+Drawing when LCD on
 	if ((lcdc_ & 0x80) && (current_mode_ == Mode::OAMScan || current_mode_ == Mode::Drawing))
 		return 0xFF;
@@ -247,6 +258,8 @@ u8 PPU::read_oam(u16 addr) const
 void PPU::write_oam(u16 addr, u8 value)
 {
 	if (addr >= 0xA0)
+		return;
+	if (is_cgb_mode(hardware_mode_) && hdma_bus_busy())
 		return;
 	if ((lcdc_ & 0x80) && (current_mode_ == Mode::OAMScan || current_mode_ == Mode::Drawing))
 		return;
@@ -321,6 +334,8 @@ void PPU::step(u32 mcycles)
 		// LCD off: LY stuck at 0, VRAM freely accessible.
 		ly_ = 0;
 		line_cycles_ = 0;
+		dot_ = 0;
+		hdma_block_until_ = 0;
 		current_mode_ = Mode::HBlank;
 		window_line_ = 0;
 		stat_ = (stat_ & 0xFC) | 0x00;
@@ -330,6 +345,7 @@ void PPU::step(u32 mcycles)
 
 	const bool was_hblank =
 		(ly_ < kVBlankStart && line_cycles_ >= kDrawDots && line_cycles_ < kDotsPerLine);
+	dot_ += mcycles * 4;
 	line_cycles_ += mcycles * 4;
 	while (line_cycles_ >= kDotsPerLine) {
 		line_cycles_ -= kDotsPerLine;
@@ -430,10 +446,13 @@ void PPU::render_background(u8 y)
 	for (u16 x = 0; x < SCREEN_WIDTH; x++) {
 		const u8 col_x = x + scx_;
 		const u8 tile_num = vram_banks_[0][map_base + (row_y / 8) * 32 + (col_x / 8)];
-		u16 tile_addr;
+		u16 tile_addr = 0;
 		if (signed_tiles) {
-			const i16 s = static_cast<i8>(tile_num);
-			tile_addr = static_cast<u16>(0x1000 + s * 16);
+			// 8800-97FF addressing: the tile number is signed, so -128..127
+			// maps to 0x1000 + n*16 with the sign folded in (unsigned, not a
+			// narrowing conversion).
+			const i32 s = static_cast<i32>(static_cast<i8>(tile_num));
+			tile_addr = static_cast<u16>(0x1000 + s * 16) & 0x1FFFu;
 		} else {
 			tile_addr = tile_num * 16;
 		}
@@ -472,10 +491,13 @@ void PPU::render_background_cgb(u8 y)
 		u8 row_in_tile = row_y % 8;
 		if (y_flip)
 			row_in_tile = 7 - row_in_tile;
-		u16 tile_addr;
+		u16 tile_addr = 0;
 		if (signed_tiles) {
-			const i16 s = static_cast<i8>(tile_num);
-			tile_addr = static_cast<u16>(0x1000 + s * 16);
+			// 8800-97FF addressing: the tile number is signed, so -128..127
+			// maps to 0x1000 + n*16 with the sign folded in (unsigned, not a
+			// narrowing conversion).
+			const i32 s = static_cast<i32>(static_cast<i8>(tile_num));
+			tile_addr = static_cast<u16>(0x1000 + s * 16) & 0x1FFFu;
 		} else {
 			tile_addr = tile_num * 16;
 		}
@@ -510,10 +532,13 @@ void PPU::render_window(u8 y)
 			continue;
 		const u8 col_x = x - wx;
 		const u8 tile_num = vram_banks_[0][map_base + (row_y / 8) * 32 + (col_x / 8)];
-		u16 tile_addr;
+		u16 tile_addr = 0;
 		if (signed_tiles) {
-			const i16 s = static_cast<i8>(tile_num);
-			tile_addr = static_cast<u16>(0x1000 + s * 16);
+			// 8800-97FF addressing: the tile number is signed, so -128..127
+			// maps to 0x1000 + n*16 with the sign folded in (unsigned, not a
+			// narrowing conversion).
+			const i32 s = static_cast<i32>(static_cast<i8>(tile_num));
+			tile_addr = static_cast<u16>(0x1000 + s * 16) & 0x1FFFu;
 		} else {
 			tile_addr = tile_num * 16;
 		}
@@ -557,10 +582,13 @@ void PPU::render_window_cgb(u8 y)
 		u8 row_in_tile = row_y % 8;
 		if (y_flip)
 			row_in_tile = 7 - row_in_tile;
-		u16 tile_addr;
+		u16 tile_addr = 0;
 		if (signed_tiles) {
-			const i16 s = static_cast<i8>(tile_num);
-			tile_addr = static_cast<u16>(0x1000 + s * 16);
+			// 8800-97FF addressing: the tile number is signed, so -128..127
+			// maps to 0x1000 + n*16 with the sign folded in (unsigned, not a
+			// narrowing conversion).
+			const i32 s = static_cast<i32>(static_cast<i8>(tile_num));
+			tile_addr = static_cast<u16>(0x1000 + s * 16) & 0x1FFFu;
 		} else {
 			tile_addr = tile_num * 16;
 		}

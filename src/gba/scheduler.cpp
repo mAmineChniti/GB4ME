@@ -38,11 +38,12 @@ void GbaScheduler::save(StateBuffer &out) const
 	out.write(now_);
 	out.write(seq_);
 	// Event queue is intentionally not serialized: callbacks are
-	// type-erased std::functions and cannot round-trip. This is safe
-	// today because the scheduler has no in-tree producers (the core
-	// drives timers/PPU/audio by direct step() calls); a producer must
-	// either re-schedule from serialized device state on load or make
-	// events serializable before relying on save states across waits.
+	// type-erased std::functions and cannot round-trip. Producers therefore
+	// re-arm from their own serialized state on load - the PPU does this in
+	// GbaPpu::rearmEvents(), called by GameBoyAdvance::loadState() AFTER the
+	// clock is restored (arming against the wrong "now" would put the event
+	// in the wrong place and stall the frame). Any new producer owes the
+	// same, or its events must become serializable.
 }
 
 void GbaScheduler::load(const StateBuffer &in)

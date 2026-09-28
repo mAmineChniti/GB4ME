@@ -17,10 +17,20 @@ namespace
 
 // T-cycles per frame-sequencer step (512Hz at DMG clock).
 constexpr u32 kFrameStepTcycles = 8192;
-// T-cycles per audio sample (44100Hz at DMG clock).
-constexpr u32 kSampleTcycles = 95;     // 4194304/44100 = 95.11; dithered below.
-constexpr u32 kSampleTcyclesFrac = 11; // 0.11 * 100 extra cycle every ~9 samples.
+// T-cycles per *mix* sample at 8x the output rate, 16.16 fixed point:
+// 4194304/352800 = 11.888118. Accumulating instead of dithering an
+// integer 11/12 keeps the long-run rate exact and spreads the residual
+// evenly instead of running a constant ~1-cycle late.
+constexpr u32 kMixPeriodFx = 779045; // 11.888118 * 65536
+constexpr u32 kOneTcycleFx = 1u << 16;
+// DMG full-scale: four channels of 0-15 times an NR50 master of 1-8 is
+// 480; 32767/480 = 68.3, so 68 lands the loudest mix just inside int16.
+constexpr float kMixScale = 68.0f;
+// Cycles before a wave RAM fetch in which the bus is owned by the DAC and
+// CPU wave RAM accesses conflict (mGBA src/gb/io.c: 4 cycles).
+constexpr u32 kWaveBusCycles = 4;
 
+constexpr u8 kWaveShifts[4] = {4, 0, 1, 2}; // NR32 volume code -> shift.
 constexpr u8 kDutyTable[4][8] = {
 	{0, 0, 0, 0, 0, 0, 0, 1}, // 12.5%
 	{1, 0, 0, 0, 0, 0, 0, 1}, // 25%
@@ -87,7 +97,13 @@ void APU::reset()
 	ch4_.dac = (nr42_ & 0xF8) != 0;
 	frame_step_ = 0;
 	frame_clock_ = 0;
-	sample_clock_ = 0;
+	mix_phase_ = 0;
+	frames_emitted_ = 0;
+	fade_left_.fill(0);
+	fade_level_.fill(0);
+	last_level_.fill(0);
+	output_.reset();
+	length_shadow_ = {0, 0, 0, 0};
 	sample_buffer_.clear();
 	sample_buffer_.reserve(kSampleRate / 10 * 2);
 }
@@ -120,6 +136,11 @@ void APU::close_audio()
 		SDL_DestroyAudioStream(stream_);
 		stream_ = nullptr;
 	}
+}
+
+int APU::queued() const
+{
+	return stream_ != nullptr ? SDL_GetAudioStreamQueued(stream_) : 0;
 }
 
 void APU::take_samples(std::vector<i16> &out)
@@ -165,16 +186,11 @@ void APU::step(u32 mcycles)
 			if (ch4_.width_7bit)
 				ch4_.lfsr = (ch4_.lfsr & ~0x40) | (xor_bit << 6);
 		}
-		// Sample clock (dithered 95/96 to average 95.11).
-		static u32 frac = 0;
-		u32 period = kSampleTcycles;
-		frac += kSampleTcyclesFrac;
-		if (frac >= 100) {
-			frac -= 100;
-			period++;
-		}
-		if (++sample_clock_ >= period) {
-			sample_clock_ = 0;
+		// Mix clock: the PSG mixes 8x the output rate and OutputStage
+		// decimates it band-limited.
+		mix_phase_ += kOneTcycleFx;
+		if (mix_phase_ >= kMixPeriodFx) {
+			mix_phase_ -= kMixPeriodFx;
 			generate_sample();
 		}
 	}
@@ -195,23 +211,44 @@ void APU::clock_frame_sequencer()
 		clock_envelope(); // 64Hz.
 }
 
+void APU::disable_channel(unsigned index)
+{
+	// Only fade a channel that was actually contributing, so a
+	// disabled-but-silent channel does not add a phantom step later.
+	if (index < 4 && last_level_[index] != 0) {
+		fade_left_[index] = kFadeMixSamples;
+		fade_level_[index] = last_level_[index];
+	}
+}
+
 void APU::clock_length()
 {
+	// A length expiry is a DAC power-down: fade, do not step (see
+	// kFadeMixSamples). The channel's own level is sampled first so the
+	// fade starts from whatever it was emitting.
 	if (ch1_.length_enabled && ch1_.length_timer > 0) {
-		if (--ch1_.length_timer == 0)
+		if (--ch1_.length_timer == 0) {
+			disable_channel(0);
 			ch1_.enabled = false;
+		}
 	}
 	if (ch2_.length_enabled && ch2_.length_timer > 0) {
-		if (--ch2_.length_timer == 0)
+		if (--ch2_.length_timer == 0) {
+			disable_channel(1);
 			ch2_.enabled = false;
+		}
 	}
 	if (ch3_.length_enabled && ch3_.length_timer > 0) {
-		if (--ch3_.length_timer == 0)
+		if (--ch3_.length_timer == 0) {
+			disable_channel(2);
 			ch3_.enabled = false;
+		}
 	}
 	if (ch4_.length_enabled && ch4_.length_timer > 0) {
-		if (--ch4_.length_timer == 0)
+		if (--ch4_.length_timer == 0) {
+			disable_channel(3);
 			ch4_.enabled = false;
+		}
 	}
 }
 
@@ -370,54 +407,141 @@ u8 APU::pulse_output(Pulse &ch)
 	return kDutyTable[ch.duty][ch.duty_pos] ? ch.volume : 0;
 }
 
+u8 APU::wave_level()
+{
+	if (!ch3_.enabled || !ch3_.dac)
+		return 0;
+	return ch3_.out_buffer >> kWaveShifts[ch3_.volume_code];
+}
+
+u8 APU::noise_level()
+{
+	if (!ch4_.enabled || !ch4_.dac)
+		return 0;
+	return ((~ch4_.lfsr & 1) != 0) ? ch4_.volume : 0;
+}
+
+void APU::power_off_channels()
+{
+	// Powering off clears channels and registers but not wave RAM. Note
+	// this is NOT the post-boot state ($F3 etc.): only a cold boot has
+	// that, a power cycle clears to zero (GBATEK "SOUND2CNT_X": PSG
+	// registers are reset while bit 7 is clear).
+	// The four length counters are the exception - they keep their values
+	// across the cycle on hardware (SameBoy Core/apu.c: the lengths are
+	// saved before GB_apu_init and restored after). Games that power-cycle
+	// the APU between notes depend on it: the next trigger then does not
+	// reload the counter and the note ends when it originally should.
+	length_shadow_ = {ch1_.length_timer, ch2_.length_timer, ch3_.length_timer, ch4_.length_timer};
+	const auto wave = ch3_.ram;
+	ch1_ = Pulse{};
+	ch2_ = Pulse{};
+	ch3_ = Wave{};
+	ch4_ = Noise{};
+	ch3_.ram = wave;
+	nr10_ = nr11_ = nr12_ = nr14_ = 0;
+	nr21_ = nr22_ = nr24_ = 0;
+	nr30_ = nr31_ = nr32_ = nr34_ = 0;
+	nr41_ = nr42_ = nr43_ = nr44_ = 0;
+	nr50_ = nr51_ = 0;
+	power_ = false;
+}
+
+void APU::power_on_channels()
+{
+	// Power-on restores the post-boot register defaults (a power cycle is
+	// not a cold boot), resets the frame sequencer phase, and reinstates
+	// the length counters saved at power-off.
+	ch1_ = Pulse{};
+	ch2_ = Pulse{};
+	ch3_ = Wave{};
+	ch4_ = Noise{};
+	nr10_ = 0x00;
+	nr11_ = 0xBF;
+	nr12_ = 0xF3;
+	nr14_ = 0x40;
+	nr21_ = 0x00;
+	nr22_ = 0x00;
+	nr24_ = 0x40;
+	nr30_ = 0x00;
+	nr31_ = 0xFF;
+	nr32_ = 0x00;
+	nr34_ = 0x40;
+	nr41_ = 0xFF;
+	nr42_ = 0x00;
+	nr43_ = 0x00;
+	nr44_ = 0x40;
+	nr50_ = 0x77;
+	nr51_ = 0xF3;
+	ch1_.duty = nr11_ >> 6;
+	ch1_.length_timer = length_shadow_[0];
+	ch1_.length_enabled = true;
+	ch1_.dac = (nr12_ & 0xF8) != 0;
+	ch1_.env_initial = nr12_ >> 4;
+	ch1_.env_period = nr12_ & 7;
+	ch2_.duty = nr21_ >> 6;
+	ch2_.length_timer = length_shadow_[1];
+	ch2_.length_enabled = true;
+	ch2_.dac = (nr22_ & 0xF8) != 0;
+	ch3_.length_timer = length_shadow_[2];
+	ch3_.length_enabled = true;
+	ch3_.dac = (nr30_ & 0x80) != 0;
+	ch3_.volume_code = (nr32_ >> 5) & 3;
+	ch4_.length_timer = length_shadow_[3];
+	ch4_.length_enabled = true;
+	ch4_.dac = (nr42_ & 0xF8) != 0;
+	frame_step_ = 0;
+	frame_clock_ = 0;
+	ch3_.out_buffer = 0;
+}
+
 void APU::generate_sample()
 {
-	u8 o1 = pulse_output(ch1_);
-	u8 o2 = pulse_output(ch2_);
-	u8 o3 = 0;
-	if (ch3_.enabled && ch3_.dac) {
-		static constexpr u8 kShifts[4] = {4, 0, 1, 2};
-		o3 = ch3_.out_buffer >> kShifts[ch3_.volume_code];
-	}
-	u8 o4 = 0;
-	if (ch4_.enabled && ch4_.dac) {
-		o4 = ((~ch4_.lfsr & 1) != 0) ? ch4_.volume : 0;
+	const u8 o1 = pulse_output(ch1_);
+	const u8 o2 = pulse_output(ch2_);
+	const u8 o3 = wave_level();
+	const u8 o4 = noise_level();
+	// Remember what each channel last emitted, for the power-down fade.
+	const u8 levels[4] = {o1, o2, o3, o4};
+	for (unsigned i = 0; i < 4; i++) {
+		if (levels[i] != 0)
+			last_level_[i] = levels[i];
 	}
 	// Stereo mix per NR51 routing, master volume per NR50. Silence (no
-	// channels) must come out as digital zero, so scale from 0 and strip
-	// residual DC with the high-pass filters.
+	// channels) must come out as digital zero; the DC blocker downstream
+	// keeps it there.
 	const u8 vol_l = (nr50_ >> 4) & 7;
 	const u8 vol_r = nr50_ & 7;
 	u32 left = 0, right = 0;
-	const u8 outs[4] = {o1, o2, o3, o4};
+	int mix[4] = {o1, o2, o3, o4};
+	// Fold in the pending power-down fades (a disabled channel still rings
+	// down through its output capacitor for ~0.5ms).
+	for (unsigned i = 0; i < 4; i++) {
+		if (fade_left_[i] == 0)
+			continue;
+		// Linear ramp from the channel's level down to 0 over
+		// kFadeMixSamples; the channel itself is already silent, so this
+		// is the output capacitor discharging.
+		mix[i] +=
+			static_cast<int>(static_cast<u32>(fade_level_[i]) * fade_left_[i] / kFadeMixSamples);
+		if (--fade_left_[i] == 0)
+			fade_level_[i] = 0;
+	}
 	for (int i = 0; i < 4; i++) {
 		if (nr51_ & (0x10 << i))
-			left += outs[i];
+			left += static_cast<u32>(mix[i] < 0 ? 0 : mix[i]);
 		if (nr51_ & (0x01 << i))
-			right += outs[i];
+			right += static_cast<u32>(mix[i] < 0 ? 0 : mix[i]);
 	}
-	// Max sum 60 * max master 8 = 480 -> *68 = full int16 range.
-	const float raw_l = static_cast<float>(left * (vol_l + 1) * 68);
-	const float raw_r = static_cast<float>(right * (vol_r + 1) * 68);
-	const float out_l_raw = raw_l - hp_x_l_ + 0.996f * hp_y_l_;
-	const float out_r_raw = raw_r - hp_x_r_ + 0.996f * hp_y_r_;
-	hp_x_l_ = raw_l;
-	hp_y_l_ = out_l_raw;
-	hp_x_r_ = raw_r;
-	hp_y_r_ = out_r_raw;
-	const float out_l = out_l_raw * master_volume_;
-	const float out_r = out_r_raw * master_volume_;
-	const auto clamp16 = [](float v) {
-		if (v > 32767.0f)
-			return static_cast<i16>(32767);
-		if (v < -32767.0f)
-			return static_cast<i16>(-32767);
-		return static_cast<i16>(v);
-	};
-	sample_buffer_.push_back(clamp16(out_l));
-	sample_buffer_.push_back(clamp16(out_r));
-	if (sample_buffer_.size() >= kSampleRate / 10 * 2)
-		flush_samples();
+	i16 out_l = 0, out_r = 0;
+	if (output_.push(static_cast<float>(left * (vol_l + 1)) * kMixScale,
+					 static_cast<float>(right * (vol_r + 1)) * kMixScale, &out_l, &out_r)) {
+		sample_buffer_.push_back(out_l);
+		sample_buffer_.push_back(out_r);
+		++frames_emitted_;
+		if (sample_buffer_.size() >= kSampleRate / 10 * 2)
+			flush_samples();
+	}
 }
 
 void APU::flush_samples()
@@ -428,8 +552,10 @@ void APU::flush_samples()
 		return;
 	}
 	// Drop backlog beyond ~250ms to avoid runaway latency after hitches.
+	// Counted: a drop is exactly the moment a game would have crackled.
 	if (SDL_GetAudioStreamQueued(stream_) > static_cast<int>(kSampleRate)) {
 		SDL_ClearAudioStream(stream_);
+		++dropouts_;
 	}
 	SDL_PutAudioStreamData(stream_, sample_buffer_.data(),
 						   static_cast<int>(sample_buffer_.size() * sizeof(i16)));
@@ -648,26 +774,10 @@ void APU::write_reg(u16 addr, u8 value)
 	case 0xFF26: {
 		const bool was = power_;
 		power_ = (value & 0x80) != 0;
-		if (!power_) {
-			// Powering off clears channels and registers but not wave
-			// RAM. Note this is NOT the post-boot state ($F3 etc.):
-			// only a cold boot has that; a power cycle clears to zero.
-			const auto wave = ch3_.ram;
-			ch1_ = Pulse{};
-			ch2_ = Pulse{};
-			ch3_ = Wave{};
-			ch4_ = Noise{};
-			ch3_.ram = wave;
-			nr10_ = nr11_ = nr12_ = nr14_ = 0;
-			nr21_ = nr22_ = nr24_ = 0;
-			nr30_ = nr31_ = nr32_ = nr34_ = 0;
-			nr41_ = nr42_ = nr43_ = nr44_ = 0;
-			nr50_ = nr51_ = 0;
-			power_ = false;
-		} else if (!was) {
-			frame_step_ = 0;
-			ch3_.out_buffer = 0;
-		}
+		if (!power_)
+			power_off_channels();
+		else if (!was)
+			power_on_channels();
 		break;
 	}
 	default:
@@ -679,21 +789,41 @@ void APU::write_wave_ram(u16 addr, u8 value)
 {
 	if (addr < 0xFF30 || addr > 0xFF3F)
 		return;
-	// Normal access. The exact DMG access-conflict windows (same T-cycle as
-	// the sample read, redirected bytes) need sub-M-cycle CPU timing that an
-	// M-cycle core cannot resolve; dmg_sound 09/12 document the gap. Real
-	// games always stop the channel (or DAC) before touching wave RAM, which
-	// takes the conflict-free path and is unaffected.
+	const u8 index = static_cast<u8>(addr - 0xFF30);
+	// DMG bus conflict: while the channel is playing, the wave RAM sits
+	// behind the same bus the DAC fetches on, so a CPU access lands on the
+	// byte currently being played instead of the addressed one, and it is
+	// dropped entirely in the few cycles before a fetch (mGBA src/gb/io.c
+	// redirects to wavedata8[window >> 1] and returns $FF when the RAM is
+	// not "readable"; SameBoy Core/apu.c does the same via
+	// wave_form_just_read). Stopping the channel (or the DAC) first takes
+	// the conflict-free path every real game uses.
 	// https://gbdev.io/pandocs/Audio_Registers.html#ff30ff3f--wave-pattern-ram
-	// GBC: different conflict behavior; revisit with GBC support.
-	ch3_.ram[addr - 0xFF30] = value;
+	// GBC: no conflict (both banks reachable) - revisit with GBC support.
+	if (!ch3_.enabled)
+		ch3_.ram[index] = value;
+	else if (!wave_bus_busy())
+		ch3_.ram[ch3_.pos / 2] = value;
 }
 
 u8 APU::read_wave_ram(u16 addr) const
 {
 	if (addr < 0xFF30 || addr > 0xFF3F)
 		return 0xFF;
-	return ch3_.ram[addr - 0xFF30];
+	const u8 index = static_cast<u8>(addr - 0xFF30);
+	if (!ch3_.enabled)
+		return ch3_.ram[index];
+	if (wave_bus_busy())
+		return 0xFF;
+	return ch3_.ram[ch3_.pos / 2];
+}
+
+bool APU::wave_bus_busy() const
+{
+	// A fetch is imminent (or in flight) within this window, so the bus
+	// belongs to the DAC. mGBA blanks accesses in the last 4 cycles before
+	// the next sample; SameBoy uses the "just read" cycle instead.
+	return ch3_.freq_timer <= kWaveBusCycles;
 }
 
 } // namespace gb

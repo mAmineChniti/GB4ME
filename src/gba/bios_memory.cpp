@@ -16,9 +16,7 @@ HleBios::Outcome HleBios::memory(u8 num, Arm7Tdmi &cpu, GbaBus &bus)
 	const u32 dst = cpu.reg(1);
 	const u32 ctrl = cpu.reg(2);
 	// Refuse BIOS-area sources (GBATEK; mirrors mGBA's guard).
-	auto inBios = [](u32 addr) {
-		return addr < 0x00004000u;
-	};
+	auto inBios = [](u32 addr) { return addr < 0x00004000u; };
 	if (num == kCpuSet) {
 		// GBATEK: r2 = length/mode (bits 0-20 = count, bit 24 = fixed, bit 26 = 32/16-bit)
 		const bool word32 = ((ctrl >> 26) & 1) != 0;
@@ -46,7 +44,7 @@ HleBios::Outcome HleBios::memory(u8 num, Arm7Tdmi &cpu, GbaBus &bus)
 			} else {
 				for (u32 i = 0; i < count; i++) {
 					cpu.storeHalf(d + i * 2, static_cast<u16>(cpu.loadHalf(s + i * 2, false)),
-							i != 0);
+								  i != 0);
 				}
 			}
 		}

@@ -1,0 +1,90 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_STANDARD": "23"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "Release (ccache, warnings as errors)",
+      "inherits": "base"
+    },
+    {
+      "name": "dev-asan",
+      "displayName": "ASan + UBSan verification build",
+      "inherits": "base",
+      "cacheVariables": {
+        "GB4ME_SANITIZE": "ON",
+        "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/build/dev-asan/bin"
+      }
+    },
+    {
+      "name": "dev-strict",
+      "displayName": "Release + selftest kept in a release build",
+      "inherits": "base",
+      "cacheVariables": {
+        "GB4ME_RELEASE": "ON",
+        "GB4ME_KEEP_SELFTEST": "ON",
+        "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/build/dev-strict/bin"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev"
+    },
+    {
+      "name": "dev-asan",
+      "configurePreset": "dev-asan"
+    },
+    {
+      "name": "dev-strict",
+      "configurePreset": "dev-strict"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "selftest",
+      "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "command": "${sourceDir}/build/dev/bin/GB4ME",
+        "args": [
+          "--selftest"
+        ]
+      }
+    },
+    {
+      "name": "selftest-asan",
+      "configurePreset": "dev-asan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=1:halt_on_error=0",
+        "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1"
+      },
+      "execution": {
+        "command": "${sourceDir}/build/dev-asan/bin/GB4ME",
+        "args": [
+          "--selftest"
+        ]
+      }
+    }
+  ]
+}

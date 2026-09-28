@@ -13,6 +13,7 @@
 #include "selftest.h"
 
 #include "gb/apu.h"
+#include "gb/audio_sync.h"
 #include "gb/cartridge.h"
 #include "gb/cpu.h"
 #include "gb/gui_console.h"
@@ -21,16 +22,19 @@
 #include "gb/mmu.h"
 #include "gb/ppu.h"
 #include "gb/timer.h"
+#include "gb/vulkan_renderer.h"
 #include "gba/bios.h"
 #include "gba/core.h"
 #include "gba/cpu.h"
 #include "gba/ppu.h"
 #include "gba/save_hardware.h"
+#include "vulkan/vulkan_internal.h"
 
-#include <cstdarg>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -92,16 +96,20 @@ std::string hex16(u32 v)
 void checkEq(u32 got, u32 want, const char *what)
 {
 	char buf[96];
-	std::snprintf(buf, sizeof buf, "got %s, expected %s", hex32(got).c_str(),
-			hex32(want).c_str());
+	std::snprintf(buf, sizeof buf, "got %s, expected %s", hex32(got).c_str(), hex32(want).c_str());
 	check(got == want, what, buf);
+}
+
+// String comparisons (paths, hardware modes) print the values, not hex.
+void checkStrEq(const std::string &got, const std::string &want, const char *what)
+{
+	check(got == want, what, "got \"" + got + "\", expected \"" + want + "\"");
 }
 
 void checkEq16(u32 got, u32 want, const char *what)
 {
 	char buf[96];
-	std::snprintf(buf, sizeof buf, "got %s, expected %s", hex16(got).c_str(),
-			hex16(want).c_str());
+	std::snprintf(buf, sizeof buf, "got %s, expected %s", hex16(got).c_str(), hex16(want).c_str());
 	check((got & 0xFFFFu) == (want & 0xFFFFu), what, buf);
 }
 
@@ -113,7 +121,7 @@ void checkNear16(u32 got, u32 want, u32 tolerance, const char *what)
 	const u32 diff = (g > w) ? (g - w) : (w - g);
 	char buf[96];
 	std::snprintf(buf, sizeof buf, "got %s, expected %s (tolerance %u)", hex16(g).c_str(),
-			hex16(w).c_str(), tolerance);
+				  hex16(w).c_str(), tolerance);
 	check(diff <= tolerance, what, buf);
 }
 
@@ -121,9 +129,9 @@ void checkNear16(u32 got, u32 want, u32 tolerance, const char *what)
 // GBA fixture
 // ---------------------------------------------------------------------------
 
-constexpr u32 kGbaEntry = 0x08000200;    // Where the synthetic ROM's header B lands.
-constexpr u32 kGbaEntryOff = 0x200;      // ...and its offset inside the ROM file.
-constexpr u32 kCodeBase = 0x02000000;    // EWRAM: writable, executable scratch.
+constexpr u32 kGbaEntry = 0x08000200; // Where the synthetic ROM's header B lands.
+constexpr u32 kGbaEntryOff = 0x200;   // ...and its offset inside the ROM file.
+constexpr u32 kCodeBase = 0x02000000; // EWRAM: writable, executable scratch.
 
 // Minimal 256Kbit cartridge: a valid ARM branch at 0x08000000 (the HLE boot
 // path reads it, GBATEK "CPU Startup"), a park loop (`B .`) at the target and
@@ -145,8 +153,8 @@ std::vector<u8> makeTestRom()
 		chk = static_cast<u8>(chk - rom[i]);
 	rom[0xBD] = static_cast<u8>(chk - 0x19);
 
-	put32(0x00, 0xEA00007Eu);            // B +0x1F8 -> 0x08000200
-	put32(kGbaEntryOff, 0xEAFFFFFEu);    // B $ (park at the entry point)
+	put32(0x00, 0xEA00007Eu);             // B +0x1F8 -> 0x08000200
+	put32(kGbaEntryOff, 0xEAFFFFFEu);     // B $ (park at the entry point)
 	put32(kGbaEntryOff + 4, 0xE12FFF1Eu); // BX LR
 	return rom;
 }
@@ -297,8 +305,7 @@ void testBiosStartup()
 	section("HLE BIOS startup");
 	GbaMachine m;
 	check(m.g.loaded(), "synthetic cartridge loads");
-	checkEq(m.g.cpu().mode() == gba::CpuMode::System ? 1 : 0, 1,
-			"post-BIOS CPU is in System mode");
+	checkEq(m.g.cpu().mode() == gba::CpuMode::System ? 1 : 0, 1, "post-BIOS CPU is in System mode");
 	checkEq(m.g.cpu().state() == gba::CpuState::Arm ? 1 : 0, 1, "post-BIOS state is ARM");
 	checkEq(m.g.cpu().cpsr(), 0x1Fu, "post-BIOS CPSR = System, I+F clear, ARM");
 	checkEq(m.g.cpu().reg(13), gba::HleBios::kSpUsr, "SP_usr = 0x03007F00 (GBATEK stacks)");
@@ -396,7 +403,8 @@ void testSwiDispatch()
 		const u32 src = 0x02001000, dst = 0x02002000;
 		for (u32 i = 0; i < 8; ++i)
 			m.write32(src + 4 * i, 0xA5A50000u + i);
-		m.swi(gba::HleBios::kCpuSet, src, dst, 0x04000008u); // r2 = control: bit26=32-bit, bit24=inc, count=8
+		m.swi(gba::HleBios::kCpuSet, src, dst,
+			  0x04000008u); // r2 = control: bit26=32-bit, bit24=inc, count=8
 		bool ok = true;
 		for (u32 i = 0; i < 8; ++i)
 			ok = ok && m.read32(dst + 4 * i) == 0xA5A50000u + i;
@@ -446,13 +454,13 @@ void testSwiDispatch()
 		GbaMachine m;
 		const u32 in = 0x02001000, out = 0x02002000;
 		// First entry: sx=1.0, sy=1.0, theta=0 -> pa=pd=0x100, pb=pc=0
-		m.write16(in + 0, 0x0100u);    // sx = 1.0 (8.8)
-		m.write16(in + 2, 0x0100u);    // sy = 1.0 (8.8)
-		m.write16(in + 4, 0);          // theta = 0
+		m.write16(in + 0, 0x0100u); // sx = 1.0 (8.8)
+		m.write16(in + 2, 0x0100u); // sy = 1.0 (8.8)
+		m.write16(in + 4, 0);       // theta = 0
 		// Second entry: sx=1.0, sy=1.0, theta=0 -> pa=pd=0x100
-		m.write16(in + 8, 0x0100u);    // sx = 1.0
-		m.write16(in + 10, 0x0100u);   // sy = 1.0
-		m.write16(in + 12, 0);         // theta = 0
+		m.write16(in + 8, 0x0100u);  // sx = 1.0
+		m.write16(in + 10, 0x0100u); // sy = 1.0
+		m.write16(in + 12, 0);       // theta = 0
 		m.swi(gba::HleBios::kObjAffineSet, in, out, 2, 8);
 		checkEq16(m.g.bus().read16(out + 0), 0x0100u, "SWI 0Fh ObjAffineSet first pa");
 		checkEq16(m.g.bus().read16(out + 6), 0x0100u, "SWI 0Fh ObjAffineSet first pd");
@@ -462,7 +470,7 @@ void testSwiDispatch()
 		GbaMachine m;
 		const u32 src = 0x02001000, info = 0x02001100, dst = 0x02002000;
 		m.g.bus().write8(src, 0x0F);
-		m.write16(info + 0, 1); // source length in bytes
+		m.write16(info + 0, 1);        // source length in bytes
 		m.g.bus().write8(info + 2, 1); // source width
 		m.g.bus().write8(info + 3, 8); // destination width
 		m.write32(info + 4, 0);        // bias
@@ -477,11 +485,11 @@ void testSwiDispatch()
 		GbaMachine m;
 		const u32 src = 0x02001000, dst = 0x02002000;
 		const u8 stream[] = {
-			0x10, 0x10, 0x00, 0x00,             // signature + 24-bit length = 16
-			0x00,                               // flag: 8 literal bytes
-			'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
-			0x80,                               // flag: compressed block next
-			0x50, 0x07,                         // len-3 = 5 -> 8 bytes, disp-1 = 7
+			0x10, 0x10, 0x00, 0x00, // signature + 24-bit length = 16
+			0x00,                   // flag: 8 literal bytes
+			'A',  'B',  'C',  'D',  'E', 'F', 'G', 'H',
+			0x80,       // flag: compressed block next
+			0x50, 0x07, // len-3 = 5 -> 8 bytes, disp-1 = 7
 		};
 		for (size_t i = 0; i < sizeof stream; ++i)
 			m.g.bus().write8(src + static_cast<u32>(i), stream[i]);
@@ -512,8 +520,8 @@ void testSwiDispatch()
 			m.g.bus().write8(src + static_cast<u32>(i), stream[i]);
 		m.swi(gba::HleBios::kDiff8bitUnFilterWram, src, dst);
 		check(m.g.bus().read8(dst + 0) == 1 && m.g.bus().read8(dst + 1) == 2 &&
-						m.g.bus().read8(dst + 2) == 3,
-				"SWI 16h Diff8bitUnFilterWram 1,1,1 -> 1,2,3");
+				  m.g.bus().read8(dst + 2) == 3,
+			  "SWI 16h Diff8bitUnFilterWram 1,1,1 -> 1,2,3");
 	}
 	{ // Unknown SWI: must return rather than derail execution.
 		GbaMachine m;
@@ -537,13 +545,13 @@ void testArmInstructions()
 	{ // Data processing flags.
 		GbaMachine m;
 		m.runArm({
-				0xE3A00001u, // MOV r0, #1
-				0xE2900001u, // ADDS r0, r0, #1 -> 2, no carry out
+			0xE3A00001u, // MOV r0, #1
+			0xE2900001u, // ADDS r0, r0, #1 -> 2, no carry out
 		});
 		checkEq(m.r(0), 2, "MOV/ADDS r0 = 2");
 		check(!m.g.cpu().getFlag(gba::kFlagC) && !m.g.cpu().getFlag(gba::kFlagZ) &&
-						!m.g.cpu().getFlag(gba::kFlagN),
-				"ADDS with no carry out clears C");
+				  !m.g.cpu().getFlag(gba::kFlagN),
+			  "ADDS with no carry out clears C");
 		m.runArm({0xE3500002u}); // CMP r0, #2
 		check(m.g.cpu().getFlag(gba::kFlagZ), "CMP r0,#2 sets Z");
 		check(m.g.cpu().getFlag(gba::kFlagC), "CMP has no borrow -> C set");
@@ -551,46 +559,46 @@ void testArmInstructions()
 	{ // Carry out and negative flag.
 		GbaMachine m;
 		m.runArm({
-				0xE3E00000u, // MVN r0, #0 -> 0xFFFFFFFF
-				0xE2900001u, // ADDS r0, r0, #1 -> 0, Z+C
+			0xE3E00000u, // MVN r0, #0 -> 0xFFFFFFFF
+			0xE2900001u, // ADDS r0, r0, #1 -> 0, Z+C
 		});
 		checkEq(m.r(0), 0, "0xFFFFFFFF + 1 wraps to 0");
 		check(m.g.cpu().getFlag(gba::kFlagZ) && m.g.cpu().getFlag(gba::kFlagC),
-				"wrap sets Z and C");
+			  "wrap sets Z and C");
 	}
 	{ // Condition codes: MOVEQ skipped while Z is clear.
 		GbaMachine m;
 		m.runArm({
-				0xE3A00005u, // MOV r0, #5
-				0xE3500006u, // CMP r0, #6 (not equal)
-				0x03A000FFu, // MOVEQ r0, #0xFF (must not run)
+			0xE3A00005u, // MOV r0, #5
+			0xE3500006u, // CMP r0, #6 (not equal)
+			0x03A000FFu, // MOVEQ r0, #0xFF (must not run)
 		});
 		checkEq(m.r(0), 5, "conditional MOVEQ not executed when Z = 0");
 	}
 	{ // Barrel shifter with register-specified shift.
 		GbaMachine m;
 		m.runArm({
-				0xE3A00201u, // MOV r0, #0x01000000
-				0xE3A01008u, // MOV r1, #8
-				0xE1A00410u, // MOV r0, r0, LSL r1
+			0xE3A00201u, // MOV r0, #0x01000000
+			0xE3A01008u, // MOV r1, #8
+			0xE1A00410u, // MOV r0, r0, LSL r1
 		});
 		checkEq(m.r(0), 0x10000000u, "LSL by register");
 	}
 	{ // Multiply / multiply-accumulate / long multiply.
 		GbaMachine n;
 		n.runArm({
-				0xE3A00007u, // MOV r0, #7
-				0xE3A01006u, // MOV r1, #6
-				0xE0030091u, // MUL r3, r1, r0  -> 42
-				0xE3A02005u, // MOV r2, #5
-				0xE0233291u, // MLA r3, r1, r2, r3 -> 42 + 30 = 72
+			0xE3A00007u, // MOV r0, #7
+			0xE3A01006u, // MOV r1, #6
+			0xE0030091u, // MUL r3, r1, r0  -> 42
+			0xE3A02005u, // MOV r2, #5
+			0xE0233291u, // MLA r3, r1, r2, r3 -> 42 + 30 = 72
 		});
 		checkEq(n.r(3), 72, "MUL then MLA");
 		GbaMachine l;
 		l.runArm({
-				0xE3E01000u, // MVN r1, #0 -> 0xFFFFFFFF
-				0xE3A00002u, // MOV r0, #2
-				0xE0830091u, // UMULL r0, r3, r1, r0
+			0xE3E01000u, // MVN r1, #0 -> 0xFFFFFFFF
+			0xE3A00002u, // MOV r0, #2
+			0xE0830091u, // UMULL r0, r3, r1, r0
 		});
 		checkEq(l.r(0), 0xFFFFFFFEu, "UMULL low word");
 		checkEq(l.r(3), 0x00000001u, "UMULL high word");
@@ -599,39 +607,39 @@ void testArmInstructions()
 		GbaMachine m;
 		m.write32(0x02000400, 0x11223344u);
 		m.runArm({
-				0xE59F0010u, // LDR r0, [pc, #16] -> literal below
-				0xE3A01000u,
-				0xE1A02000u, // MOV r2, r0
-				0xE59F000Cu, // LDR r0, [pc, #12]
-				0xE5901000u, // LDR r1, [r0]      (aligned)
-				0xEAFFFFFEu, // park (never reached: runArm appends its own)
-				0x02000400u, // literal: address
-				0x02000400u, // literal: address
-				0x02000400u,
+			0xE59F0010u, // LDR r0, [pc, #16] -> literal below
+			0xE3A01000u,
+			0xE1A02000u, // MOV r2, r0
+			0xE59F000Cu, // LDR r0, [pc, #12]
+			0xE5901000u, // LDR r1, [r0]      (aligned)
+			0xEAFFFFFEu, // park (never reached: runArm appends its own)
+			0x02000400u, // literal: address
+			0x02000400u, // literal: address
+			0x02000400u,
 		});
 		checkEq(m.r(1), 0x11223344u, "aligned LDR reads the stored word");
 		m.runArm({
-				0xE3A00000u, // MOV r0, #0
-				0xE59F0010u, // LDR r0, [pc, #16] -> 0x02000401
-				0xE5901000u, // LDR r1, [r0]      (unaligned: rotate right 8)
-				0xE1A01001u,
-				0xE1A01001u,
-				0xEAFFFFFEu,
-				0x02000401u,
-				0x02000401u,
-				0x02000401u,
+			0xE3A00000u, // MOV r0, #0
+			0xE59F0010u, // LDR r0, [pc, #16] -> 0x02000401
+			0xE5901000u, // LDR r1, [r0]      (unaligned: rotate right 8)
+			0xE1A01001u,
+			0xE1A01001u,
+			0xEAFFFFFEu,
+			0x02000401u,
+			0x02000401u,
+			0x02000401u,
 		});
 		checkEq(m.r(1), 0x44112233u, "unaligned LDR rotates by 8 * (addr & 3)");
 		m.runArm({
-				0xE59F0010u, // LDR r0, [pc, #16] -> 0x02000401
-				0xE3A01042u, // MOV r1, #0x42
-				0xE1C010B0u, // STRH r1, [r0]     (aligns down to 0x02000400)
-				0xE1A01001u,
-				0xE1A01001u,
-				0xEAFFFFFEu,
-				0x02000401u,
-				0x02000401u,
-				0x02000401u,
+			0xE59F0010u, // LDR r0, [pc, #16] -> 0x02000401
+			0xE3A01042u, // MOV r1, #0x42
+			0xE1C010B0u, // STRH r1, [r0]     (aligns down to 0x02000400)
+			0xE1A01001u,
+			0xE1A01001u,
+			0xEAFFFFFEu,
+			0x02000401u,
+			0x02000401u,
+			0x02000401u,
 		});
 		checkEq16(m.g.bus().read16(0x02000400), 0x0042u, "unaligned STRH aligns down");
 	}
@@ -639,15 +647,15 @@ void testArmInstructions()
 		GbaMachine m;
 		m.g.bus().write8(0x02000500, 0x80);
 		m.runArm({
-				0xE59F0018u, // LDR r0, [pc, #24] -> 0x02000500
-				0xE5D01000u, // LDRB r1, [r0]
-				0xE1D120F0u, // LDRSH r2, [r0]  (from 0x8000 pattern below)
-				0xE1A01001u,
-				0xE1A01001u,
-				0xEAFFFFFEu,
-				0x02000500u,
-				0x02000500u,
-				0x02000500u,
+			0xE59F0018u, // LDR r0, [pc, #24] -> 0x02000500
+			0xE5D01000u, // LDRB r1, [r0]
+			0xE1D120F0u, // LDRSH r2, [r0]  (from 0x8000 pattern below)
+			0xE1A01001u,
+			0xE1A01001u,
+			0xEAFFFFFEu,
+			0x02000500u,
+			0x02000500u,
+			0x02000500u,
 		});
 		checkEq(m.r(1), 0x80u, "LDRB zero-extends");
 	}
@@ -656,16 +664,16 @@ void testArmInstructions()
 		for (u32 i = 0; i < 4; ++i)
 			m.write32(0x02000600 + 4 * i, 0x10u + i);
 		m.runArm({
-				0xE59F001Cu, // LDR r0, [pc, #28] -> 0x02000600
-				0xE890000Eu, // LDMIA r0, {r1, r2, r3}
-				0xE3A04000u, // MOV r4, #0
-				0xE1A00000u, // NOP
-				0xE1A00000u,
-				0xE1A00000u,
-				0xEAFFFFFEu,
-				0x02000600u,
-				0x02000600u,
-				0x02000600u,
+			0xE59F001Cu, // LDR r0, [pc, #28] -> 0x02000600
+			0xE890000Eu, // LDMIA r0, {r1, r2, r3}
+			0xE3A04000u, // MOV r4, #0
+			0xE1A00000u, // NOP
+			0xE1A00000u,
+			0xE1A00000u,
+			0xEAFFFFFEu,
+			0x02000600u,
+			0x02000600u,
+			0x02000600u,
 		});
 		checkEq(m.r(1), 0x10u, "LDM r1");
 		checkEq(m.r(2), 0x11u, "LDM r2");
@@ -675,15 +683,15 @@ void testArmInstructions()
 		GbaMachine m;
 		m.write32(0x02000700, 0xCAFEBABEu);
 		m.runArm({
-				0xE59F0014u, // LDR r0, [pc, #20] -> 0x02000700
-				0xE3A01011u, // MOV r1, #0x11
-				0xE1001091u, // SWP r1, r1, [r0] -> r1 = old memory, memory = r1
-				0xE1A00000u,
-				0xE1A00000u,
-				0xEAFFFFFEu,
-				0x02000700u,
-				0x02000700u,
-				0x02000700u,
+			0xE59F0014u, // LDR r0, [pc, #20] -> 0x02000700
+			0xE3A01011u, // MOV r1, #0x11
+			0xE1001091u, // SWP r1, r1, [r0] -> r1 = old memory, memory = r1
+			0xE1A00000u,
+			0xE1A00000u,
+			0xEAFFFFFEu,
+			0x02000700u,
+			0x02000700u,
+			0x02000700u,
 		});
 		checkEq(m.r(1), 0xCAFEBABEu, "SWP returns the old word");
 		checkEq(m.read32(0x02000700), 0x11u, "SWP wrote the new word");
@@ -693,12 +701,11 @@ void testArmInstructions()
 		GbaMachine m;
 		m.g.cpu().setReg(0, 0xF000001Cu); // flags=0xF0, mode=0x1C (invalid)
 		m.runArm({
-				0xE12C0000u, // MSR CPSR_fc, r0
-				0xE1A00000u,
+			0xE12C0000u, // MSR CPSR_fc, r0
+			0xE1A00000u,
 		});
 		checkEq(m.g.cpu().cpsr() & 0x1Fu, 0x1Fu, "unimplemented mode field ignored by MSR");
-		check((m.g.cpu().cpsr() & 0xF0000000u) == 0xF0000000u,
-				"MSR still applies the flag field");
+		check((m.g.cpu().cpsr() & 0xF0000000u) == 0xF0000000u, "MSR still applies the flag field");
 	}
 	{ // User mode cannot change the control field (writes are ignored).
 		GbaMachine m;
@@ -710,10 +717,12 @@ void testArmInstructions()
 	{ // BX / BL with LR link.
 		GbaMachine m;
 		m.write32(0x02000300, 0xE12FFF1Eu); // BX LR
-		m.runArm({
+		m.runArm(
+			{
 				0xEB0000BEu, // BL 0x02000300 (offset 0x300 - 8 = 0x2F8 / 4 = 0xBE)
 				0xE1A00000u,
-		}, kCodeBase, 64);
+			},
+			kCodeBase, 64);
 		checkEq(m.r(14), kCodeBase + 4, "BL links LR to the next instruction");
 	}
 }
@@ -724,9 +733,9 @@ void testThumbInstructions()
 	{ // Small arithmetic + flags.
 		GbaMachine m;
 		m.runThumb({
-				0x2005u, // MOV r0, #5
-				0x3001u, // ADD r0, #1
-				0x2806u, // CMP r0, #6
+			0x2005u, // MOV r0, #5
+			0x3001u, // ADD r0, #1
+			0x2806u, // CMP r0, #6
 		});
 		checkEq(m.r(0), 6, "THUMB MOV/ADD");
 		check(m.g.cpu().getFlag(gba::kFlagZ), "THUMB CMP sets Z");
@@ -749,43 +758,48 @@ void testThumbInstructions()
 	{ // Register shift + high-register ALU + BL/BX round trip.
 		GbaMachine m;
 		m.write16(0x02000300, 0x4770u); // BX LR
-		m.runThumb({
-				0x2108u,              // MOV r1, #8
-				0x0008u,              // MOV r0, r1
+		m.runThumb(
+			{
+				0x2108u, // MOV r1, #8
+				0x0008u, // MOV r0, r1
 				0x0080u, // LSL r0, r0, #2 -> 32
 				0xF000u, // BL 0x02000300 (high halfword: link)
 				0xF800u, // BL 0x02000300 (low halfword: offset)
 				0x4603u, // MOV r3, r0
-		}, kCodeBase, 64);
+			},
+			kCodeBase, 64);
 		checkEq(m.r(3), 32, "THUMB LSL + BL/BX return");
 	}
 	{ // PUSH/POP and stack access.
 		GbaMachine m;
 		m.runThumb({
-				0x2007u, // MOV r0, #7
-				0xB402u, // PUSH {r1}
-				0x2109u, // MOV r1, #9
-				0xBC02u, // POP {r1}
+			0x2007u, // MOV r0, #7
+			0xB402u, // PUSH {r1}
+			0x2109u, // MOV r1, #9
+			0xBC02u, // POP {r1}
 		});
 		checkEq(m.r(1), 0, "THUMB PUSH/POP restores the pushed value");
 	}
 	{ // PC-relative literal load.
 		GbaMachine m;
 		m.g.bus().write32(0x02000400, 0xABCD1234u);
-		m.runThumb({
+		m.runThumb(
+			{
 				0x4800u, // LDR r0, [pc, #0]  -> literal at (pc+4)&~2 relative
 				0x0000u,
 				0x0000u,
-		}, 0x020003F0u, 64);
+			},
+			0x020003F0u, 64);
 		info("THUMB LDR literal PC was %s, r0 = %s", hex32(m.g.cpu().pc()).c_str(),
-				hex32(m.r(0)).c_str());
+			 hex32(m.r(0)).c_str());
 		check(m.r(0) != 0, "THUMB LDR literal loads a value");
 	}
 	{ // ARM <-> THUMB interworking through BX.
 		GbaMachine m;
 		m.write16(0x02000300, 0x2017u); // MOV r0, #23
 		m.write16(0x02000302, 0x4770u); // BX LR (LR bit0 set -> stays THUMB)
-		m.runArm({
+		m.runArm(
+			{
 				0xE59F0010u, // LDR r0, [pc, #16] -> 0x02000301
 				0xE12FFF10u, // BX r0 (switch to THUMB)
 				0xE1A00000u,
@@ -795,7 +809,8 @@ void testThumbInstructions()
 				0x02000301u,
 				0x02000301u,
 				0x02000301u,
-		}, kCodeBase, 64);
+			},
+			kCodeBase, 64);
 		checkEq(m.r(0), 23, "BX switches ARM -> THUMB and runs THUMB code");
 	}
 	{ // THUMB.10 LDRH/STRH: imm5 scaled by 2 (GBATEK nn = 0..62 step 2).
@@ -876,7 +891,7 @@ void testExceptionsAndIrq()
 		m.runFrames(2);
 		const u32 count = m.read32(0x02000200);
 		check(count >= 2, "VBlank IRQ reached the handler via the BIOS trampoline",
-				"count=" + hex32(count));
+			  "count=" + hex32(count));
 		checkEq(m.io16r(0x04000208), 1, "IME still enabled after servicing");
 	}
 	{ // IE gating: DISPSTAT enable + IE must both be set, IME must be 1.
@@ -988,7 +1003,7 @@ void testBus()
 	const u32 rom_n = m.g.bus().accessCycles(0x08000000, 2, false);
 	const u32 rom_s = m.g.bus().accessCycles(0x08000000, 2, true);
 	check(rom_n >= rom_s, "ROM N-cycles >= S-cycles at default WAITCNT",
-			"N=" + hex32(rom_n) + " S=" + hex32(rom_s));
+		  "N=" + hex32(rom_n) + " S=" + hex32(rom_s));
 	// SRAM is the slowest region (8 cycles, 3+1 wait pattern per GBATEK).
 	m.g.bus().write8(0x0E000000, 0x12);
 	check(m.g.bus().accessCycles(0x0E000000, 1, true) > rom_s, "SRAM slower than ROM");
@@ -1026,7 +1041,7 @@ void testPpu()
 		m.runFrames(1);
 		const u32 px = m.g.ppu().frame().pixels[80 * 240 + 120];
 		check(((px >> 16) & 0xFF) > 0xE0 && ((px >> 8) & 0xFF) < 0x20,
-				"no layers -> backdrop = palette entry 0", hex32(px));
+			  "no layers -> backdrop = palette entry 0", hex32(px));
 	}
 	{
 		GbaMachine m;
@@ -1036,12 +1051,12 @@ void testPpu()
 		m.runFrames(1);
 		const u32 px = m.g.ppu().frame().pixels[0];
 		check(((px >> 16) & 0xFF) > 0xE0 && ((px >> 8) & 0xFF) < 0x20,
-				"mode 3 bitmap pixel renders red", hex32(px));
+			  "mode 3 bitmap pixel renders red", hex32(px));
 	}
 	{ // Mode 0 text BG: 4bpp tile 0 filled with colour 1, BG0 map entry 0.
 		GbaMachine m;
-		m.io16(0x04000000, 0x0100u);          // DISPCNT: mode 0, BG0 on
-		m.io16(0x04000008, 0x1000u);          // BG0CNT: map base block 16 -> 0x06008000
+		m.io16(0x04000000, 0x0100u); // DISPCNT: mode 0, BG0 on
+		m.io16(0x04000008, 0x1000u); // BG0CNT: map base block 16 -> 0x06008000
 		for (u32 i = 0; i < 32; ++i)
 			m.g.bus().write16(0x06000000u + 2 * i, 0x1111u); // tile 0 rows
 		m.g.bus().write16(0x06008000u, 0x0000u);             // map entry 0 -> tile 0
@@ -1050,7 +1065,7 @@ void testPpu()
 		m.runFrames(1);
 		const u32 px = m.g.ppu().frame().pixels[0];
 		check(((px >> 8) & 0xFF) > 0xE0 && ((px >> 16) & 0xFF) < 0x20,
-				"mode 0 BG0 tile colour index 1 = palette colour 1", hex32(px));
+			  "mode 0 BG0 tile colour index 1 = palette colour 1", hex32(px));
 	}
 	{
 		GbaMachine m;
@@ -1060,9 +1075,9 @@ void testPpu()
 		m.g.bus().write16(0x05000202, 0x001Fu); // OBJ palette 0 colour 1
 		for (u32 i = 0; i < 8; ++i)
 			m.g.bus().write16(0x06010000u + 2 * i, 0x1111u); // OBJ tile 0 rows
-		m.g.bus().write16(0x07000000, 20); // attr0: y
-		m.g.bus().write16(0x07000002, 8);  // attr1: x
-		m.g.bus().write16(0x07000004, 0);  // attr2: tile 0, palette 0
+		m.g.bus().write16(0x07000000, 20);                   // attr0: y
+		m.g.bus().write16(0x07000002, 8);                    // attr1: x
+		m.g.bus().write16(0x07000004, 0);                    // attr2: tile 0, palette 0
 		m.runFrames(1);
 		bool found_red = false;
 		for (u32 y = 0; y < 40; ++y)
@@ -1089,7 +1104,7 @@ void testPpu()
 		m.runFrames(1);
 		const u32 px = m.g.ppu().frame().pixels[0];
 		check(((px >> 16) & 0xFF) > 0xE0, "backdrop colour (palette 0 colour 0) after BG0 off",
-				hex32(px));
+			  hex32(px));
 	}
 	{ // Priority: OBJ beats BG on equal priority numbers, BG0 beats BG1
 	  // (mGBA composite order; GBATEK "BG0 is having the highest").
@@ -1101,7 +1116,7 @@ void testPpu()
 			m.g.bus().write16(0x06000000u + 2 * i, 0x1111u); // tile 0: colour 1
 		for (u32 i = 0; i < 32; ++i)
 			m.g.bus().write16(0x06000020u + 2 * i, 0x2222u); // tile 1: colour 2
-		m.g.bus().write16(0x06008000u, 0x0000u); // BG0 map -> tile 0
+		m.g.bus().write16(0x06008000u, 0x0000u);             // BG0 map -> tile 0
 		for (u32 i = 0; i < 1024; ++i)
 			m.g.bus().write16(0x06008800u + 2 * i, 0x0001u); // BG1 map -> tile 1
 		m.g.bus().write16(0x05000000, 0x0000u);
@@ -1110,23 +1125,23 @@ void testPpu()
 		m.g.bus().write16(0x05000202, 0x001Fu); // OBJ colour 1 = red
 		for (u32 i = 0; i < 16; ++i)
 			m.g.bus().write16(0x06010000u + 2 * i, 0x1111u); // OBJ tile 0, rows 0-7
-		m.g.bus().write16(0x07000000, 20); // attr0: y = 20
-		m.g.bus().write16(0x07000002, 8);  // attr1: x = 8
-		m.g.bus().write16(0x07000004, 0);  // attr2: tile 0, prio 0
+		m.g.bus().write16(0x07000000, 20);                   // attr0: y = 20
+		m.g.bus().write16(0x07000002, 8);                    // attr1: x = 8
+		m.g.bus().write16(0x07000004, 0);                    // attr2: tile 0, prio 0
 		m.runFrames(1);
 		const u32 px = m.g.ppu().frame().pixels[24 * 240 + 12];
 		check(((px >> 16) & 0xFF) > 0xE0 && ((px >> 8) & 0xFF) < 0x20,
-				"OBJ beats BG0 on priority tie", hex32(px));
+			  "OBJ beats BG0 on priority tie", hex32(px));
 		m.io16(0x04000000, 0x0300u); // OBJ off: BG0 vs BG1, same prio
 		m.runFrames(1);
 		const u32 px2 = m.g.ppu().frame().pixels[24 * 240 + 12];
 		check(((px2 >> 8) & 0xFF) > 0xE0 && ((px2 >> 16) & 0xFF) < 0x20,
-				"BG0 beats BG1 on priority tie", hex32(px2));
+			  "BG0 beats BG1 on priority tie", hex32(px2));
 	}
 	{ // 256-color sprites: OAM numbers address 32-byte slots (GBATEK
 	  // 1D example tiles 04h,06h; mGBA tile*0x20), not 64-byte tiles.
 		GbaMachine m;
-		m.io16(0x04000000, 0x1040u); // mode 0, OBJ, 1D mapping
+		m.io16(0x04000000, 0x1040u);                         // mode 0, OBJ, 1D mapping
 		m.g.bus().write16(0x05000200u + 2 * 0x5Au, 0x001Fu); // OBJ colour 0x5A = red
 		m.g.bus().write16(0x05000200u + 2 * 0xA5u, 0x7C00u); // OBJ colour 0xA5 = blue
 		for (u32 i = 0; i < 4; ++i)
@@ -1137,7 +1152,7 @@ void testPpu()
 		m.runFrames(1);
 		const u32 px = m.g.ppu().frame().pixels[20 * 240 + 10];
 		check(((px >> 16) & 0xFF) > 0xE0 && ((px >> 8) & 0xFF) < 0x20,
-				"256-colour 8x8 sprite reads slot tile*32", hex32(px));
+			  "256-colour 8x8 sprite reads slot tile*32", hex32(px));
 	}
 	{ // Alpha blend: BG0 (first target) over BG1 (second target) mixes
 	  // EVA/EVB (GBATEK color special effects).
@@ -1162,12 +1177,12 @@ void testPpu()
 		const unsigned r = (px >> 16) & 0xFFu, g = (px >> 8) & 0xFFu;
 		const unsigned b = px & 0xFFu;
 		check(r > 0x60 && r < 0xA0 && g > 0x60 && g < 0xA0 && b < 0x20,
-				"alpha blend mixes red over green", hex32(px));
+			  "alpha blend mixes red over green", hex32(px));
 	}
 	{ // LZ77UnCompVram assembles halfwords across byte stores (GBATEK).
 		GbaMachine m;
 		const u32 src = 0x02001000u, dst = 0x06000000u;
-		m.write32(src, 0x00000410u); // header: 0x10, length 4
+		m.write32(src, 0x00000410u);      // header: 0x10, length 4
 		m.g.bus().write8(src + 4, 0x00u); // block header: 8 literals
 		m.g.bus().write8(src + 5, 0xDEu);
 		m.g.bus().write8(src + 6, 0xADu);
@@ -1180,19 +1195,19 @@ void testPpu()
 	{ // HuffUnComp 4-bit: root with two terminal leaves (GBATEK tree).
 		GbaMachine m;
 		const u32 src = 0x02001000u, dst = 0x02002000u;
-		m.write32(src, 0x00000424u); // header: 0x20|4, length 4
+		m.write32(src, 0x00000424u);      // header: 0x20|4, length 4
 		m.g.bus().write8(src + 4, 0x01u); // tree size 3
 		m.g.bus().write8(src + 5, 0xC0u); // root: both terminal
 		m.g.bus().write8(src + 6, 0x05u); // left leaf
 		m.g.bus().write8(src + 7, 0x0Au); // right leaf
-		m.write32(src + 8, 0x40000000u); // bits 0,1 -> 5,A, then 5s (8 nibbles)
+		m.write32(src + 8, 0x40000000u);  // bits 0,1 -> 5,A, then 5s (8 nibbles)
 		m.swi(0x13, src, dst);
 		checkEq(m.read32(dst), 0x555555A5u, "Huffman 4-bit decodes 5,A,5...");
 	}
 	{ // RlUnCompVram run block + Diff16bitUnFilter chained deltas.
 		GbaMachine m;
 		const u32 src = 0x02001000u, dst = 0x06000000u;
-		m.write32(src, 0x00000430u); // header: 0x30, length 4
+		m.write32(src, 0x00000430u);      // header: 0x30, length 4
 		m.g.bus().write8(src + 4, 0x81u); // run of 4
 		m.g.bus().write8(src + 5, 0x7Eu);
 		m.swi(0x15, src, dst);
@@ -1215,16 +1230,16 @@ void testPpu()
 		m.g.bus().write16(0x05000202, 0x001Fu);              // OBJ colour 1 red
 		for (u32 i = 0; i < 128; ++i) {                      // 64x64, two columns
 			const u32 x = i < 19 ? 0u : 176u;
-			m.g.bus().write16(0x07000000u + 8 * i, 0);             // y = 0
-			m.g.bus().write16(0x07000002u + 8 * i, x | 0xC000u);   // x, size 3
-			m.g.bus().write16(0x07000004u + 8 * i, 0);             // tile 0
+			m.g.bus().write16(0x07000000u + 8 * i, 0);           // y = 0
+			m.g.bus().write16(0x07000002u + 8 * i, x | 0xC000u); // x, size 3
+			m.g.bus().write16(0x07000004u + 8 * i, 0);           // tile 0
 		}
 		m.runFrames(1);
 		const u32 early = m.g.ppu().frame().pixels[32 * 240 + 32];
 		const u32 late = m.g.ppu().frame().pixels[32 * 240 + 200];
 		check(((early >> 16) & 0xFF) > 0xE0, "early sprite draws", hex32(early));
 		check(((late >> 16) & 0xFF) < 0x20 && ((late >> 8) & 0xFF) < 0x20,
-				"over-budget sprite drops to backdrop", hex32(late));
+			  "over-budget sprite drops to backdrop", hex32(late));
 	}
 	{ // A non-transformed OBJ parked below the screen must NOT be drawn
 	  // wrapped onto the top. mGBA wraps Y only for transformed sprites
@@ -1258,7 +1273,7 @@ void testPpu()
 	{ // OBJ vertical mosaic snaps by screen Y (VBA-M cites NBA/HW
 	  // research; mGBA snaps the scanline too), not by sprite-local row.
 		GbaMachine m;
-		m.io16(0x04000000, 0x1000u); // mode 0, OBJ
+		m.io16(0x04000000, 0x1000u);  // mode 0, OBJ
 		m.io16(0x0400004Cu, 0x7000u); // OBJ mosaic V = 8
 		for (u32 r = 0; r < 8; ++r) {
 			const u16 v = static_cast<u16>(((r + 1) << 4) | (r + 1));
@@ -1268,10 +1283,10 @@ void testPpu()
 		m.g.bus().write16(0x05000000, 0x0000u);
 		for (u32 c = 1; c <= 8; ++c)
 			m.g.bus().write16(0x05000200u + 2 * c,
-					static_cast<u16>((c << 10) | (c << 5) | c)); // grey ramp
-		m.g.bus().write16(0x07000000, 20 | 0x1000u);     // attr0: y, mosaic
-		m.g.bus().write16(0x07000002, 8);                // attr1: x, 8x8
-		m.g.bus().write16(0x07000004, 0);                // attr2: tile 0
+							  static_cast<u16>((c << 10) | (c << 5) | c)); // grey ramp
+		m.g.bus().write16(0x07000000, 20 | 0x1000u);                       // attr0: y, mosaic
+		m.g.bus().write16(0x07000002, 8);                                  // attr1: x, 8x8
+		m.g.bus().write16(0x07000004, 0);                                  // attr2: tile 0
 		m.runFrames(1);
 		// Line 25, sprite row 5: screen snap 25 - 25%8 = 24 -> row 4
 		// (colour 5). Sprite-local snap would give row 0 (colour 1).
@@ -1283,7 +1298,7 @@ void testPpu()
 		// Colour 5 renders as (41,41,41); colour 1 as (8,8,8); a miss is
 		// backdrop black. 0x20 separates them.
 		check(((px >> 16) & 0xFF) > 0x20 && ((px >> 8) & 0xFF) > 0x20,
-				"OBJ mosaic uses screen-Y snap", hex32(px));
+			  "OBJ mosaic uses screen-Y snap", hex32(px));
 	}
 	{ // Scanline timing: line 160 is VBlank (GBATEK "GBA Video Controller").
 		GbaMachine m;
@@ -1337,8 +1352,8 @@ void testDma()
 		GbaMachine m;
 		for (u32 i = 0; i < 16; ++i)
 			m.write32(0x02001000 + 4 * i, 0x51510000u + i);
-		m.write32(0x040000D4, 0x02001000u);              // SAD
-		m.write32(0x040000D8, 0x02002000u);              // DAD
+		m.write32(0x040000D4, 0x02001000u);               // SAD
+		m.write32(0x040000D8, 0x02002000u);               // DAD
 		m.write32(0x040000DC, (16u << 16) | 0x84000000u); // 32-bit, immediate, enable
 		bool ok = true;
 		for (u32 i = 0; i < 16; ++i)
@@ -1422,16 +1437,17 @@ void testTimers()
 		m.runCycles(0x200);
 		check((m.io16r(0x04000202) & 0x08u) != 0, "timer 0 overflow raises IF bit 3");
 		checkNear16(m.g.bus().read16(0x04000100), 0xFF00u, 0x08u,
-				"timer reloads on overflow and keeps counting");
+					"timer reloads on overflow and keeps counting");
 	}
 	{ // CNT_L write semantics (GBATEK: write sets reload, read returns
 	  // frozen counter while stopped; reload loads on enable).
 		GbaMachine m;
 		m.write16(0x04000100, 0x1111u);
-		checkEq16(m.g.bus().read16(0x04000100), 0x0000u, "CNT_L read returns frozen counter while stopped");
+		checkEq16(m.g.bus().read16(0x04000100), 0x0000u,
+				  "CNT_L read returns frozen counter while stopped");
 		m.write16(0x04000102, 0x0080u); // enable
 		checkNear16(m.g.bus().read16(0x04000100), 0x1111u, 0x04u,
-				"enabling loads the counter from the reload value");
+					"enabling loads the counter from the reload value");
 	}
 	{ // Prescaler /1024 over a long budget: 0x10000 / 1024 = 64 ticks.
 		GbaMachine m;
@@ -1439,7 +1455,7 @@ void testTimers()
 		m.write16(0x04000102, 0x0083u); // enable, prescaler /1024
 		m.runCycles(0x10000);
 		checkNear16(m.g.bus().read16(0x04000100), 0xFF40u, 0x04u,
-				"prescaler /1024 divides by 1024");
+					"prescaler /1024 divides by 1024");
 	}
 	{ // Cascade: timer 1 counts on timer 0 overflow.
 		GbaMachine m;
@@ -1459,7 +1475,7 @@ void testTimers()
 void testGpioRtc()
 {
 	section("GPIO/RTC");
-	{ // RTC carts are detected by game code (mGBA overrides table).
+	{                 // RTC carts are detected by game code (mGBA overrides table).
 		GbaMachine m; // synthetic ROM: no RTC prefix
 		check(!m.g.cartridge().hasGpio(), "test ROM has no GPIO");
 		std::vector<u8> bpee = makeTestRom();
@@ -1523,6 +1539,81 @@ void testGpioRtc()
 		w16(0x080000C4u, 0x00u); // CS low: end transfer
 		checkEq(status, 0x40u, "RTC status: 24-hour mode, no power failure");
 	}
+	{ // A game-written date/time rebases the emulated clock instead of
+	  // being dropped (Boktai's date changer): the chip keeps running
+	  // from the written time, expressed as a host-clock offset so it
+	  // still advances. Byte order is seconds first, all BCD.
+		gba::GpioRtc gpio;
+		gpio.setPresent(true);
+		auto drive = [&](u16 v) { gpio.write(0x080000C4u, v); };
+		gpio.write(0x080000C8u, 1);    // read/write mode
+		gpio.write(0x080000C6u, 0x07); // SCK/SIO/CS driven by the "game"
+		auto writeByte = [&](u8 byte) {
+			drive(0x05); // SCK=1, CS=1
+			drive(0x04); // SCK=0
+			for (int i = 0; i < 8; ++i) {
+				const u16 lvl = ((byte >> i) & 1u) ? 0x06u : 0x04u;
+				drive(lvl);      // SIO bit presented while SCK is low
+				drive(lvl | 1u); // SCK rising shifts it in
+			}
+		};
+		auto readByte = [&](u8 *out) {
+			gpio.write(0x080000C6u, 0x05); // release SIO to the chip
+			u8 v = 0;
+			for (int i = 0; i < 8; ++i) {
+				drive(0x04); // SCK falling: the chip presents the bit
+				v |= (gpio.read(0x080000C4u) & 2u) ? static_cast<u8>(1u << i) : 0u;
+				drive(0x05);
+			}
+			*out = v;
+			gpio.write(0x080000C6u, 0x07);
+		};
+		auto readDatetime = [&] {
+			std::array<u8, 7> t{};
+			writeByte(0xA6); // magic 0110, DATE/TIME, read
+			for (u8 &b : t)
+				readByte(&b);
+			drive(0x00); // CS low
+			return t;    // year(00-99), month, day, weekday, h, m, s
+		};
+		writeByte(0x26); // magic 0110, DATE/TIME, write
+		for (u8 b : {0x03u, 0x07u, 0x04u, 0x05u, 0x12u, 0x34u, 0x00u})
+			writeByte(b); // year, month, day, weekday, 12:34:00 on 2003-07-04
+		drive(0x00);
+		const std::array<u8, 7> t = readDatetime();
+		checkEq(t[0], 0x03u, "RTC honours a game-written year");
+		checkEq(t[1], 0x07u, "RTC honours a game-written month");
+		checkEq(t[2], 0x04u, "RTC honours a game-written day");
+		checkEq(t[3], 0x05u, "RTC recomputes the weekday (2003-07-04 = Friday)");
+		checkEq(t[4], 0x12u, "RTC honours a game-written hour");
+		checkEq(t[5], 0x34u, "RTC honours a game-written minute");
+		check(t[6] <= 0x01u, "written seconds keep running");
+		check(gpio.offset() != 0, "game-set clock is a host-clock offset");
+		// Time-only write keeps the date (SII command 6).
+		writeByte(0x66);
+		for (u8 b : {0x07u, 0x00u, 0x00u})
+			writeByte(b); // 07:00:00
+		drive(0x00);
+		const std::array<u8, 7> t2 = readDatetime();
+		checkEq(t2[4], 0x07u, "RTC time-only write sets the hour");
+		checkEq(t2[1], 0x07u, "RTC time-only write keeps the date");
+		// The offset is battery-backed: sidecar and save state both keep it.
+		const std::string path = "/tmp/gb4me_selftest.gpio.rtc";
+		gpio.saveToFile(path);
+		gba::GpioRtc restored;
+		restored.setPresent(true);
+		restored.loadFromFile(path);
+		check(restored.offset() == gpio.offset(), "RTC sidecar restores the clock offset");
+		gba::GpioRtc fresh;
+		checkEq(static_cast<u32>(fresh.offset() < 0 ? -fresh.offset() : fresh.offset()), 0u,
+				"without a sidecar the RTC follows the host clock");
+		gba::StateBuffer buf;
+		gpio.save(buf);
+		gba::GpioRtc reloaded;
+		reloaded.load(buf);
+		check(reloaded.offset() == gpio.offset(), "save state keeps the RTC offset");
+		std::remove(path.c_str());
+	}
 }
 
 void testAudio()
@@ -1560,7 +1651,7 @@ void testAudio()
 	  // keypad registers, so a STRB of 0x34 to DISPCNT became 0xFF34.
 		GbaMachine m;
 		m.g.bus().write16(0x04000000u, 0x0400u); // DISPCNT = BG2 on
-		m.g.bus().write8(0x04000000u, 0x34u);     // STRB low byte
+		m.g.bus().write8(0x04000000u, 0x34u);    // STRB low byte
 		const u16 dispcnt = m.g.bus().read16(0x04000000u);
 		checkEq16(dispcnt, 0x0434u, "8-bit DISPCNT write preserves the high byte");
 	}
@@ -1573,7 +1664,7 @@ void testAudio()
 		// No IRQ pending yet: must still be waiting.
 		(m.g.bios().*m.g.bios().intrWaitFn())(1, 0, cpu, m.g.bus());
 		check(m.g.bios().waiting(), "IntrWait with a zero mask halts");
-		m.g.irq().raise(gba::GbaIrq::kVBlank);   // IF is write-1-to-CLEAR, so raise it
+		m.g.irq().raise(gba::GbaIrq::kVBlank); // IF is write-1-to-CLEAR, so raise it
 		m.g.bios().pollWait(cpu, m.g.bus());
 		check(!m.g.bios().waiting(), "IntrWait with a zero mask wakes on any IRQ");
 	}
@@ -1599,7 +1690,7 @@ void testAudio()
 	  // muted/unrouted (mGBA timer.c:25-32). Folding the enable test into the
 	  // timer-0 predicate made a disabled FIFO fire on timer 1 instead.
 		GbaMachine m;
-		m.g.audio().write16(0x04000084u, 0x0080u); // master enable on
+		m.g.audio().write16(0x04000084u, 0x0080u);           // master enable on
 		m.g.audio().write16(0x04000082u, 0x4000u | 0x2000u); // B=timer1, B->Left
 		m.g.audio().write16(0x040000A4u, 0x0142u);
 		m.g.audio().onTimerOverflow(0);
@@ -1623,9 +1714,9 @@ void testAudio()
 	}
 	{ // FIFO B follows timer 1 when SOUNDCNT_H bit 14 is set.
 		GbaMachine m;
-		m.g.audio().write16(0x04000084u, 0x0080u); // master enable on
+		m.g.audio().write16(0x04000084u, 0x0080u);           // master enable on
 		m.g.audio().write16(0x04000082u, 0x4000u | 0x2000u); // B = timer 1, B -> Left
-		m.g.audio().write16(0x040000A4u, 0x0142u); // bytes 0x42, 0x01
+		m.g.audio().write16(0x040000A4u, 0x0142u);           // bytes 0x42, 0x01
 		m.g.audio().onTimerOverflow(0);
 		checkEq(m.g.audio().fifoBCount(), 2, "timer 0 does not consume FIFO B");
 		m.g.audio().onTimerOverflow(1);
@@ -1665,6 +1756,458 @@ void testAudio()
 	}
 }
 
+void testApu()
+{
+	section("GB APU");
+	{ // Band-limited output stage: the kernel is unit-DC-gain, so a square
+	  // wave keeps its level in the passband, and a tone above the cutoff
+	  // is filtered out instead of being sampled straight through (the
+	  // aliasing buzz the old 1x mixing produced).
+		gb::dsp::OutputStage stage;
+		stage.reset();
+		// 1kHz square, one second: fundamental should survive near unity.
+		constexpr unsigned kSquareHz = 1000;
+		constexpr unsigned kPeriodMix = 352800 / kSquareHz;
+		float peak = 0.0f;
+		for (unsigned i = 0; i < 352800; i++) {
+			const float v = ((i / (kPeriodMix / 2)) % 2 == 0) ? 1.0f : -1.0f;
+			i16 l = 0, r = 0;
+			// Skip the first frames: the kernel starts from a zero history,
+			// so the leading edge is a step, not the steady state.
+			if (stage.push(v * 1000.0f, v * 1000.0f, &l, &r) && i > 8 * gb::dsp::kMixDiv)
+				peak = std::max(peak, std::abs(static_cast<float>(l)));
+		}
+		// A band-limited square overshoots ~9% (Gibbs) exactly like the
+		// real thing; what must not happen is droop from a bad kernel.
+		check(peak > 1000.0f && peak < 1200.0f, "1kHz square keeps its amplitude (no droop)");
+		gb::dsp::OutputStage tone;
+		tone.reset();
+		// 30kHz sits well above the 19.8kHz cutoff: must be attenuated.
+		constexpr unsigned kToneHz = 30000;
+		constexpr unsigned kTonePeriod = 352800 / kToneHz;
+		peak = 0.0f;
+		for (unsigned i = 0; i < 352800; i++) {
+			const float v = ((i / (kTonePeriod / 2)) % 2 == 0) ? 1.0f : -1.0f;
+			i16 l = 0, r = 0;
+			if (tone.push(v * 1000.0f, v * 1000.0f, &l, &r) && i > 8 * gb::dsp::kMixDiv)
+				peak = std::max(peak, std::abs(static_cast<float>(l)));
+		}
+		check(peak < 100.0f, "30kHz tone is filtered out (band-limited, not aliased)");
+	}
+	{ // Sample rate: one emulated second of T-cycles yields 44100 frames.
+		gb::APU apu;
+		std::vector<i16> samples;
+		// 4194304 T-cycles = 1s at the DMG clock; step() takes M-cycles.
+		apu.step(4194304 / 4);
+		apu.take_samples(samples);
+		const u64 frames = apu.frames_emitted();
+		check(frames >= 44000 && frames <= 44200, "APU emits ~44100 frames per emulated second");
+		checkEq(static_cast<u32>(samples[0]), 0u, "silent APU outputs digital zero");
+	}
+	{ // DAC power-down fade: a length expiry must not step the output to
+	  // zero (that step is the click at the end of every note). The mix
+	  // keeps a decaying copy of the channel level for ~0.5ms, so the
+	  // sample right after the cut is *louder* than the steady note, then
+	  // falls away.
+		gb::APU apu;
+		apu.write_reg(0xFF11, 0xBF); // length 1, 50% duty
+		apu.write_reg(0xFF12, 0xF0); // DAC on, full volume, no envelope
+		apu.write_reg(0xFF13, 0xFF); // fastest frequency -> steady square
+		apu.write_reg(0xFF14, 0xC0); // freq high + trigger + length enable
+		apu.write_reg(0xFF25, 0x11); // ch1 to both sides
+		apu.write_reg(0xFF24, 0x77); // master volume 8
+		apu.step(20000 / 4);         // past the 1/256s length clock and the fade
+		std::vector<i16> tail;
+		apu.take_samples(tail);
+		std::vector<int> frames;
+		for (size_t i = 0; i + 1 < tail.size(); i += 2)
+			frames.push_back(std::abs(static_cast<int>(tail[i])));
+		// The 50% duty square at NR13=FF alternates every few frames, so
+		// "loud" frames are the high phase. The cut is the last of them.
+		int steady_peak = 0;
+		for (int v : frames)
+			steady_peak = std::max(steady_peak, v);
+		int last_loud = -1;
+		for (size_t i = 0; i < frames.size(); i++) {
+			if (frames[i] * 2 >= steady_peak)
+				last_loud = static_cast<int>(i);
+		}
+		check(last_loud > 0, "the note is audible before the expiry");
+		// The channel is silent the instant it powers down, so what follows
+		// is the output capacitor alone: a positive ramp that then decays.
+		// The DC blocker takes about half of a one-sided ramp (the steady
+		// square is bipolar, the ramp is not), so the observed peak lands
+		// near 1/2 scale - but a hard cut would fall straight past a third
+		// of it into the much smaller HPF ring.
+		const size_t tail_start = static_cast<size_t>(last_loud) + 1;
+		const size_t tail_end = tail_start + 40;
+		int post_peak = 0;
+		for (size_t i = tail_start; i < frames.size() && i < tail_end; i++)
+			post_peak = std::max(post_peak, frames[i]);
+		check(post_peak * 3 >= steady_peak, "the cut is followed by a ramp, not a step");
+		check(post_peak <= steady_peak + 64, "the ramp starts at the channel level, not louder");
+		// And it decays: well under a second later the tail is quiet.
+		int last_audible = -1;
+		for (size_t i = frames.size(); i > 0; i--) {
+			if (frames[i - 1] > steady_peak / 8) {
+				last_audible = static_cast<int>(i) - 1;
+				break;
+			}
+		}
+		const int ring = last_audible - last_loud;
+		std::printf("  info  DAC power-down fade: %d output frames (%.2f ms)\n", ring,
+					ring * 1000.0 / 44100.0);
+		check(ring > 4 && ring < 400, "the fade is short and bounded");
+	}
+	{ // NR52 length hazard: a power cycle keeps the four length counters,
+	  // so the next trigger does not reload them and the note still ends
+	  // when it should (SameBoy Core/apu.c).
+		gb::APU apu;
+		auto nr = [&](u16 addr, u8 v) { apu.write_reg(addr, v); };
+		auto ch1_on = [&] { return (apu.read_reg(0xFF26) & 0x01) != 0; };
+		nr(0xFF11, 0xBF); // length 1
+		nr(0xFF12, 0xF0); // DAC on
+		nr(0xFF14, 0xC0); // trigger + length enable
+		check(ch1_on(), "channel 1 playing after trigger");
+		nr(0xFF26, 0x00); // power off
+		nr(0xFF26, 0x80); // power on
+		nr(0xFF14, 0xC0); // trigger again
+		check(ch1_on(), "channel 1 playing after the power cycle");
+		apu.step(32768 / 4); // two length clocks at 256Hz
+		check(!ch1_on(), "length counter survived the power cycle (note still expires)");
+	}
+	{ // Audio-clock pacing: the device buffer is the master clock. With the
+	  // level at target the loop must not wait; below target it must never
+	  // wait at all; above target the wait is capped at one frame.
+		gb::AudioSync sync;
+		sync.reset(44100, 2048); // 46ms device buffer -> 23ms target
+		checkEq(sync.target_frames(), 1024u, "target is half the device buffer");
+		// produced 735 frames/frame (44100/60); steady state: the level after
+		// subtracting this frame's own audio sits at the target.
+		check(sync.pace(1024 + 735, 735) == 0.0, "at target: no wait");
+		// Starving device: 300 frames left after our own contribution.
+		check(sync.pace(300 + 735, 735) == 0.0, "starving device: never wait");
+		// Overfull: 4000 frames of backlog -> wait, but at most one frame.
+		const double over = sync.pace(4000 + 735, 735);
+		check(over > 0.0 && over <= 1.0 / 60.0 + 1e-9, "overfull: wait, capped at a frame");
+		// A level far above target does not ask for a multi-second sleep.
+		const double huge = sync.pace(44100 * 2, 735);
+		check(huge <= 1.0 / 60.0 + 1e-9, "a huge backlog still waits at most a frame");
+	}
+	{ // Drift correction follows the MOVEMENT of the buffer level, not its
+	  // depth: a level that keeps rising means we outrun the device (ratio
+	  // down), a level that keeps falling means the reverse (ratio up), and
+	  // a pathological device cannot push it past ±1%.
+		gb::AudioSync sync;
+		sync.reset(44100, 2048);
+		// Level climbing by ~7 frames per frame for several windows.
+		i32 queued = 1024 + 735;
+		for (int i = 0; i < 400; i++) {
+			queued += 7;
+			sync.pace(static_cast<u32>(queued), 735);
+		}
+		check(sync.resample_ratio() < 1.0f, "a rising level lowers the ratio");
+		// Now the level drains.
+		queued = 40000;
+		for (int i = 0; i < 400; i++) {
+			queued -= 40;
+			sync.pace(static_cast<u32>(queued), 735);
+		}
+		check(sync.resample_ratio() > 1.0f, "a falling level raises the ratio");
+		// A level that neither rises nor falls must not move the ratio. One
+		// window of drift is enough to overshoot the tolerance, so allow a
+		// couple of windows' worth of settling first.
+		for (int i = 0; i < 400; i++)
+			sync.pace(1024 + 735, 735);
+		const float steady = sync.resample_ratio();
+		for (int i = 0; i < 400; i++)
+			sync.pace(1024 + 735, 735);
+		check(sync.resample_ratio() == steady, "a steady level leaves the ratio alone");
+		// Clamped.
+		for (int i = 0; i < 40000; i++)
+			sync.pace(200000, 735);
+		check(sync.resample_ratio() <= 1.01f && sync.resample_ratio() >= 0.99f,
+			  "the drift correction stays within ±1%");
+	}
+	{ // The PPU's HBlank is a scheduler *event*, so it lands on the exact dot
+	  // (1008) instead of whenever the next step() slice happens to end.
+	  // Stepping one tick at a time must flip DISPSTAT's HBlank bit there.
+		gba::GameBoyAdvance g;
+		// DISPCNT: mode 0, BG0 on, so a frame renders.
+		g.bus().write16(0x04000000u, 0x0100u);
+		// Start from a known line start by running to the first line end,
+		// then measure in *ticks* - step(1) runs a whole instruction, not one
+		// dot, so counting calls would measure nothing.
+		u64 guard = 0;
+		while (g.ppu().line() != 1 && guard++ < 200000)
+			g.step(1);
+		checkEq(static_cast<u32>(g.ppu().line()), 1u, "reached scanline 1");
+		const u64 line_start = g.tick();
+		u32 hblank_at = 0;
+		for (u32 i = 0; i < 4000 && hblank_at == 0; i++) {
+			g.step(1);
+			if ((g.bus().read16(0x04000004u) & 0x0002u) != 0)
+				hblank_at = static_cast<u32>(g.tick() - line_start);
+		}
+		checkEq(hblank_at, 1008u, "HBlank flag is set at exactly dot 1008");
+		// And the line ends 224 dots later (1232 - 1008).
+		guard = 0;
+		while (g.ppu().line() == 1 && guard++ < 4000)
+			g.step(1);
+		checkEq(static_cast<u32>(g.tick() - line_start), 1232u,
+				"the line ends at exactly dot 1232");
+		// The line must end at 1232, and the next HBlank 1232 dots later.
+		guard = 0;
+		while (g.ppu().line() != 2 && guard++ < 4000)
+			g.step(1);
+		checkEq(static_cast<u32>(g.ppu().line()), 2u, "scanline 2 begins at dot 1232");
+	}
+	{ // The scheduler queue holds type-erased callbacks, so a state load
+	  // must re-arm the PPU's pending event from the restored state. If it
+	  // did not, the frame would never complete again.
+		const std::string path = "/tmp/opencode/gb4me_sched.state";
+		gba::GameBoyAdvance ref;
+		ref.bus().write16(0x04000000u, 0x0100u);
+		for (int f = 0; f < 3; f++) {
+			u64 guard = 0;
+			while (!ref.ppu().frameReady() && guard++ < 400000)
+				ref.step(1232);
+			ref.ppu().clearFrameReady();
+		}
+		u64 mid = 0;
+		while (mid < 5000) { // part-way into a frame, mid-HBlank most likely
+			ref.step(64);
+			mid += 64;
+		}
+		check(ref.saveState(path), "state saved mid-frame");
+		// Reference: 6 more frames from the save point.
+		for (int f = 0; f < 6; f++) {
+			u64 guard = 0;
+			while (!ref.ppu().frameReady() && guard++ < 400000)
+				ref.step(1232);
+			ref.ppu().clearFrameReady();
+		}
+		std::array<u32, 8> want{};
+		for (int i = 0; i < 8; i++)
+			want[static_cast<size_t>(i)] = ref.ppu().frame().pixels[100u * 240u + 100u + i];
+		// Reload into a fresh machine and run the same 6 frames.
+		gba::GameBoyAdvance g;
+		check(g.loadState(path), "state loaded (events must be re-armed)");
+		int done = 0;
+		for (int f = 0; f < 6; f++) {
+			u64 guard = 0;
+			while (!g.ppu().frameReady() && guard++ < 400000)
+				g.step(1232);
+			if (!g.ppu().frameReady())
+				break;
+			g.ppu().clearFrameReady();
+			++done;
+		}
+		checkEq(static_cast<u32>(done), 6u, "six more frames run after the load");
+		std::array<u32, 8> got{};
+		for (int i = 0; i < 8; i++)
+			got[static_cast<size_t>(i)] = g.ppu().frame().pixels[100u * 240u + 100u + i];
+		check(got == want, "the reloaded run matches the uninterrupted one");
+		std::remove(path.c_str());
+	}
+	{ // The 2-cycle interrupt delay (GBATEK "GBA Interrupts"): IF is visible
+	  // the moment a source raises it, but the CPU is handed the IRQ two
+	  // cycles later - now a scheduler event.
+		gba::GameBoyAdvance g;
+		g.bus().write16(0x04000000u, 0x0100u); // DISPCNT: mode 0, BG0 on
+		// No IE/IME yet: the flag must still latch and stay visible.
+		u64 guard = 0;
+		while (g.ppu().line() != 100 && guard++ < 400000)
+			g.step(16);
+		g.irq().writeIf(0);
+		g.irq().raise(gba::GbaIrq::kVCount);
+		check((g.irq().readIf() & gba::GbaIrq::kVCount) != 0,
+			  "IF is visible immediately when a source raises it");
+		check(g.irq().delivery_pending(), "delivery is scheduled, not immediate");
+		checkEq(g.irq().deliveries(), 0u, "no delivery while masked (IE/IME clear)");
+		// The pending event drains without delivering, and stays latched.
+		g.step(8);
+		check(!g.irq().delivery_pending(), "the delayed delivery ran");
+		checkEq(g.irq().deliveries(), 0u, "still no delivery with IE clear");
+		check((g.irq().readIf() & gba::GbaIrq::kVCount) != 0,
+			  "a masked flag stays latched (not lost)");
+		// Enabling it delivers on the next update, as before.
+		g.irq().writeIe(gba::GbaIrq::kVCount);
+		checkEq(g.irq().deliveries(), 0u, "unmasking alone does nothing while IME is 0");
+		g.irq().writeIme(1);
+		checkEq(g.irq().deliveries(), 1u, "enabling IME delivers the latched flag");
+	}
+	{ // A save state taken with a delayed delivery pending must not lose or
+	  // duplicate it: the callback is type-erased, so loadState re-arms it.
+		const std::string path = "/tmp/opencode/gb4me_irq.state";
+		gba::GameBoyAdvance g;
+		g.bus().write16(0x04000000u, 0x0100u);
+		g.irq().writeIe(gba::GbaIrq::kVCount);
+		g.irq().writeIme(1);
+		// Raise just before saving so the delivery is still in flight.
+		u64 guard = 0;
+		while (g.ppu().line() != 100 && guard++ < 400000)
+			g.step(16);
+		g.irq().raise(gba::GbaIrq::kVCount);
+		const u32 before = g.irq().deliveries();
+		check(g.irq().delivery_pending(), "delivery pending at save time");
+		check(g.saveState(path), "state saved with a delivery in flight");
+		gba::GameBoyAdvance g2;
+		check(g2.loadState(path), "state loaded");
+		check(g2.irq().delivery_pending(), "the pending delivery is re-armed on load");
+		g2.step(64);
+		check(!g2.irq().delivery_pending(), "re-armed delivery runs after the load");
+		check(g2.irq().deliveries() > before, "the IRQ still reaches the CPU after a reload");
+		std::remove(path.c_str());
+	}
+	{ // Timers are scheduler events: a 1/64 prescaler overflows on the exact
+	  // tick, not whenever the current step() slice stops. reload 0xFFFE (not
+	  // 0xFFFF) so the reload is observable as the counter leaving 0xFFFF.
+		gba::GameBoyAdvance g;
+		g.bus().write16(0x04000100u, 0x0000u); // TM0 reload 0: 65535 increments
+		g.bus().write16(0x04000102u, 0x0081u); // 1/64, enable
+		check(g.timers().event_armed(0), "timer 0 armed its first increment");
+		checkEq(g.timers().ticks_to_next(0), 64u, "first increment is 64 ticks away");
+		const u64 start = g.tick();
+		u64 elapsed = 0;
+		bool saw_top = false;
+		for (int i = 0; i < 200000; i++) {
+			g.step(64);
+			if (g.timers().counter(0) == 0xFFFFu)
+				saw_top = true;
+			// Back to 0 only on the reload, so this is the overflow.
+			if (saw_top && g.timers().counter(0) == 0x0000u) {
+				elapsed = g.tick() - start;
+				break;
+			}
+		}
+		// 0xFFFE -> 0xFFFF is 1 increment, then the overflow reloads: 65535
+		// increments of 64 ticks, plus at most one tick of arming slack.
+		std::printf("  info  timer 1/64 overflow after %llu ticks (want %d)\n",
+					(unsigned long long) elapsed, 65535 * 64);
+		check(elapsed >= 65534ull * 64ull && elapsed <= 65535ull * 64ull + 64ull,
+			  "the 1/64 overflow lands on an exact tick");
+	}
+	{ // Cascade: timer 1 counts timer 0's overflows only, and the increment
+	  // happens inside the overflow event.
+		gba::GameBoyAdvance g;
+		g.bus().write16(0x04000100u, 0x0000u); // TM0 reload 0
+		g.bus().write16(0x04000102u, 0x0081u); // 1/64, enable
+		g.bus().write16(0x04000104u, 0x0000u); // TM1 reload 0
+		g.bus().write16(0x04000106u, 0x00C4u); // cascade + IRQ + enable
+		check(!g.timers().event_armed(1), "a cascade timer has no event of its own");
+		bool saw_top = false;
+		int overflows = 0;
+		for (int i = 0; i < 200000; i++) {
+			g.step(64);
+			if (g.timers().counter(0) == 0xFFFFu)
+				saw_top = true;
+			if (saw_top && g.timers().counter(0) == 0x0000u)
+				++overflows;
+			if (overflows == 1)
+				break;
+		}
+		checkEq(static_cast<u32>(overflows), 1u, "timer 0 overflowed once");
+		checkEq(g.timers().counter(1), 1u, "timer 1 counted exactly one overflow");
+		// 2000 steps (128k ticks) cannot fit another 65535-increment period,
+		// so a cascade timer must not move on its own.
+		const u16 before = g.timers().counter(1);
+		const u32 incr_before = g.timers().increments();
+		for (int i = 0; i < 2000; i++)
+			g.step(64);
+		std::printf("  info  cascade idle: tm1 %u -> %u, increments %u -> %u\n", before,
+					g.timers().counter(1), incr_before, g.timers().increments());
+		checkEq(g.timers().counter(1), before, "a cascade timer only moves on overflows");
+	}
+	{ // A prescaler write under a pending event must not be counted twice.
+		gba::GameBoyAdvance g;
+		g.bus().write16(0x04000100u, 0x0000u);
+		g.bus().write16(0x04000102u, 0x0081u); // 1/64
+		g.step(30);                            // part-way into the period
+		g.bus().write16(0x04000102u, 0x0082u); // -> 1/256, progress restarts
+		checkEq(g.timers().ticks_to_next(0), 256u, "the prescaler change restarted progress");
+		// The *steady-state* period is exact (checked above); the FIRST period
+		// after a write is armed from the scheduler clock, which the core only
+		// advances between instructions - so it can be up to one instruction
+		// early (documented in core.cpp until the CPU runs per-cycle slices).
+		// What must hold is that the stale 1/64 event did NOT survive: one
+		// increment per new period, not two.
+		const u64 t_write = g.tick();
+		while (g.tick() < t_write + 200)
+			g.step(1);
+		checkEq(g.timers().counter(0), 0u, "no increment early in the new period");
+		while (g.tick() < t_write + 400)
+			g.step(1);
+		checkEq(g.timers().counter(0), 1u, "exactly one increment per new period");
+	}
+	{ // Save state with a timer mid-count: the events are re-armed, so it
+	  // keeps counting instead of stalling.
+		const std::string path = "/tmp/opencode/gb4me_timer.state";
+		gba::GameBoyAdvance g;
+		g.bus().write16(0x04000000u, 0x0100u);
+		g.bus().write16(0x04000100u, 0x0000u);
+		g.bus().write16(0x04000102u, 0x0081u); // 1/64
+		g.step(1000);
+		const u16 mid = g.timers().counter(0);
+		check(mid > 0, "the timer was counting before the save");
+		check(g.saveState(path), "state saved with a timer event in flight");
+		gba::GameBoyAdvance g2;
+		check(g2.loadState(path), "state loaded");
+		check(g2.timers().event_armed(0), "the timer event is re-armed on load");
+		u64 guard = 0;
+		while (g2.timers().counter(0) <= mid && guard++ < 200000)
+			g2.step(16);
+		check(g2.timers().counter(0) > mid, "the reloaded timer keeps counting");
+		std::remove(path.c_str());
+	}
+	{ // The GBA side of the drift correction: a +/-1% ratio must change the
+	  // number of output frames by that much, smoothly (a hold/skip, not a
+	  // batch drop).
+		GbaMachine m;
+		m.g.audio().set_resample_ratio(1.0f);
+		const u64 before = m.g.audio().frames_emitted();
+		m.g.audio().step(16777216); // one second of GBA ticks (16.78MHz)
+		const u64 plain = m.g.audio().frames_emitted() - before;
+		check(plain > 44000 && plain < 44200, "GBA audio emits ~44100 frames/s at 1.00");
+
+		gba::GameBoyAdvance g2;
+		g2.audio().set_resample_ratio(1.01f);
+		const u64 hi_before = g2.audio().frames_emitted();
+		g2.audio().step(16777216);
+		const u64 hi = g2.audio().frames_emitted() - hi_before;
+		gba::GameBoyAdvance g3;
+		g3.audio().set_resample_ratio(0.99f);
+		const u64 lo_before = g3.audio().frames_emitted();
+		g3.audio().step(16777216);
+		const u64 lo = g3.audio().frames_emitted() - lo_before;
+		std::printf("  info  gba drift: 1.00 -> %llu, 1.01 -> %llu, 0.99 -> %llu frames\n",
+					(unsigned long long) plain, (unsigned long long) hi, (unsigned long long) lo);
+		check(hi > plain + 300 && hi < plain + 520, "+1% emits ~1% more frames");
+		check(lo < plain - 300 && lo > plain - 520, "-1% emits ~1% fewer frames");
+	}
+	{ // Wave RAM bus conflict: while the channel plays, an access lands on
+	  // the byte the DAC is fetching, and blanks to $FF right before a
+	  // fetch (mGBA src/gb/io.c).
+		gb::APU apu;
+		for (u8 i = 0; i < 16; i++)
+			apu.write_wave_ram(static_cast<u16>(0xFF30 + i), static_cast<u8>(i));
+		checkEq(apu.read_wave_ram(0xFF30), 0x00u, "wave RAM reads back while stopped");
+		apu.write_reg(0xFF1A, 0x80); // channel 3 on
+		apu.write_reg(0xFF1B, 0x00); // length
+		apu.write_reg(0xFF1D, 0x00); // rate: slowest, 2*(2048-0) T-cycles
+		apu.write_reg(0xFF1E, 0x80); // trigger
+		apu.write_wave_ram(0xFF30, 0x5Au);
+		// pos == 0 right after the trigger, so the write lands on byte 0.
+		checkEq(apu.read_wave_ram(0xFF30), 0x5Au, "playing: write lands on the fetched byte");
+		checkEq(apu.read_wave_ram(0xFF3F), 0x5Au,
+				"playing: read returns the fetched byte, not the address");
+		apu.step(4096 / 4);                // one sample period: pos -> 1, bus free again
+		apu.write_wave_ram(0xFF3F, 0x77u); // byte 0 (pos/2 == 0) is fetched now
+		checkEq(apu.read_wave_ram(0xFF30), 0x77u,
+				"playing: redirected write hits the current byte");
+	}
+}
+
 void testKeypad()
 {
 	section("Keypad");
@@ -1696,6 +2239,22 @@ void testSavesAndStates()
 		checkEq(m.g.bus().read8(0x0E000000), 0x5Au, "SRAM region readable/writable");
 		m.g.bus().write8(0x0E000000, 0xA5u);
 		checkEq(m.g.bus().read8(0x0E000000), 0xA5u, "SRAM byte persists");
+	}
+	{ // GBATEK: the save chip mirrors across the whole 0x0E-0x0F window, so
+	  // every 64K alias hits the same byte.
+		std::vector<u8> rom = makeTestRom();
+		const std::string marker = "SRAM_V113";
+		rom.insert(rom.end(), marker.begin(), marker.end());
+		gba::GameBoyAdvance g;
+		check(g.loadFromBytes(rom), "SRAM test ROM loads");
+		checkEq(static_cast<u32>(g.cartridge().saveType()), static_cast<u32>(gba::SaveType::SRAM),
+				"marker selects plain SRAM");
+		g.bus().write8(0x0E000000, 0x5Au);
+		g.bus().write8(0x0E008000u, 0xA5u);
+		checkEq(g.bus().read8(0x0E010000u), 0x5Au, "save window mirrors every 64K");
+		checkEq(g.bus().read8(0x0E018000u), 0xA5u, "save window mirrors the upper 32K too");
+		checkEq(g.bus().read8(0x0E000000), 0x5Au, "mirrored writes do not collide");
+		checkEq(g.bus().read8(0x0F000000u), 0x5Au, "save window mirrors across 0x0F");
 	}
 	{ // Flash autoselect IDs (GBATEK "Device Types", MSB=device).
 		auto autoselect = [](gba::SaveHardware &flash) {
@@ -1747,27 +2306,27 @@ void testSavesAndStates()
 		checkEq(ee.size(), 512u, "EEPROM starts at 4Kbit guess");
 		auto writeBlock = [&](u32 block, u32 first_byte) {
 			// "10" + 14 address bits + 64 data bits + stop (81 halfwords).
-			ee.dmaWrite(1, 81);
-			ee.dmaWrite(0, 80);
+			ee.dmaWrite(1, 81, 0);
+			ee.dmaWrite(0, 80, 0);
 			for (int i = 13; i >= 0; --i)
-				ee.dmaWrite((block >> i) & 1u, static_cast<u32>(66 + i));
+				ee.dmaWrite((block >> i) & 1u, static_cast<u32>(66 + i), 0);
 			for (int b = 0; b < 8; ++b) {
 				const u32 byte = (b == 0) ? first_byte : 0u;
 				for (int i = 7; i >= 0; --i)
-					ee.dmaWrite((byte >> i) & 1u, static_cast<u32>(65 - (b * 8 + (7 - i))));
+					ee.dmaWrite((byte >> i) & 1u, static_cast<u32>(65 - (b * 8 + (7 - i))), 0);
 			}
-			ee.dmaWrite(0, 1);
+			ee.dmaWrite(0, 1, 0);
 		};
 		auto readBlock = [&](u32 block) {
 			// "11" + 14 address bits + stop, then 68-bit readback.
-			ee.dmaWrite(1, 17);
-			ee.dmaWrite(1, 16);
+			ee.dmaWrite(1, 17, 0);
+			ee.dmaWrite(1, 16, 0);
 			for (int i = 13; i >= 0; --i)
-				ee.dmaWrite((block >> i) & 1u, static_cast<u32>(2 + i));
-			ee.dmaWrite(0, 1);
+				ee.dmaWrite((block >> i) & 1u, static_cast<u32>(2 + i), 0);
+			ee.dmaWrite(0, 1, 0);
 			u64 bits = 0;
 			for (int i = 0; i < 68; ++i)
-				bits = (bits << 1) | (ee.dmaRead() & 1u);
+				bits = (bits << 1) | (ee.dmaRead(0) & 1u);
 			return bits; // the 4 leading ignore bits shifted out; 64 data bits remain
 		};
 		writeBlock(0x00, 0xAAu); // low block, survives the upgrade
@@ -1775,6 +2334,90 @@ void testSavesAndStates()
 		checkEq(ee.size(), 8 * 1024u, "EEPROM upgrades to 64Kbit on high write");
 		check(readBlock(0x40) == 0xFF00000000000000ull, "high block reads back written byte");
 		check((readBlock(0x00) >> 56) == 0xAAu, "low block data preserved across upgrade");
+	}
+	{ // EEPROM write settle time: after a data burst the serial line
+	  // reads 0 (busy) for ~6.5ms of core cycles, then ready again.
+	  // (mGBA models it as EEPROM_SETTLE_CYCLES = 115000.)
+		gba::EepromSave ee(gba::EepromSave::Size::K4bit);
+		checkEq(ee.dmaRead(0) & 1u, 1u, "EEPROM ready before any write");
+		// "10" + 6 address bits (512B chip) + 64 data bits + stop.
+		constexpr u32 kTotal = 73;
+		ee.dmaWrite(1, kTotal, 0);
+		ee.dmaWrite(0, kTotal - 1, 0);
+		for (int i = 5; i >= 0; --i)
+			ee.dmaWrite(0, static_cast<u32>(58 + i), 0);
+		for (int b = 0; b < 64; ++b)
+			ee.dmaWrite(0, static_cast<u32>(65 - b), 0);
+		ee.dmaWrite(0, 1, 0);
+		checkEq(ee.dmaRead(0) & 1u, 0u, "EEPROM busy right after a write");
+		checkEq(ee.dmaRead(100000) & 1u, 0u, "EEPROM still busy before the settle window ends");
+		checkEq(ee.dmaRead(115000) & 1u, 1u, "EEPROM ready once the settle window passes");
+		// A new write re-arms the window; a read request is answered even
+		// while a previous write would still be settling.
+		ee.dmaWrite(1, kTotal, 100000);
+		ee.dmaWrite(0, kTotal - 1, 100000);
+		for (int i = 5; i >= 0; --i)
+			ee.dmaWrite(0, static_cast<u32>(58 + i), 100000);
+		for (int b = 0; b < 64; ++b)
+			ee.dmaWrite(0, static_cast<u32>(65 - b), 100000);
+		ee.dmaWrite(0, 1, 100000);
+		checkEq(ee.dmaRead(211000) & 1u, 0u, "EEPROM busy window restarts on the next write");
+		checkEq(ee.dmaRead(226000) & 1u, 1u, "EEPROM ready again after the second settle");
+	}
+	{ // Serial (SIO) ports have no link hardware: writes must not come
+	  // back from the io shadow (a game polling its own status word would
+	  // think a transfer happened), and reads report idle.
+		GbaMachine m;
+		m.g.bus().write16(0x04000128u, 0x0000); // SIOCNT: "start" a transfer
+		checkEq(m.g.bus().read16(0x04000128u), 0x0000u, "SIO write does not read back (no shadow)");
+		m.g.bus().write16(0x04000120u, 0x00C3); // SIOMLT0 sent byte
+		checkEq(m.g.bus().read16(0x04000120u), 0x0000u, "SIO read returns idle");
+		checkEq(m.g.bus().read8(0x04000129u), 0x00u, "SIO byte read returns idle");
+		// The neighbouring timer block is untouched: 0x100 is TM0's live
+		// counter, so a write must not shadow it either (it reads 0 until
+		// the timer has been enabled and ticked).
+		m.g.bus().write16(0x04000100u, 0xB0B0);
+		checkEq(m.g.bus().read16(0x04000100u), 0x0000u, "timers still own 0x100-0x10F");
+	}
+	{ // Flash byte program is AND-only: bits can be cleared, never set
+	  // back without an erase (GBATEK "Flash Memory" programming model).
+		gba::FlashMacronix flash(64 * 1024);
+		auto program = [&](u32 addr, u8 value) {
+			flash.write(0x5555, 0xAA);
+			flash.write(0x2AAA, 0x55);
+			flash.write(0x5555, 0xA0);
+			flash.write(addr, value);
+		};
+		auto eraseSector = [&](u32 addr) {
+			flash.write(0x5555, 0xAA);
+			flash.write(0x2AAA, 0x55);
+			flash.write(0x5555, 0x80);
+			flash.write(0x5555, 0xAA);
+			flash.write(0x2AAA, 0x55);
+			flash.write(addr, 0x30);
+		};
+		auto eraseChip = [&] {
+			flash.write(0x5555, 0xAA);
+			flash.write(0x2AAA, 0x55);
+			flash.write(0x5555, 0x10);
+		};
+		program(0x0200, 0x5Au);
+		checkEq(flash.read(0x0200), 0x5Au, "flash program stores a byte");
+		program(0x0200, 0xA5u);
+		checkEq(flash.read(0x0200), static_cast<u8>(0x5Au & 0xA5u),
+				"flash program ANDs (0 bits stay cleared)");
+		program(0x0200, 0x0Fu);
+		checkEq(flash.read(0x0200), 0x00u, "flash program cannot set bits back to 1");
+		eraseSector(0x0200);
+		checkEq(flash.read(0x0200), 0xFFu, "flash sector erase restores erased state");
+		program(0x0200, 0x3Cu);
+		checkEq(flash.read(0x0200), 0x3Cu, "flash programs again after erase");
+		program(0x1500, 0x11u); // next sector, must survive the next erase
+		eraseSector(0x0200);
+		checkEq(flash.read(0x0200), 0xFFu, "flash sector erase clears its own sector");
+		checkEq(flash.read(0x1500), 0x11u, "flash sector erase leaves other sectors alone");
+		eraseChip();
+		checkEq(flash.read(0x1500), 0xFFu, "flash chip erase clears everything");
 	}
 	{
 		// Save state round trip: CPU, memory, PPU and timer state all live in
@@ -1879,8 +2522,8 @@ void testGbCpu()
 		m.run({0x3E, 0x0F, 0xC6, 0x01}); // LD A,0x0F ; ADD A,0x01
 		checkEq(m.cpu.regs.a, 0x10, "ADD A: 0x0F + 1 = 0x10");
 		check(m.cpu.regs.get_h() && !m.cpu.regs.get_z() && !m.cpu.regs.get_n() &&
-						!m.cpu.regs.get_c(),
-				"ADD half-carry only");
+				  !m.cpu.regs.get_c(),
+			  "ADD half-carry only");
 	}
 	{
 		GbMachine m;
@@ -1898,7 +2541,7 @@ void testGbCpu()
 		m.run({0x3E, 0x0F, 0x37, 0x3C}); // LD A,0x0F ; SCF ; INC A
 		checkEq(m.cpu.regs.a, 0x10, "INC A");
 		check(m.cpu.regs.get_h() && m.cpu.regs.get_c() && !m.cpu.regs.get_n(),
-				"INC sets H, preserves C, clears N");
+			  "INC sets H, preserves C, clears N");
 	}
 	{
 		GbMachine m;
@@ -1917,8 +2560,8 @@ void testGbCpu()
 		m.run({0xAF}); // XOR A
 		checkEq(m.cpu.regs.a, 0x00, "XOR A zeroes A");
 		check(m.cpu.regs.get_z() && !m.cpu.regs.get_n() && !m.cpu.regs.get_h() &&
-						!m.cpu.regs.get_c(),
-				"XOR A sets only Z");
+				  !m.cpu.regs.get_c(),
+			  "XOR A sets only Z");
 	}
 	{
 		GbMachine m;
@@ -1933,13 +2576,13 @@ void testGbCpu()
 	{
 		GbMachine m;
 		m.run({0x3E, 0x81, 0xCB, 0x7F}); // LD A,0x81 ; BIT 7,A
-		check(m.cpu.regs.get_z() == false && m.cpu.regs.get_n() == false &&
-						m.cpu.regs.get_h(),
-				"BIT sets Z from the bit and H");
+		check(!m.cpu.regs.get_z() && !m.cpu.regs.get_n() && m.cpu.regs.get_h(),
+			  "BIT sets Z from the bit and H");
 	}
 	{
 		GbMachine m;
-		m.run({0x21, 0x34, 0x12, 0x01, 0x34, 0x12, 0x09}); // LD HL,0x1234 ; LD BC,0x1234 ; ADD HL,BC
+		m.run(
+			{0x21, 0x34, 0x12, 0x01, 0x34, 0x12, 0x09}); // LD HL,0x1234 ; LD BC,0x1234 ; ADD HL,BC
 		checkEq(m.cpu.regs.hl(), 0x2468, "ADD HL,BC");
 	}
 	{
@@ -1978,7 +2621,7 @@ void testGbCpu()
 		// HALT + interrupt wake, then vector at 0x0040.
 		GbMachine m;
 		m.cpu.ime = true;
-		m.mmu.write_ie(0x01);      // VBlank
+		m.mmu.write_ie(0x01); // VBlank
 		m.cpu.halted = true;
 		m.mmu.request_interrupt(0);
 		m.cpu.step();
@@ -2044,7 +2687,7 @@ void testGbcFeatures()
 		m.mmu.write(0xFF69, 0x00);     // high byte
 		const u32 colour = m.ppu.bg_palette_color(0, 1);
 		check((colour >> 16 & 0xFF) > (colour >> 8 & 0xFF), "BG palette colour 1 is red",
-				hex32(colour));
+			  hex32(colour));
 		checkEq(m.mmu.read(0xFF68) & 0xBFu, 0x80u | 4u, "BCPS index auto-incremented");
 		m.mmu.write(0xFF6A, 0x80 | 2);
 		m.mmu.write(0xFF6B, 0x1F);
@@ -2065,7 +2708,7 @@ void testGbcFeatures()
 		m.ppu.render_scanline(0);
 		const u32 px = m.ppu.frame().pixels[0];
 		check(((px >> 16) & 0xFF) > ((px >> 8) & 0xFF), "CGB BG scanline uses the CGB palette",
-				hex32(px));
+			  hex32(px));
 	}
 	{
 		// DMG scanline render stays monochrome (same tile, DMG path).
@@ -2081,18 +2724,137 @@ void testGbcFeatures()
 		check(r == g && g == b, "DMG BG scanline renders a grey shade", hex32(px));
 		check(r != 0xFF, "DMG palette maps colour 1 to a non-white shade", hex32(px));
 	}
+	{ // MBC5 rumble: bit 3 of a 0x4000-0x5FFF write is the motor, NOT a RAM
+	  // bank bit (Pan Docs "MBC5"; mGBA strips it too). Getting this wrong
+	  // silently moved a rumble cart to bank 8 on every write.
+		std::vector<u8> ram(0x10000, 0xAA); // 32 banks
+		for (size_t i = 0x10000; i < ram.size(); i++)
+			ram[i] = 0xBB; // bank 8 has a distinct fill
+		gb::MBC5 mbc({}, ram, false);
+		check(mbc.has_rumble(), "MBC5 reports a rumble motor");
+		check(!mbc.rumble(), "rumble starts off");
+		mbc.write_rom(0x0000, 0x0A); // RAM enable
+		mbc.write_rom(0x4000, 0x08); // rumble only, bank bits 0
+		check(mbc.rumble(), "MBC5 bit 3 turns the motor on");
+		checkEq(mbc.read_ram(0x0000), 0xAAu, "the rumble bit is not a RAM bank bit");
+		mbc.write_rom(0x4000, 0x0A); // bank 2 + rumble
+		checkEq(mbc.read_ram(0x0000), 0xAAu, "bank 2 selected by bits 0-2");
+		mbc.write_rom(0x4000, 0x00);
+		check(!mbc.rumble(), "clearing bit 3 stops the motor");
+	}
 	{
-		// Double speed: KEY1 bit 0 request + STOP switches the CPU clock.
+		// CGB HDMA owns the VRAM/OAM bus while a 0x10 block moves: CPU
+		// reads see FF and writes are lost for that window, whatever the
+		// PPU mode is (Pan Docs "CGB VRAM DMA").
+		GbMachine m(HardwareMode::CGB_Only);
+		m.mmu.write(0xFF40, 0x91); // LCD on
+		m.mmu.write(0x8000, 0x42);
+		checkEq(m.mmu.read(0x8000), 0x42u, "VRAM readable before the transfer");
+		// Source 0xC000 -> dest 0x8000, one 0x10 block, HBlank mode.
+		m.mmu.write(0xC000, 0x99);
+		m.mmu.write(0xFF51, 0xC0);
+		m.mmu.write(0xFF52, 0x00);
+		m.mmu.write(0xFF53, 0x80);
+		m.mmu.write(0xFF54, 0x00);
+		m.mmu.write(0xFF55, 0x80); // bit7 = HBlank mode, 1 block
+		check(m.mmu.hdma_active(), "HBlank HDMA armed");
+		m.ppu.step(120); // cross a line boundary: the HBlank hook fires
+		check(m.ppu.hdma_bus_busy(), "bus busy right after the block");
+		checkEq(m.mmu.read(0x8010), 0xFFu, "CPU VRAM reads FF while the block moves");
+		checkEq(m.mmu.read(0xFE00), 0xFFu, "CPU OAM reads FF while the block moves");
+		m.mmu.write(0x8010, 0x77); // must be lost
+		// Step past the 32-dot block window and into HBlank (VRAM is
+		// separately inaccessible in mode 3, which would mask the result).
+		m.ppu.step(100);
+		check(!m.ppu.hdma_bus_busy(), "bus free after the block window");
+		checkEq(m.mmu.read(0x8000), 0x99u, "HDMA block copied to VRAM");
+		checkEq(m.mmu.read(0x8010), 0x00u, "write during the block was dropped");
+		m.mmu.write(0x8010, 0x77);
+		checkEq(m.mmu.read(0x8010), 0x77u, "VRAM writable again after the block");
+		// DMG has no HDMA and no bus block.
+		GbMachine d(HardwareMode::DMG);
+		d.mmu.write(0xFF40, 0x91);
+		d.mmu.write(0x8000, 0x42);
+		d.ppu.step(1);
+		checkEq(d.mmu.read(0x8000), 0x42u, "DMG VRAM unaffected by the HDMA path");
+	}
+	{
+		// Double speed: KEY1 bit 0 request + STOP switches the CPU clock,
+		// then the CPU stalls 2050 M-cycles with DIV frozen (Pan Docs KEY1).
 		GbMachine m(HardwareMode::CGB_Only);
 		m.mmu.write(0xFF4D, 0x01);
+		m.mmu.write(0xFF07, 0x07); // TAC: enabled, fastest (bit 7, 256 T period)
+		m.mmu.write(0xFF05, 0x00); // TIMA = 0
+		const u8 div0 = m.mmu.read(0xFF04);
+		const u8 ly0 = m.mmu.read(0xFF44);
 		m.plant({0x10, 0x00}); // STOP
 		m.cpu.step();
 		check(m.cpu.double_speed, "STOP with KEY1 bit 0 switches to double speed");
 		check((m.mmu.read_key1() & 0x80) != 0, "KEY1 bit 7 reports double speed");
+		checkEq(m.cpu.speed_stall_, 2050u, "STOP arms the 2050 M-cycle stall");
+		// Drain the stall the way the frontend steps (1 component-M per CPU-M).
+		u32 drained = 0;
+		while (m.cpu.speed_stall_ > 0 && drained < 4096) {
+			const u32 mc = m.cpu.step();
+			m.timer.step(mc);
+			m.ppu.step(mc);
+			drained++;
+		}
+		checkEq(drained, 2050u, "stall lasts exactly 2050 M-cycles");
+		checkEq(m.mmu.read(0xFF04), div0, "DIV frozen across the speed-switch stall");
+		checkEq(m.mmu.read(0xFF05), 0u, "TIMA frozen across the speed-switch stall");
+		check(m.mmu.read(0xFF44) != ly0 || m.ppu.frame_ready(), "PPU advances during the stall");
+		// After the stall the timer runs again (8200 unstalled T would move DIV).
+		m.timer.step(300);
+		check(m.mmu.read(0xFF04) != div0, "DIV resumes after the stall");
 		m.mmu.write(0xFF4D, 0x01);
 		m.plant({0x10, 0x00});
 		m.cpu.step();
 		check(!m.cpu.double_speed, "a second STOP returns to normal speed");
+	}
+	{
+		// CGB double-speed: DIV/TIMA run at double wall-rate (Pan Docs KEY1;
+		// SameBoy compensates its APU for this — ours runs off its own
+		// counter, so only the timer doubles here).
+		GbMachine m(HardwareMode::CGB_Only);
+		m.mmu.write(0xFF07, 0x07); // TAC: enabled, fastest (256 T period)
+		m.mmu.write(0xFF05, 0x00); // TIMA = 0
+		const u8 sdiv = m.mmu.read(0xFF04);
+		m.timer.step(256); // 1024 T single-speed
+		const unsigned single_div = (m.mmu.read(0xFF04) - sdiv) & 0xFF;
+		const unsigned single_tima = m.mmu.read(0xFF05);
+		checkEq(single_div, 4u, "single-speed DIV baseline");
+		checkEq(single_tima, 4u, "single-speed TIMA baseline");
+		// Switch through the real STOP path, then drain the stall.
+		m.mmu.write(0xFF4D, 0x01);
+		m.plant({0x10, 0x00});
+		m.cpu.step();
+		while (m.cpu.speed_stall_ > 0) {
+			const u32 mc = m.cpu.step();
+			m.timer.step(mc);
+			m.ppu.step(mc);
+		}
+		check(m.cpu.double_speed, "double-speed engaged for the rate test");
+		const u8 ddiv = m.mmu.read(0xFF04);
+		m.timer.step(256); // 2048 T in double-speed
+		checkEq(((m.mmu.read(0xFF04) - ddiv) & 0xFF), (single_div * 2) & 0xFF,
+				"DIV advances 2x in double speed");
+		m.mmu.write(0xFF05, 0x00);
+		m.timer.step(256);
+		checkEq(m.mmu.read(0xFF05), (single_tima * 2) & 0xFF, "TIMA clocks 2x in double speed");
+		// Switching back restores single rate.
+		m.mmu.write(0xFF4D, 0x01);
+		m.plant({0x10, 0x00});
+		m.cpu.step();
+		while (m.cpu.speed_stall_ > 0) {
+			const u32 mc = m.cpu.step();
+			m.timer.step(mc);
+			m.ppu.step(mc);
+		}
+		const u8 rdiv = m.mmu.read(0xFF04);
+		m.timer.step(256);
+		checkEq(((m.mmu.read(0xFF04) - rdiv) & 0xFF), single_div,
+				"DIV back to single rate after switching down");
 	}
 	{
 		// DMG hardware must ignore the speed switch.
@@ -2122,7 +2884,180 @@ void testGbcFeatures()
 }
 
 // ---------------------------------------------------------------------------
-// 12. Optional ROM boot smoke test
+// 12. GB MBC3 real-time clock
+// ---------------------------------------------------------------------------
+
+void testGbMbc3Rtc()
+{
+	section("GB MBC3 RTC");
+	// Synthetic MBC3+TIMER+BATTERY (type 0x10): 32KB ROM, 8KB RAM.
+	MBC3 mbc(std::vector<u8>(0x8000, 0), std::vector<u8>(0x2000, 0), true, true);
+	auto select = [&](u8 reg) { mbc.write_rom(0x4000, reg); };
+	auto latch = [&] {
+		mbc.write_rom(0x6000, 0);
+		mbc.write_rom(0x6000, 1);
+	};
+	auto read = [&](u8 reg) -> u8 {
+		select(reg);
+		return mbc.read_ram(0);
+	};
+	auto write = [&](u8 reg, u8 v) {
+		select(reg);
+		mbc.write_ram(0, v);
+	};
+
+	// RTC registers are gated on RAM enable, like RAM.
+	write(0x08, 30);
+	latch();
+	checkEq(read(0x08), 0xFFu, "RTC reads 0xFF without RAM enable");
+	mbc.write_rom(0x0000, 0x0A);
+
+	// Halted writes freeze the clock, so latch+read is exact (no 1s race
+	// with the host wall clock between the write and the latch).
+	write(0x08, 30);
+	write(0x09, 15);
+	write(0x0A, 10);
+	write(0x0B, 0x05);
+	write(0x0C, 0x40); // DH: halt, day high 0
+	latch();
+	checkEq(read(0x08), 30u, "RTC seconds latch while halted");
+	checkEq(read(0x09), 15u, "RTC minutes latch while halted");
+	checkEq(read(0x0A), 10u, "RTC hours latch while halted");
+	checkEq(read(0x0B), 0x05u, "RTC day-low latches while halted");
+	checkEq(read(0x0C), 0x40u, "RTC day-high/halt/carry latch while halted");
+	latch();
+	checkEq(read(0x08), 30u, "halted RTC stays frozen across latches");
+
+	// Stray latch writes without a 0->1 edge change nothing.
+	mbc.write_rom(0x6000, 1);
+	mbc.write_rom(0x6000, 1);
+	checkEq(read(0x08), 30u, "repeated latch bit without 0->1 edge is a no-op");
+
+	// Day-counter overflow is sticky until the time is (re)set.
+	write(0x0C, 0xC0); // halt + carry
+	latch();
+	checkEq(read(0x0C) & 0x80u, 0x80u, "RTC day-carry bit latches");
+	write(0x0C, 0x00); // resume, clear carry
+	latch();
+	checkEq(read(0x0C) & 0xC0u, 0x00u, "clearing DH clears halt and carry");
+
+	// Full day decomposition at the top of the 9-bit range, frozen.
+	write(0x08, 59);
+	write(0x09, 59);
+	write(0x0A, 23);
+	write(0x0B, 0xFF);
+	write(0x0C, 0x41); // halt, day bit 8
+	latch();
+	checkEq(read(0x08), 59u, "RTC seconds decompose at day 511");
+	checkEq(read(0x09), 59u, "RTC minutes decompose at day 511");
+	checkEq(read(0x0A), 23u, "RTC hours decompose at day 511");
+	checkEq(read(0x0B), 0xFFu, "RTC day-low decomposes at day 511");
+	checkEq(read(0x0C), 0x41u, "RTC day-high decomposes at day 511");
+
+	// `.rtc` sidecar round-trips the frozen clock.
+	const char *tmp = "/tmp/opencode/gb4me_rtc_test.rtc";
+	check(mbc.save_rtc(tmp), "RTC state saves to a sidecar file");
+	write(0x08, 0);
+	write(0x09, 0);
+	write(0x0A, 0);
+	write(0x0B, 0x00);
+	write(0x0C, 0x40);
+	latch();
+	checkEq(read(0x08), 0u, "RTC reprogrammed after save");
+	check(mbc.load_rtc(tmp), "RTC state loads from the sidecar file");
+	latch();
+	checkEq(read(0x08), 59u, "RTC seconds restored from sidecar");
+	checkEq(read(0x0B), 0xFFu, "RTC day-low restored from sidecar");
+	std::remove(tmp);
+
+	// Loader path: type 0x10 carries TIMER+BATTERY.
+	{
+		std::vector<u8> img(0x8000, 0);
+		static constexpr u8 kLogo[48] = {
+			0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83,
+			0x00, 0x0C, 0x00, 0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E,
+			0xDC, 0xCC, 0x6E, 0xE6, 0xDD, 0xDD, 0xD9, 0x99, 0xBB, 0xBB, 0x67, 0x63,
+			0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC, 0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+		};
+		for (int i = 0; i < 48; i++)
+			img[0x0104 + i] = kLogo[i];
+		img[0x0147] = 0x10; // MBC3+TIMER+BATTERY
+		Cartridge cart;
+		check(cart.load_from_bytes(img), "MBC3+TIMER image loads");
+		check(cart.has_rtc(), "type 0x10 reports RTC hardware");
+		check(cart.has_battery(), "type 0x10 reports battery");
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 13. Vector typeface baking (headless; upload needs a Vulkan device)
+// ---------------------------------------------------------------------------
+
+void testFontBake()
+{
+	section("Font baking (vector typeface)");
+	// Same lookup the renderer uses, dev layout first (bin/fonts is staged
+	// by the build from the pinned ImGui source).
+	const char *candidates[] = {
+		"bin/fonts/Cousine-Regular.ttf",
+		"/usr/share/fonts/TTF/DejaVuSans.ttf",
+		"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+		"/usr/share/fonts/noto/NotoSans-Regular.ttf",
+		"assets/fonts/Cousine-Regular.ttf",
+	};
+	font_detail::BakedFont font;
+	std::string path;
+	for (const char *p : candidates) {
+		if (font_detail::bake_font_file(p, font)) {
+			path = p;
+			break;
+		}
+	}
+	check(!path.empty(), "a staged or system TTF bakes");
+	if (path.empty())
+		return;
+	info("baked %s", path.c_str());
+	check(font.pixels.size() ==
+			  static_cast<size_t>(font_detail::BakedFont::kAtlas) * font_detail::BakedFont::kAtlas,
+		  "atlas is 512x512 coverage");
+	check(font.ascent > 0 && font.descent < 0, "vertical metrics straddle the baseline");
+	bool slots_ok = true, advances_ok = true;
+	for (int i = 0; i < font_detail::BakedFont::kCount; i++) {
+		const auto &g = font.glyphs[i];
+		if (g.u0 > g.u1 || g.v0 > g.v1 || g.u1 > 1.0f || g.v1 > 1.0f)
+			slots_ok = false;
+		if (!(g.advance > 0))
+			advances_ok = false;
+	}
+	check(slots_ok, "all 95 ASCII slots have valid atlas rects");
+	check(advances_ok, "every glyph advances the pen");
+	// Ink check: 'A' and 'g' must have inside (>128) samples in their rects.
+	auto has_ink = [&](char ch) {
+		const auto &g = font.glyphs[ch - 32];
+		const int x0 = static_cast<int>(g.u0 * font_detail::BakedFont::kAtlas);
+		const int y0 = static_cast<int>(g.v0 * font_detail::BakedFont::kAtlas);
+		const int x1 = static_cast<int>(g.u1 * font_detail::BakedFont::kAtlas + 0.5f);
+		const int y1 = static_cast<int>(g.v1 * font_detail::BakedFont::kAtlas + 0.5f);
+		for (int y = y0; y < y1; y++)
+			for (int x = x0; x < x1; x++)
+				if (font.pixels[static_cast<size_t>(y) * font_detail::BakedFont::kAtlas + x] > 128)
+					return true;
+		return false;
+	};
+	check(has_ink('A') && has_ink('g'), "'A' and 'g' have atlas ink");
+	check(!has_ink(' '), "space has no atlas ink");
+	// Determinism: baking twice yields identical output.
+	font_detail::BakedFont again;
+	check(font_detail::bake_font_file(path, again) && again.pixels == font.pixels,
+		  "baking is deterministic");
+	// Garbage in, false out (never throws, never crashes).
+	font_detail::BakedFont junk;
+	check(!font_detail::bake_font_file("/tmp/opencode/does-not-exist.ttf", junk),
+		  "a missing file bakes false");
+}
+
+// ---------------------------------------------------------------------------
+// 14. Optional ROM boot smoke test
 // ---------------------------------------------------------------------------
 
 void testRomBoot(const std::string &path)
@@ -2162,7 +3097,7 @@ void testRomBoot(const std::string &path)
 			}
 		}
 		info("ran %d frames, %u distinct colours, PC = %s", frames, distinct,
-				hex16(m.cpu.regs.pc).c_str());
+			 hex16(m.cpu.regs.pc).c_str());
 		check(frames > 0, "GB/GBC ROM produced at least one frame");
 		check(distinct > 1, "GB/GBC frame is not blank");
 		return;
@@ -2219,15 +3154,15 @@ void testRomBoot(const std::string &path)
 		if (n != 0)
 			++swis;
 	const u32 pc = gba.cpu().pc();
-	const bool pc_valid = !(pc >= 0x00004000 && pc < 0x02000000);
+	const bool pc_valid = pc < 0x00004000 || pc >= 0x02000000;
 	info("%s: %d frames, best %u distinct colours, PC = %s, %u distinct SWIs used, "
-			"display %s, assets %s",
-			path.c_str(), frames, best_distinct, hex32(pc).c_str(), swis,
-			display_on ? "on" : "off", assets_uploaded ? "uploaded" : "missing");
+		 "display %s, assets %s",
+		 path.c_str(), frames, best_distinct, hex32(pc).c_str(), swis, display_on ? "on" : "off",
+		 assets_uploaded ? "uploaded" : "missing");
 	check(frames > 0, "GBA ROM produced at least one frame");
 	check(pc_valid, "GBA ROM stayed in mapped code (no open-bus escape)");
 	check(display_on || assets_uploaded || best_distinct > 1 || swis >= 3,
-			"GBA ROM boot progressed (display, assets, colours or BIOS use)");
+		  "GBA ROM boot progressed (display, assets, colours or BIOS use)");
 }
 
 void testVideoSettings()
@@ -2280,8 +3215,7 @@ void testVideoSettings()
 		s.lcd_grid = -5;
 		check(s.lcdGridDepth() == 0.0f, "a negative grid setting clamps to Off");
 		s.lcd_grid = 9999;
-		check(s.lcdGridDepth() ==
-				  Settings::kLcdGridDepth[Settings::kLcdGridMax],
+		check(s.lcdGridDepth() == Settings::kLcdGridDepth[Settings::kLcdGridMax],
 			  "an out-of-range grid setting clamps to the strongest step");
 	}
 
@@ -2356,6 +3290,145 @@ void testVideoSettings()
 		}
 		std::remove(path.c_str());
 	}
+
+	// settings.cfg is versioned: a save records the schema, a legacy file
+	// with no schema line still loads, and a file from a newer build keeps
+	// the keys we understand while its unknown keys are reported.
+	{
+		const std::string path = "/tmp/opencode/gb4me_schema_test.cfg";
+		{
+			Settings s;
+			s.video_filter = static_cast<int>(VideoFilter::Bilinear);
+			s.volume = 0.25f;
+			check(s.save(path), "settings save with a schema header");
+		}
+		{
+			Settings s;
+			check(s.load(path), "settings load from disk");
+			checkEq(s.loaded_schema(), Settings::kSchemaVersion,
+					"the saved file reports the current schema");
+			check(s.unknown_keys().empty(), "no unknown keys in a current file");
+			check(s.video_filter == static_cast<int>(VideoFilter::Bilinear) && s.volume > 0.24f &&
+					  s.volume < 0.26f,
+				  "values round trip through the versioned file");
+		}
+		// Legacy file: no schema line, old GB key order (key0 = Right).
+		{
+			std::ofstream f(path, std::ios::trunc);
+			f << "rom_folder=/tmp\n";
+			f << "volume=1\n";
+			f << "video_filter=2\n";
+			f << "key0=79\n";
+			f << "key1=80\n";
+			f << "a_completely_new_key=7\n";
+		}
+		{
+			Settings s;
+			check(s.load(path), "a legacy file (no schema line) loads");
+			checkEq(s.loaded_schema(), 1, "an unversioned file reports schema 1");
+			check(s.video_filter == static_cast<int>(VideoFilter::SmoothBilinear),
+				  "legacy values still apply");
+			checkEq(static_cast<u32>(s.unknown_keys().size()), 1u,
+					"an unknown key is reported, not fatal");
+			checkEq(static_cast<u32>(s.key_map[4]), 79u, // Right
+					"legacy GB key order migrates into the shared table");
+		}
+		// A file claiming a newer schema still loads (forward compatible).
+		{
+			std::ofstream f(path, std::ios::trunc);
+			f << "schema=99\n";
+			f << "video_filter=1\n";
+		}
+		{
+			Settings s;
+			check(s.load(path), "a file from a newer build still loads");
+			checkEq(s.loaded_schema(), 99, "the future schema is recorded as-is");
+			check(s.video_filter == static_cast<int>(VideoFilter::Bilinear),
+				  "keys we understand still apply from a future file");
+		}
+		std::remove(path.c_str());
+	}
+
+	// Per-game overlay: <rom>.cfg beats the global config for that game only.
+	{
+		checkStrEq(Settings::game_override_path("games/mario.gb"), std::string("games/mario.cfg"),
+				   "the per-game file is the rom path with a .cfg extension");
+		checkStrEq(Settings::game_override_path("noext"), std::string("noext.cfg"),
+				   "a rom path without an extension still gets one");
+		// A dot in a DIRECTORY must not be mistaken for the extension.
+		checkStrEq(Settings::game_override_path("Mr. B's ROMs/game.gbc"),
+				   std::string("Mr. B's ROMs/game.cfg"),
+				   "a dot in a folder name is not an extension");
+
+		const std::string rom = "/tmp/opencode/gb4me_pergame.gb";
+		const std::string cfg = Settings::game_override_path(rom);
+		{
+			std::ofstream f(cfg, std::ios::trunc);
+			f << "volume=0.25\n";
+			f << "palette=3\n";
+			f << "hardware_mode=DMG\n";
+		}
+		Settings s;
+		s.volume = 1.0f;
+		s.palette = 0;
+		s.lcd_grid = 2;
+		s.hardware_mode = "Auto";
+		check(s.load_game_override(rom), "a per-game file with known keys applies");
+		check(s.game.active, "the overlay reports itself active");
+		check(std::fabs(s.volume - 0.25f) < 1e-6f, "the per-game volume wins");
+		checkEq(s.palette, 3, "the per-game palette wins");
+		checkStrEq(s.hardware_mode, std::string("DMG"), "the per-game hardware mode wins");
+		checkEq(s.lcd_grid, 2, "a key the file omits keeps its global value");
+
+		// A save from inside the game must not promote the game's values to
+		// the global defaults - that is the whole reason the overlay keeps
+		// what it displaced.
+		const std::string global_path = "/tmp/opencode/gb4me_pergame_global.cfg";
+		check(s.save(global_path), "the global config still saves under an overlay");
+		{
+			Settings reread;
+			check(reread.load(global_path), "the saved global config reloads");
+			check(std::fabs(reread.volume - 1.0f) < 1e-6f,
+				  "the global volume is not overwritten by the game's");
+			checkEq(reread.palette, 0, "the global palette is not overwritten by the game's");
+			check(s.game.active && std::fabs(s.volume - 0.25f) < 1e-6f,
+				  "the running game keeps its own values after a save");
+		}
+		std::remove(global_path.c_str());
+
+		s.clear_game_override();
+		check(!s.game.active, "clearing the overlay deactivates it");
+		check(std::fabs(s.volume - 1.0f) < 1e-6f, "the displaced global volume comes back");
+		checkEq(s.palette, 0, "the displaced global palette comes back");
+		checkStrEq(s.hardware_mode, std::string("Auto"), "the displaced global mode comes back");
+		checkEq(s.lcd_grid, 2, "clearing does not touch keys the file never set");
+
+		// A file with nothing we understand is not an overlay at all, and a
+		// missing one is not an error.
+		{
+			std::ofstream f(cfg, std::ios::trunc);
+			f << "not_a_setting=1\n";
+		}
+		check(!s.load_game_override(rom), "a per-game file with no known keys applies nothing");
+		check(!s.game.active, "such a file leaves the overlay inactive");
+		checkEq(s.palette, 0, "and changes nothing");
+		check(!s.load_game_override("/tmp/opencode/gb4me_absent.gb"),
+			  "a game without a .cfg file is not an error");
+		std::remove(cfg.c_str());
+	}
+
+	// Volume OSD state is pure clock logic (no device): inactive by default,
+	// active right after a flash, clamping out-of-range volumes.
+	{
+		VulkanRenderer r;
+		check(!r.volume_osd_active(), "the volume OSD starts inactive");
+		r.flash_volume(0.8f);
+		check(r.volume_osd_active(), "the volume OSD is active after a flash");
+		r.flash_volume(2.0f);
+		check(r.volume_osd_active(), "an over-range flash still activates");
+		r.flash_volume(-1.0f);
+		check(r.volume_osd_active(), "an under-range flash still activates");
+	}
 }
 
 void testInputsPage()
@@ -2370,8 +3443,7 @@ void testInputsPage()
 		check(!c.device_box().enabled, "the device dropdown is locked with keyboard only");
 		check(c.selectedDevice() == 0, "the locked device is the keyboard");
 		check(c.deviceName() == "Keyboard", "the locked device is named Keyboard");
-		check(c.device_box().options.size() == 1,
-			  "keyboard-only still offers exactly one option");
+		check(c.device_box().options.size() == 1, "keyboard-only still offers exactly one option");
 		// A controller unlocks it and appears as its own entry.
 		c.setDeviceOptions({"Xbox Controller"}, 1);
 		check(c.device_box().enabled, "a controller unlocks the device dropdown");
@@ -2450,8 +3522,7 @@ void testInputsPage()
 		const int nprof = c.profileCommandIndex();
 		check(size == st.profileCount() + GUIConsole::kProfileMenuSpecials,
 			  "the profile menu lists every profile plus the three commands");
-		check(nprof == st.profileCount(),
-			  "the command boundary sits right after the last profile");
+		check(nprof == st.profileCount(), "the command boundary sits right after the last profile");
 		// Every menu entry is reachable and in range: the bug made the last
 		// three entries index past the profile list.
 		bool in_range = true;
@@ -2484,8 +3555,7 @@ void testInputsPage()
 			  "Rename is unavailable while Default is the active profile");
 		check(!c.profileMenuEnabled(c.profileCommandIndex() + 2),
 			  "Delete is unavailable while Default is the active profile");
-		check(c.profileMenuEnabled(c.profileCommandIndex()),
-			  "New is always available");
+		check(c.profileMenuEnabled(c.profileCommandIndex()), "New is always available");
 		check(c.profileMenuEnabled(0), "any profile entry is selectable");
 		// Default itself is still protected at the model level.
 		check(!st.renameProfile(0, "Nope"), "Default cannot be renamed");
@@ -2508,8 +3578,7 @@ void testInputsPage()
 		c.set_settings_tab(GUIConsole::SettingsTab::Inputs);
 		c.set_show_settings(true);
 		// Hit testing is gated on the Inputs tab.
-		check(!c.hit_gba_pad(0, 0).has_value(),
-			  "the diagram is inert outside the Inputs tab");
+		check(!c.hit_gba_pad(0, 0).has_value(), "the diagram is inert outside the Inputs tab");
 		const auto &p = c.gbaPad();
 		const int cx = static_cast<int>(p.body.x + p.body.w * 0.5f);
 		const int cy = static_cast<int>(p.body.y + p.body.h * 0.5f);
@@ -2517,25 +3586,25 @@ void testInputsPage()
 		const auto centre = [&](const GUIConsole::Rect &r) {
 			return static_cast<int>(r.x + r.w * 0.5f);
 		};
-		check(c.hit_gba_pad(centre(p.btn_a), static_cast<int>(p.btn_a.y + p.btn_a.h * 0.5f))
-				  == PadButton::A,
+		check(c.hit_gba_pad(centre(p.btn_a), static_cast<int>(p.btn_a.y + p.btn_a.h * 0.5f)) ==
+				  PadButton::A,
 			  "the A circle hits A");
-		check(c.hit_gba_pad(centre(p.btn_b), static_cast<int>(p.btn_b.y + p.btn_b.h * 0.5f))
-				  == PadButton::B,
+		check(c.hit_gba_pad(centre(p.btn_b), static_cast<int>(p.btn_b.y + p.btn_b.h * 0.5f)) ==
+				  PadButton::B,
 			  "the B circle hits B");
 		check(c.hit_gba_pad(centre(p.btn_start),
-							static_cast<int>(p.btn_start.y + p.btn_start.h * 0.5f))
-				  == PadButton::Start,
+							static_cast<int>(p.btn_start.y + p.btn_start.h * 0.5f)) ==
+				  PadButton::Start,
 			  "the START pill hits Start");
 		check(c.hit_gba_pad(centre(p.btn_select),
-							static_cast<int>(p.btn_select.y + p.btn_select.h * 0.5f))
-				  == PadButton::Select,
+							static_cast<int>(p.btn_select.y + p.btn_select.h * 0.5f)) ==
+				  PadButton::Select,
 			  "the SELECT pill hits Select");
-		check(c.hit_gba_pad(centre(p.btn_l), static_cast<int>(p.btn_l.y + p.btn_l.h * 0.5f))
-				  == PadButton::L,
+		check(c.hit_gba_pad(centre(p.btn_l), static_cast<int>(p.btn_l.y + p.btn_l.h * 0.5f)) ==
+				  PadButton::L,
 			  "the L shoulder hits L");
-		check(c.hit_gba_pad(centre(p.btn_r), static_cast<int>(p.btn_r.y + p.btn_r.h * 0.5f))
-				  == PadButton::R,
+		check(c.hit_gba_pad(centre(p.btn_r), static_cast<int>(p.btn_r.y + p.btn_r.h * 0.5f)) ==
+				  PadButton::R,
 			  "the R shoulder hits R");
 		// The D-pad: each arm, and the dominant-axis rule on the diagonals.
 		const int dx = static_cast<int>(p.dpad_h.x + p.dpad_h.w * 0.5f);
@@ -2546,7 +3615,7 @@ void testInputsPage()
 		check(c.hit_gba_pad(dx + arm, dy) == PadButton::Right, "the D-pad right arm hits Right");
 		check(c.hit_gba_pad(dx, dy - armv) == PadButton::Up, "the D-pad up arm hits Up");
 		check(c.hit_gba_pad(dx, dy + armv) == PadButton::Down, "the D-pad down arm hits Down");
-			// The hit region must be CENTRED on the cross. Writing the centre as
+		// The hit region must be CENTRED on the cross. Writing the centre as
 		// (x + w) / 2 instead of x + w / 2 puts it on the right edge, so every
 		// arm click fell outside the region and the D-pad did nothing.
 		{
@@ -2576,17 +3645,13 @@ void testInputsPage()
 				  "the screen keeps the real 61.2x40.8mm aspect");
 			// Controls must sit where a real GBA puts them: D-pad on the far
 			// left, A/B right of the screen, START/SELECT under it.
-			check(p.btn_a.x > p.screen.x + p.screen.w,
-				  "the A button is right of the screen");
-			check(p.dpad_h.x + p.dpad_h.w * 0.5f < p.screen.x,
-				  "the D-pad is left of the screen");
-			check(p.btn_start.y > p.screen.y + p.screen.h,
-				  "START is below the screen");
+			check(p.btn_a.x > p.screen.x + p.screen.w, "the A button is right of the screen");
+			check(p.dpad_h.x + p.dpad_h.w * 0.5f < p.screen.x, "the D-pad is left of the screen");
+			check(p.btn_start.y > p.screen.y + p.screen.h, "START is below the screen");
 			check(p.btn_select.x < p.btn_start.x, "SELECT sits left of START");
 			check(p.btn_l.y <= p.body.y + 1.0f && p.btn_r.y <= p.body.y + 1.0f,
 				  "the shoulders are on the top edge");
-			check(p.btn_b.x < p.btn_a.x && p.btn_b.y > p.btn_a.y,
-				  "B sits lower-left of A");
+			check(p.btn_b.x < p.btn_a.x && p.btn_b.y > p.btn_a.y, "B sits lower-left of A");
 		}
 
 		// Dead space around the cross must not resolve to anything.
@@ -2597,7 +3662,6 @@ void testInputsPage()
 		(void) cx;
 		(void) cy;
 	}
-
 }
 
 void testInputProfiles()
@@ -2729,8 +3793,7 @@ void testInputProfiles()
 			check(s.profileName(1) == "Handheld", "the first profile kept its name");
 			check(s.profileName(2) == "Arcade", "the second profile kept its name");
 			check(s.active_profile == 2, "the active profile index was restored");
-			check(s.key_map[0] == SDL_SCANCODE_KP_1,
-				  "the active profile's key map was restored");
+			check(s.key_map[0] == SDL_SCANCODE_KP_1, "the active profile's key map was restored");
 			check(s.pad_map[0].kind == BindKind::Button &&
 					  s.pad_map[0].code == static_cast<int>(SDL_GAMEPAD_BUTTON_SOUTH),
 				  "the active profile's controller binding was restored");
@@ -2764,6 +3827,32 @@ void testInputProfiles()
 		check(s.profileCount() == 1, "a legacy file yields just the Default profile");
 		check(s.key_map[0] == static_cast<SDL_Scancode>(79),
 			  "a legacy file's key map is preserved on Default");
+		std::remove(path.c_str());
+	}
+
+	// Recent ROMs: dedupe, most-recent-first, capped, persisted.
+	{
+		const std::string path = "/tmp/opencode/gb4me_recents_test.cfg";
+		{
+			Settings s;
+			s.push_recent("/games/a.gb");
+			s.push_recent("/games/b.gbc");
+			s.push_recent("/games/a.gb"); // replay fronts without duplicating
+			check(s.recent_roms.size() == 2, "replaying a recent dedupes");
+			check(s.recent_roms[0] == "/games/a.gb", "replay fronts the entry");
+			for (int i = 0; i < 10; i++)
+				s.push_recent("/games/f" + std::to_string(i) + ".gba");
+			check(s.recent_roms.size() == Settings::kMaxRecent, "recents are capped");
+			check(s.recent_roms[0] == "/games/f9.gba", "newest push stays front");
+			check(s.save(path), "settings with recents save to disk");
+		}
+		{
+			Settings s;
+			check(s.load(path), "settings with recents load from disk");
+			check(s.recent_roms.size() == Settings::kMaxRecent, "all capped recents came back");
+			check(s.recent_roms[0] == "/games/f9.gba", "recency order survives");
+			check(s.recent_roms.back() == "/games/f2.gba", "oldest entry is f2");
+		}
 		std::remove(path.c_str());
 	}
 
@@ -2825,16 +3914,16 @@ void testInputManager()
 		const Binding b = Binding::makeButton(SDL_GAMEPAD_BUTTON_SOUTH);
 		const Binding rt = Binding::unpack(b.packed());
 		check(b.kind == BindKind::Button && b.code == static_cast<int>(SDL_GAMEPAD_BUTTON_SOUTH) &&
-				rt.packed() == b.packed(),
+				  rt.packed() == b.packed(),
 			  "Binding pack/unpack round trip preserves a controller button");
 		const Binding ax = Binding::makeAxis(SDL_GAMEPAD_AXIS_LEFTX, true);
-		check(ax.kind == BindKind::AxisPos && !ax.bound() == false,
+		check(ax.kind == BindKind::AxisPos && ax.bound(),
 			  "positive axis binding is stored as AxisPos and counts as bound");
 		const Binding none;
 		check(!none.bound(), "an unset Binding does not report itself bound");
 		check(std::string(pad_button_name(PadButton::Select)) == "Select" &&
-				std::string(pad_button_name(PadButton::R)) == "R" &&
-				std::string(pad_button_name(PadButton::L)) == "L",
+				  std::string(pad_button_name(PadButton::R)) == "R" &&
+				  std::string(pad_button_name(PadButton::L)) == "L",
 			  "pad_button_name names the ten logical buttons");
 	}
 
@@ -2950,9 +4039,10 @@ int run_selftest(const std::string &rom_path)
 	g_checks = 0;
 	g_failed = 0;
 	std::printf("GB4ME self test\n");
-	std::printf("Core checks for the GB/GBC core and the GBA core (HLE BIOS, no external firmware)\n");
+	std::printf(
+		"Core checks for the GB/GBC core and the GBA core (HLE BIOS, no external firmware)\n");
 	info("core object sizes: GBA %zu bytes, GB stack %zu bytes", sizeof(gba::GameBoyAdvance),
-			sizeof(GbMachine));
+		 sizeof(GbMachine));
 
 	testBiosStartup();
 	testSwiDispatch();
@@ -2963,6 +4053,7 @@ int run_selftest(const std::string &rom_path)
 	testPpu();
 	testDma();
 	testTimers();
+	testApu();
 	testKeypad();
 	testInputManager();
 	testVideoSettings();
@@ -2973,6 +4064,8 @@ int run_selftest(const std::string &rom_path)
 	testSavesAndStates();
 	testGbCpu();
 	testGbcFeatures();
+	testGbMbc3Rtc();
+	testFontBake();
 
 	if (!rom_path.empty())
 		testRomBoot(rom_path);

@@ -137,6 +137,9 @@ class CPU
 
 	bool halted = false;
 	bool stopped = false;
+	// CGB speed-switch stall: M-cycles remaining of the 2050 M-cycle freeze
+	// after STOP (Pan Docs KEY1). Test-visible; drained by step().
+	u32 speed_stall_ = 0;
 	u64 cycles = 0; // Total M-cycles executed.
 	u32 cycles_last_instruction = 0;
 
@@ -156,6 +159,10 @@ class CPU
   private:
 	MMU *mmu_ = nullptr;
 	bool ei_delay_ = false; // EI takes effect after the following instruction.
+	// HALT bug: HALT with IME=0 and a pending interrupt skips the next
+	// PC increment (next opcode byte is read twice).
+	// https://gbdev.io/pandocs/halt.html#halt-bug
+	bool halt_bug_ = false;
 
 	u8 fetch();
 	u16 fetch16();
@@ -210,6 +217,15 @@ class CPU
 	u8 op_swap(u8 v);
 	u8 op_srl(u8 v);
 	void op_bit(u8 bit, u8 v);
+	// Dispatch tables: the ALU group (ADD ADC SUB SBC AND XOR OR CP) and the
+	// CB rotate/shift group (RLC RRC RL RR SLA SRA SWAP SRL) are both
+	// selected by the y field. Same callees as the switches they replace.
+	using AluFn = void (CPU::*)(u8);
+	static constexpr AluFn kAlu[8] = {&CPU::add_a, &CPU::adc_a, &CPU::sub_a, &CPU::sbc_a,
+									  &CPU::and_a, &CPU::xor_a, &CPU::or_a,  &CPU::cp_a};
+	using RotFn = u8 (CPU::*)(u8);
+	static constexpr RotFn kRot[8] = {&CPU::op_rlc, &CPU::op_rrc, &CPU::op_rl,   &CPU::op_rr,
+									  &CPU::op_sla, &CPU::op_sra, &CPU::op_swap, &CPU::op_srl};
 };
 
 } // namespace gb

@@ -30,8 +30,13 @@ _deps/
 # Shader compiled output (keep sources)
 *.spv
 
+# Headless dump output (--dump / --dump-gba)
+dump*.ppm
+dump*.txt
+
 # === Emulator runtime ===
 *.sav
+*.rtc
 *.state
 *.log
 *.wav

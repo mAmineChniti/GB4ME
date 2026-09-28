@@ -97,8 +97,8 @@ class FlashSave : public SaveHardware
 	Manufacturer mfr_;
 	enum class State : u8 {
 		ReadArray,
-		Unlock1,       // After 0xAA at 0x5555
-		Unlock2,       // After 0x55 at 0x2AAA
+		Unlock1, // After 0xAA at 0x5555
+		Unlock2, // After 0x55 at 0x2AAA
 		ReadId,
 		ReadStatus,
 		EraseSetup,
@@ -122,6 +122,21 @@ class FlashSave : public SaveHardware
 
 	// Command handling (to be implemented by specific manufacturers).
 	virtual void handleCommand(u32 offset, u8 value) = 0;
+
+	// Shared command effects (GBATEK "Flash Memory" command set; the
+	// chips this header models are all JEDEC-compatible here):
+	//   AA 55 10 @5555        chip erase
+	//   AA 55 80 AA 55 30 @sector   4KB sector erase
+	//   AA 55 A0, byte @addr  byte program (AND)
+	//   AA 55 90              autoselect ID, AA 55 B0 + bank @0000 (128KB)
+	void eraseChip();
+	void eraseSector(u32 physical);
+	// Byte program (the 0xA0 command's data byte). NOR flash cells can only
+	// be cleared while programming; a 1 bit only comes back from an erase
+	// (GBATEK "Flash Memory", the AND/erase programming model). Assigning
+	// unconditionally (what mGBA does) would let a title resurrect 0 bits
+	// without erasing first, which no cartridge can do.
+	void programByte(u32 offset, u8 value);
 	virtual u8 readId(u32 offset) const = 0;
 	virtual u8 readStatus() const = 0;
 };
@@ -207,8 +222,11 @@ class EepromSave : public SaveHardware
 	// 0 of value; `remaining` is the number of halfword transfers left
 	// *including* the current one (mirrors the DMA unit counter, which is
 	// how the engine tells address bits from data bits from the stop bit).
-	uint16_t dmaRead() const;
-	void dmaWrite(uint16_t value, uint32_t remaining);
+	// `cycle` is the current tick of the core clock (1 tick = 1/16.78MHz
+	// second); it only drives the write-settle busy window, so headless
+	// callers may pass their own counter (0 = never busy).
+	uint16_t dmaRead(u64 cycle) const;
+	void dmaWrite(uint16_t value, uint32_t remaining, u64 cycle);
 	u32 size() const override
 	{
 		return static_cast<u32>(data_.size());
@@ -222,11 +240,11 @@ class EepromSave : public SaveHardware
 
   private:
 	enum class Cmd : u8 {
-		Null = 0,       // Waiting for the leading 1 bit.
-		Pending = 1,    // First bit seen; second selects read vs write.
-		Write = 2,      // Receiving address + data bits ("10" seen).
+		Null = 0,        // Waiting for the leading 1 bit.
+		Pending = 1,     // First bit seen; second selects read vs write.
+		Write = 2,       // Receiving address + data bits ("10" seen).
 		ReadPending = 3, // Receiving read address ("11" seen).
-		Read = 4,       // Streaming the 68-bit readback.
+		Read = 4,        // Streaming the 68-bit readback.
 	};
 	// Lazy size upgrade: a 4Kbit backing transparently grows to 8KB the
 	// first time the game addresses beyond 512 bytes (a 64Kbit title on
@@ -250,6 +268,12 @@ class EepromSave : public SaveHardware
 	mutable u32 write_addr_ = 0;
 	mutable u32 read_addr_ = 0;
 	mutable int read_left_ = 0; // Bits left in the active 68-bit readback.
+	// Program/erase settle window: while `cycle < busy_until_` a status
+	// read reports 0 (busy) instead of 1 (ready). GBATEK puts the EEPROM
+	// write time at ~6.5ms; mGBA models it as 115000 core cycles
+	// (src/gba/savedata.c EEPROM_SETTLE_CYCLES) which is what this uses.
+	static constexpr u64 kSettleCycles = 115000;
+	mutable u64 busy_until_ = 0;
 };
 
 } // namespace gba

@@ -66,6 +66,20 @@ class PPU
 	// DMA/HDMA bypass VRAM/OAM blocking but respect VBK bank selection (per
 	// Pan Docs CGB VRAM DMA: dest VRAM bank is FF4F). Used by MMU HDMA.
 	void write_vram_dma(u16 addr, u8 value);
+	// A CGB HDMA block owns the VRAM/OAM bus while it moves (2us per 0x10
+	// bytes = 8 M-cycles = 32 dots). The MMU reports each block it starts;
+	// the PPU counts the window down and blocks CPU accesses for it, which
+	// is independent of the current PPU mode.
+	// https://gbdev.io/pandocs/Memory_Map.html#dma-transfer-channels
+	static constexpr u32 kHdmaBlockDots = 32;
+	void note_hdma_block()
+	{
+		hdma_block_until_ = dot_ + kHdmaBlockDots;
+	}
+	bool hdma_bus_busy() const
+	{
+		return hdma_block_until_ > dot_;
+	}
 	u8 read_oam(u16 addr) const;
 	void write_oam(u16 addr, u8 value);
 
@@ -260,6 +274,10 @@ class PPU
 
 	Mode current_mode_ = Mode::OAMScan;
 	u32 line_cycles_ = 0;
+	// Running dot position in the frame; only used to time the HDMA bus
+	// block, so it is not kept in sync with LY/LYC.
+	u32 dot_ = 0;
+	u32 hdma_block_until_ = 0;
 	u16 window_line_ = 0; // Internal WY line counter (resets on VBlank/LCD-off).
 	FrameData frame_buffer_{};
 	bool frame_ready_flag_ = false;

@@ -26,8 +26,7 @@ static void logIoAccess(char op, unsigned width, u32 addr, u32 value, u32 instr_
 	if ((addr >= 0x04000000u && addr < 0x04000100u) ||
 		(addr >= 0x080000C0u && addr < 0x080000D0u) ||
 		(addr >= 0x0E000000u && addr < 0x0F000000u)) {
-		std::printf("gba-io: %c%u %08X = %08X @ %08X\n", op, width, addr, value,
-				instr_addr);
+		std::printf("gba-io: %c%u %08X = %08X @ %08X\n", op, width, addr, value, instr_addr);
 	}
 #endif // !GB4ME_RELEASE
 }
@@ -322,7 +321,7 @@ void Arm7Tdmi::writePsr(bool use_spsr, u32 value, u8 field_mask)
 	// mask (:729-735). Writing them let code that probes reserved fields
 	// corrupt the mode/flag byte.
 	const bool privileged = mode() != CpuMode::User;
-	const bool mask_sx = use_spsr ? true : privileged && false;
+	const bool mask_sx = use_spsr; // Bank access is privileged; no SPR mask bit.
 	if (field_mask & 0x8)
 		mask |= 0xFF000000u; // f: flags 31-24.
 	if (mask_sx && (field_mask & 0x4))
@@ -639,8 +638,7 @@ u32 Arm7Tdmi::step()
 		cycles_ += 1;
 		bool fire = irq_pending_ && !getFlag(kFlagI);
 		if (bus_ != nullptr) {
-			const u16 fired =
-				static_cast<u16>(bus_->read16(0x04000200) & bus_->read16(0x04000202));
+			const u16 fired = static_cast<u16>(bus_->read16(0x04000200) & bus_->read16(0x04000202));
 			if (fired != 0)
 				fire = true;
 		}

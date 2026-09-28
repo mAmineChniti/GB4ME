@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gba/gpio.h"
+#include "gba/scheduler.h"
 #include "gba/state.h"
 #include <array>
 #include <cstddef>
@@ -12,8 +13,8 @@ class GbaIrq;
 class GbaTimers;
 class GbaDma;
 class GbaPpu;
-class GbaKeypad;
 class GbaAudio;
+class GbaKeypad;
 class Cartridge;
 
 // GBA memory bus (Phase 1 skeleton: map + RAM + protection, no devices yet).
@@ -124,6 +125,16 @@ class GbaBus
 		return (addr >> 24) == 0x0Du;
 	}
 	bool eepromActive() const;
+	// Serial transfers carry the core tick so the EEPROM busy window
+	// (program/erase settle time) is measured in real core cycles.
+	void setScheduler(GbaScheduler *scheduler)
+	{
+		scheduler_ = scheduler;
+	}
+	u64 cycle() const
+	{
+		return scheduler_ != nullptr ? scheduler_->now() : 0;
+	}
 	uint16_t eepromDmaRead() const;
 	void eepromDmaWrite(uint16_t value, uint32_t remaining);
 	// Cart GPIO/RTC window (0x080000C4-0x080000C9). Active only when the
@@ -133,6 +144,10 @@ class GbaBus
 		return addr >= GpioRtc::kDataAddr && addr < GpioRtc::kEndAddr;
 	}
 	bool gpioActive() const;
+	// Serial (SIO) ports 0x04000120-0x0400012B: no link hardware, so
+	// reads answer "idle" and writes are dropped (see bus.cpp).
+	u16 readSerialIdle(u32 addr) const;
+	void noteSerialUse(u32 addr) const;
 
 	// WAITCNT (0x04000204) backing. Reset default 0x0000; Phase 5 routes
 	// the I/O write here. Tables below follow GBATEK "Address Bus Width
@@ -195,6 +210,8 @@ class GbaBus
 	GbaPpu *ppu_ = nullptr;
 	GbaKeypad *keypad_ = nullptr;
 	GbaAudio *audio_ = nullptr;
+	GbaScheduler *scheduler_ = nullptr;
+	mutable bool serial_warned_ = false;
 	Cartridge *cartridge_ = nullptr;
 
 	u8 readRom(u32 addr) const;

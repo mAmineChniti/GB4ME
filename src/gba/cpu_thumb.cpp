@@ -277,10 +277,10 @@ u32 executeThumb(Arm7Tdmi &cpu, u16 instr, u32 instr_addr)
 	case 0x6:
 	case 0x7: {
 		// Register-offset (0101) and immediate word/byte (011x).
-		u32 addr;
-		bool load;
+		u32 addr = 0;
+		bool load = 0;
 		bool byte = false;
-		u8 rt;
+		u8 rt = 0;
 		if (top == 0x5) {
 			addr = cpu.reg((instr >> 6) & 7) + cpu.reg((instr >> 3) & 7);
 			rt = instr & 7;
@@ -290,23 +290,20 @@ u32 executeThumb(Arm7Tdmi &cpu, u16 instr, u32 instr_addr)
 				// 1 LDSB, 2 LDRH, 3 LDSH).
 				const u8 op8 = (instr >> 10) & 3;
 				if (op8 == 0) {
-					cpu.storeHalf(addr & ~1u,
-							static_cast<u16>(cpu.reg(rt) & 0xFFFFu));
+					cpu.storeHalf(addr & ~1u, static_cast<u16>(cpu.reg(rt) & 0xFFFFu));
 					return 0;
 				}
 				if (op8 == 1) {
-					cpu.setReg(rt,
-							static_cast<u32>(static_cast<i32>(
-									static_cast<i8>(cpu.loadByte(addr)))));
+					cpu.setReg(rt, static_cast<u32>(
+									   static_cast<i32>(static_cast<i8>(cpu.loadByte(addr)))));
 					return 1;
 				}
 				if (op8 == 3 && (addr & 1) != 0) {
 					// LDSH from an odd address loads a byte and
 					// sign-extends it (ARMv4T; mirrors the ARM
 					// halfword-group path in cpu_arm.cpp).
-					cpu.setReg(rt,
-							static_cast<u32>(static_cast<i32>(
-									static_cast<i8>(cpu.loadByte(addr)))));
+					cpu.setReg(rt, static_cast<u32>(
+									   static_cast<i32>(static_cast<i8>(cpu.loadByte(addr)))));
 					return 1;
 				}
 				cpu.setReg(rt, cpu.loadHalf(addr, op8 == 3));

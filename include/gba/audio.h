@@ -31,6 +31,19 @@ class GbaAudio
 	GbaAudio &operator=(const GbaAudio &) = delete;
 
 	void reset();
+	// Audio batches dropped because the device fell behind (crackle).
+	u32 dropouts() const
+	{
+		return dropouts_;
+	}
+	// Audio-clock pacing hooks (see include/gb/audio_sync.h).
+	int queued() const;
+	void set_resample_ratio(float ratio);
+	// Output frames produced since reset (for the pacer and the overlay).
+	u64 frames_emitted() const
+	{
+		return frames_emitted_;
+	}
 	void setDma(GbaDma *dma)
 	{
 		dma_ = dma;
@@ -177,7 +190,7 @@ class GbaAudio
 	u32 envelope_clock_ = 0; // 64 Hz: 262144 ticks.
 	u32 sweep_clock_ = 0;    // 128 Hz: 131072 ticks.
 	u32 sample_clock_ = 0;   // 44100 Hz output.
-	u32 sample_frac_ = 0;   // Fixed-point dither for the exact sample period.
+	u32 sample_frac_ = 0;    // Fixed-point dither for the exact sample period.
 
 	float hp_x_l_ = 0, hp_y_l_ = 0;
 	float hp_x_r_ = 0, hp_y_r_ = 0;
@@ -189,7 +202,18 @@ class GbaAudio
 
 	SDL_AudioStream *stream_ = nullptr;
 	std::vector<i16> sample_buffer_;
+	u32 dropouts_ = 0;
 	float master_volume_ = 1.0f;
+	// Drift correction from the audio-clock pacer, applied to the emitted
+	// frame count (the GBA mixes straight at the output rate, so there is no
+	// oversampled stage to re-stride - the ratio picks every Nth frame).
+	float resample_ratio_ = 1.0f;
+	// Fractional sample-hold state for the drift correction: `phase` counts
+	// output frames owed (+) or to be skipped (-), prev_* hold the last
+	// emitted pair so an "extra" frame is a hold, not a new sample.
+	f32 resample_phase_ = 0.0f;
+	i16 prev_l_ = 0, prev_r_ = 0;
+	u32 frames_emitted_ = 0;
 
 	// Register shadows for readable bits.
 	u8 nr10_ = 0, nr11_ = 0, nr12_ = 0, nr14_ = 0;

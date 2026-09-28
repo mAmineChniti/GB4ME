@@ -2,7 +2,6 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <cmath>
-#include <cmath>
 #include <fstream>
 #include <sstream>
 
@@ -204,6 +203,13 @@ bool Settings::save(const std::string &path)
 	// Persist any remapping done since the last switch into the active
 	// profile, so a restart comes back on the mapping the user is looking at.
 	syncActiveProfile();
+	// A per-game overlay is live, so the in-memory values are partly the
+	// game's. Write the file with the overlay lifted, then put it back -
+	// otherwise a save from inside a game (load_rom() does one for the
+	// recent-ROMs list) would quietly promote that game's palette/scale to
+	// the global default for every other game.
+	const bool had_override = game.active;
+	clear_game_override();
 	std::string p = path.empty() ? default_settings_path() : path;
 	// Ensure directory exists
 	size_t slash = p.find_last_of('/');
@@ -212,8 +218,17 @@ bool Settings::save(const std::string &path)
 		SDL_CreateDirectory(dir.c_str());
 	}
 	std::ofstream f(p);
-	if (!f)
+	if (!f) {
+		// Failed write: the game must keep its own values, not fall back to
+		// the globals it was only borrowing.
+		if (had_override)
+			load_game_override(game.rom);
 		return false;
+	}
+	// Schema header. A comment line keeps the file self-describing, and the
+	// machine-readable `schema=` line is what load() reads.
+	f << "# GB4ME settings (key=value, one per line)\n";
+	f << "schema=" << kSchemaVersion << "\n";
 	f << "rom_folder=" << rom_folder << "\n";
 	f << "volume=" << volume << "\n";
 	f << "video_scale=" << video_scale << "\n";
@@ -222,6 +237,8 @@ bool Settings::save(const std::string &path)
 	f << "palette=" << palette << "\n";
 	f << "hardware_mode=" << hardware_mode << "\n";
 	f << "console_color=" << static_cast<int>(console_color) << "\n";
+	for (size_t i = 0; i < recent_roms.size() && i < Settings::kMaxRecent; i++)
+		f << "recent" << i << "=" << recent_roms[i] << "\n";
 	for (int i = 0; i < 10; i++)
 		f << "key" << i << "=" << static_cast<int>(key_map[i]) << "\n";
 	for (int i = 0; i < static_cast<int>(kPadButtonCount); i++)
@@ -247,8 +264,24 @@ bool Settings::save(const std::string &path)
 		for (int i = 0; i < static_cast<int>(kPadButtonCount); i++)
 			f << tag << "alt" << i << "=" << pr.pad_map_alt[i].packed() << "\n";
 	}
+	// Put the game's values back on top, so the running game keeps them.
+	if (had_override)
+		load_game_override(game.rom);
 	return true;
 }
+
+void Settings::push_recent(const std::string &path)
+{
+	if (path.empty())
+		return;
+	auto it = std::find(recent_roms.begin(), recent_roms.end(), path);
+	if (it != recent_roms.end())
+		recent_roms.erase(it);
+	recent_roms.insert(recent_roms.begin(), path);
+	if (recent_roms.size() > kMaxRecent)
+		recent_roms.resize(kMaxRecent);
+}
+
 namespace
 {
 
@@ -274,41 +307,41 @@ int safe_index(const std::string &s)
 	return s[0] == '-' ? -v : v;
 }
 
-	// Non-throwing float parse for volume (accepts "1", "0.8", ".5").
-	bool safe_float(const std::string &s, float &out)
-	{
-		if (s.empty() || s.size() > 16)
-			return false;
-		size_t i = 0;
-		bool neg = false;
-		if (s[0] == '+' || s[0] == '-') {
-			neg = (s[0] == '-');
-			i = 1;
-		}
-		if (i >= s.size())
-			return false;
-		double whole = 0, frac = 0, div = 1;
-		bool dot = false, any = false;
-		for (; i < s.size(); i++) {
-			if (s[i] == '.' && !dot) {
-				dot = true;
-				continue;
-			}
-			if (s[i] < '0' || s[i] > '9')
-				return false;
-			any = true;
-			if (!dot)
-				whole = whole * 10 + (s[i] - '0');
-			else {
-				frac = frac * 10 + (s[i] - '0');
-				div *= 10;
-			}
-		}
-		if (!any)
-			return false;
-		out = static_cast<float>((neg ? -1 : 1) * (whole + frac / div));
-		return true;
+// Non-throwing float parse for volume (accepts "1", "0.8", ".5").
+bool safe_float(const std::string &s, float &out)
+{
+	if (s.empty() || s.size() > 16)
+		return false;
+	size_t i = 0;
+	bool neg = false;
+	if (s[0] == '+' || s[0] == '-') {
+		neg = (s[0] == '-');
+		i = 1;
 	}
+	if (i >= s.size())
+		return false;
+	double whole = 0, frac = 0, div = 1;
+	bool dot = false, any = false;
+	for (; i < s.size(); i++) {
+		if (s[i] == '.' && !dot) {
+			dot = true;
+			continue;
+		}
+		if (s[i] < '0' || s[i] > '9')
+			return false;
+		any = true;
+		if (!dot)
+			whole = whole * 10 + (s[i] - '0');
+		else {
+			frac = frac * 10 + (s[i] - '0');
+			div *= 10;
+		}
+	}
+	if (!any)
+		return false;
+	out = static_cast<float>((neg ? -1 : 1) * (whole + frac / div));
+	return true;
+}
 
 } // namespace
 
@@ -328,13 +361,36 @@ bool Settings::load(const std::string &path)
 	// when the file has no profile section at all.
 	std::vector<InputProfile> loaded;
 	int loaded_active = 0;
+	// Schema: an absent `schema=` line means the original v1 file. A file
+	// from a NEWER build still loads best-effort (every key is optional and
+	// unknown ones are only reported), so a downgrade keeps the settings it
+	// does understand.
+	int schema = 1;
+	unknown_keys_.clear();
+	present_keys_.clear();
+	// Recents are staged by rank and compacted after the loop, so sparse or
+	// out-of-order recentN lines still load most-recent-first.
+	std::array<std::string, Settings::kMaxRecent> staged_recent{};
 	std::string line;
 	while (std::getline(f, line)) {
+		// '#' and ';' start a comment (the schema header uses one), and a
+		// line without '=' is not a setting. Skipping both keeps comment
+		// text out of the unknown-key report.
+		const size_t first = line.find_first_not_of(" \t\r");
+		if (first == std::string::npos || line[first] == '#' || line[first] == ';')
+			continue;
 		size_t eq = line.find('=');
 		if (eq == std::string::npos)
 			continue;
 		std::string k = line.substr(0, eq);
 		std::string v = line.substr(eq + 1);
+		present_keys_.push_back(k);
+		if (k == "schema") {
+			const int parsed = safe_index(v);
+			if (parsed > 0)
+				schema = parsed;
+			continue;
+		}
 		if (k == "rom_folder")
 			rom_folder = v;
 		else if (k == "volume") {
@@ -364,8 +420,14 @@ bool Settings::load(const std::string &path)
 			const int c = safe_index(v);
 			if (c >= 0 && c <= static_cast<int>(ConsoleColor::ClearPurple))
 				console_color = static_cast<ConsoleColor>(c);
-		}
-		else if (k.rfind("gkey", 0) == 0) {
+		} else if (k.rfind("recent", 0) == 0) {
+			// recentN=path, N = recency rank. Staged and compacted below so
+			// out-of-order or sparse lines still load most-recent-first.
+			const int idx = safe_index(k.substr(6));
+			if (idx >= 0 && idx < static_cast<int>(Settings::kMaxRecent) && !v.empty() &&
+				v.size() <= 1024)
+				staged_recent[static_cast<size_t>(idx)] = v;
+		} else if (k.rfind("gkey", 0) == 0) {
 			const int idx = safe_index(k.substr(4));
 			const int code = safe_index(v);
 			if (idx >= 0 && idx < 10 && code >= 0)
@@ -424,7 +486,28 @@ bool Settings::load(const std::string &path)
 			}
 		} else if (k == "active_profile") {
 			loaded_active = safe_index(v);
+		} else if (k.rfind("recent", 0) != 0 && !k.empty()) {
+			// A key this build does not know: keep it for the report, but
+			// never let it break the load (a file written by a newer build
+			// must still apply the settings we do understand).
+			unknown_keys_.push_back(k);
 		}
+	}
+	loaded_schema_ = schema;
+#ifndef GB4ME_RELEASE
+	if (schema > kSchemaVersion) {
+		std::printf("settings: file schema %d is newer than this build (%d); unknown "
+					"keys kept out of the way\n",
+					schema, kSchemaVersion);
+	}
+	for (const std::string &k : unknown_keys_) {
+		std::printf("settings: ignoring unknown key '%s'\n", k.c_str());
+	}
+#endif
+	recent_roms.clear();
+	for (const auto &r : staged_recent) {
+		if (!r.empty())
+			recent_roms.push_back(r);
 	}
 	// Unified table, GBA key order. Old files stored GB order (key0-7) plus
 	// a GBA table (gkey0-9); migrate either into the shared table once.
@@ -469,6 +552,99 @@ bool Settings::load(const std::string &path)
 	return true;
 }
 
+bool Settings::has_key(const std::string &key) const
+{
+	return std::find(present_keys_.begin(), present_keys_.end(), key) != present_keys_.end();
+}
+
+std::string Settings::game_override_path(const std::string &rom_path)
+{
+	if (rom_path.empty())
+		return std::string();
+	const size_t dot = rom_path.find_last_of('.');
+	const size_t slash = rom_path.find_last_of('/');
+	// Only an extension in the final path segment is replaced, so a dot in
+	// a directory name ("Mr. B's ROMs/game.gb") is left alone.
+	if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+		return rom_path + ".cfg";
+	return rom_path.substr(0, dot) + ".cfg";
+}
+
+bool Settings::load_game_override(const std::string &rom_path)
+{
+	// Drop any previous overlay first: the globals restored here are the ones
+	// this file will then displace.
+	clear_game_override();
+	game.rom = rom_path;
+	if (rom_path.empty())
+		return false;
+	// Same parser as the global config - a per-game file is a settings file
+	// with a different name, so a key added to Settings::save() works here
+	// for free.
+	Settings over;
+	if (!over.load(game_override_path(rom_path)))
+		return false;
+	// Only the display keys, and only the ones the file actually has. Input
+	// is deliberately not here (see GameOverride).
+	const auto take_int = [&over](const char *key, int &live, int from, int &saved, bool &flag) {
+		if (!over.has_key(key))
+			return;
+		saved = live;
+		flag = true;
+		live = from;
+	};
+	take_int("video_scale", video_scale, over.video_scale, game.video_scale, game.has_video_scale);
+	take_int("video_filter", video_filter, over.video_filter, game.video_filter,
+			 game.has_video_filter);
+	take_int("lcd_grid", lcd_grid, over.lcd_grid, game.lcd_grid, game.has_lcd_grid);
+	take_int("palette", palette, over.palette, game.palette, game.has_palette);
+	if (over.has_key("console_color")) {
+		game.console_color = static_cast<int>(console_color);
+		game.has_console_color = true;
+		console_color = over.console_color;
+	}
+	if (over.has_key("hardware_mode")) {
+		game.hardware_mode = hardware_mode;
+		game.has_hardware_mode = true;
+		hardware_mode = over.hardware_mode;
+	}
+	if (over.has_key("volume")) {
+		game.volume = volume;
+		game.has_volume = true;
+		volume = std::clamp(over.volume, 0.0f, 1.0f);
+	}
+	// A file with only unrecognised keys is not an overlay.
+	game.active = game.has_volume || game.has_video_scale || game.has_video_filter ||
+				  game.has_lcd_grid || game.has_palette || game.has_console_color ||
+				  game.has_hardware_mode;
+	return game.active;
+}
+
+void Settings::clear_game_override()
+{
+	if (!game.active)
+		return;
+	// Only the keys the file set: an overlay that sets one key must not
+	// reset every other display setting to a default.
+	if (game.has_volume)
+		volume = game.volume;
+	if (game.has_video_scale)
+		video_scale = game.video_scale;
+	if (game.has_video_filter)
+		video_filter = game.video_filter;
+	if (game.has_lcd_grid)
+		lcd_grid = game.lcd_grid;
+	if (game.has_palette)
+		palette = game.palette;
+	if (game.has_console_color)
+		console_color = static_cast<ConsoleColor>(game.console_color);
+	if (game.has_hardware_mode)
+		hardware_mode = game.hardware_mode;
+	const std::string rom = game.rom;
+	game = GameOverride{};
+	game.rom = rom;
+}
+
 // ---- GUIConsole ----
 
 GUIConsole::GUIConsole()
@@ -503,7 +679,7 @@ void GUIConsole::update_layout(int window_w, int window_h)
 	// public-domain GBC photo), so fractional photo coordinates map 1:1.
 	const float body_aspect = 75.0f / 133.0f;
 	const float win_aspect = static_cast<float>(window_w) / window_h;
-	float body_w, body_h;
+	float body_w = 0, body_h = 0;
 	if (win_aspect > body_aspect) {
 		body_h = window_h * 0.96f;
 		body_w = body_h * body_aspect;
@@ -549,8 +725,8 @@ void GUIConsole::update_layout(int window_w, int window_h)
 			sh = gh;
 			sw = gh * (240.0f / 160.0f);
 		}
-		gba_screen_rect_ = {bezel_rect_.x + (gw - sw) * 0.5f, bezel_rect_.y + (gh - sh) * 0.5f,
-							sw, sh};
+		gba_screen_rect_ = {bezel_rect_.x + (gw - sw) * 0.5f, bezel_rect_.y + (gh - sh) * 0.5f, sw,
+							sh};
 	}
 	// D-pad enclosing area (cross + well): x 130-465, y 1440-1800.
 	dpad_rect_ = F(0.09489f, 0.59259f, 0.24453f, 0.14815f);
@@ -558,10 +734,10 @@ void GUIConsole::update_layout(int window_w, int window_h)
 	// Both sit on the near-black bezel beside the glass (grey circle +
 	// white glyph read well there). Hit-testing uses these same rects.
 	settings_rect_ = {body_x + body_w * 0.797f, body_y + body_h * 0.100f, body_w * 0.080f,
-		body_h * 0.046f};
+					  body_h * 0.046f};
 	// OPEN button (file dialog): top-left bezel corner, mirroring the gear.
 	open_rect_ = {body_x + body_w * 0.123f, body_y + body_h * 0.100f, body_w * 0.080f,
-		body_h * 0.046f};
+				  body_h * 0.046f};
 
 	rebuild_buttons();
 	rebuild_settings_cells();
@@ -601,11 +777,11 @@ void GUIConsole::rebuild_buttons()
 	// rows), same click-to-remap flow as the rest.
 	shoulders_.clear();
 	shoulders_.push_back({{bx + 0.020f * bw, by + 0.012f * bh, 0.130f * bw, 0.055f * bh},
-			"L",
-			gba::GbaKeypad::Key::L});
+						  "L",
+						  gba::GbaKeypad::Key::L});
 	shoulders_.push_back({{bx + 0.850f * bw, by + 0.012f * bh, 0.130f * bw, 0.055f * bh},
-			"R",
-			gba::GbaKeypad::Key::R});
+						  "R",
+						  gba::GbaKeypad::Key::R});
 }
 
 std::optional<Joypad::Key> GUIConsole::hit_test(int x, int y) const
@@ -803,9 +979,9 @@ std::vector<GUIConsole::SettingsRow> GUIConsole::settings_rows() const
 		return rows;
 	if (settings_tab_ == SettingsTab::General) {
 		static const char *ids[kGeneralRows] = {"folder", "volume", "palette",
-		                                       "hw",     "filter",  "lcdgrid"};
-		static const char *labels[kGeneralRows] = {
-			"ROM Folder", "Volume", "DMG Palette", "Hardware Mode", "Filter", "LCD Grid"};
+												"hw",     "filter", "lcdgrid"};
+		static const char *labels[kGeneralRows] = {"ROM Folder",    "Volume", "DMG Palette",
+												   "Hardware Mode", "Filter", "LCD Grid"};
 		for (int i = 0; i < kGeneralRows; i++) {
 			SettingsRow r;
 			r.id = ids[i];
@@ -830,13 +1006,13 @@ std::vector<GUIConsole::SettingsRow> GUIConsole::settings_rows() const
 				r.value = video_filter_name(static_cast<VideoFilter>(settings_->video_filter));
 				break;
 			case 5: {
-				static const char *kGridNames[Settings::kLcdGridMax + 1] = {
-					"Off", "Light", "Medium", "Strong"};
+				static const char *kGridNames[Settings::kLcdGridMax + 1] = {"Off", "Light",
+																			"Medium", "Strong"};
 				r.value = kGridNames[settings_->lcd_grid < 0
-									 ? 0
-									 : (settings_->lcd_grid > Settings::kLcdGridMax
-											? Settings::kLcdGridMax
-											: settings_->lcd_grid)];
+										 ? 0
+										 : (settings_->lcd_grid > Settings::kLcdGridMax
+												? Settings::kLcdGridMax
+												: settings_->lcd_grid)];
 				break;
 			}
 			default:
@@ -875,11 +1051,10 @@ GUIConsole::SettingsHit GUIConsole::settings_hit_test(int x, int y) const
 	}
 	if (settings_tab_ == SettingsTab::General) {
 		static const SettingsAction acts[kGeneralRows] = {
-			SettingsAction::RomFolder, SettingsAction::Volume,  SettingsAction::Palette,
-			SettingsAction::HwMode,    SettingsAction::Filter,  SettingsAction::LcdGrid};
+			SettingsAction::RomFolder, SettingsAction::Volume, SettingsAction::Palette,
+			SettingsAction::HwMode,    SettingsAction::Filter, SettingsAction::LcdGrid};
 		for (int i = 0; i < kGeneralRows; i++) {
-			if (!in(settings_general_labels_[i], x, y) &&
-				!in(settings_general_cells_[i], x, y))
+			if (!in(settings_general_labels_[i], x, y) && !in(settings_general_cells_[i], x, y))
 				continue;
 			hit.action = acts[i];
 			if (acts[i] == SettingsAction::Volume) {
@@ -1014,8 +1189,8 @@ void GUIConsole::relayout_dropdown(Dropdown &dd)
 		top = dd.closed.y - total;
 	dd.flipped = top < dd.closed.y;
 	for (size_t i = 0; i < dd.options.size(); i++) {
-		dd.items.push_back({dd.closed.x, top + static_cast<float>(i) * item_h, dd.closed.w,
-							item_h});
+		dd.items.push_back(
+			{dd.closed.x, top + static_cast<float>(i) * item_h, dd.closed.w, item_h});
 	}
 	(void) gap;
 }
@@ -1122,15 +1297,14 @@ void GUIConsole::rebuild_settings_cells()
 		out_gap = row_gap;
 		if (out_h < kMinRowH && rows > 1) {
 			out_h = std::min(kMinRowH, rows_avail / static_cast<float>(rows));
-			out_gap = std::max(
-				0.0f, (rows_avail - out_h * static_cast<float>(rows)) /
-						  static_cast<float>(rows - 1));
+			out_gap = std::max(0.0f, (rows_avail - out_h * static_cast<float>(rows)) /
+										 static_cast<float>(rows - 1));
 		}
 	};
 	const float label_x = panel_x + 6.0f, label_w = panel_w * 0.44f;
 	const float value_x = panel_x + panel_w * 0.52f, value_w = panel_w * 0.42f;
 
-	float gen_h, gen_gap;
+	float gen_h = 0, gen_gap = 0;
 	fit_rows(kGeneralRows, gen_h, gen_gap);
 	float row_y = rows_top;
 	for (int i = 0; i < kGeneralRows; i++) {

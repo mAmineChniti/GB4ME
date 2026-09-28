@@ -45,6 +45,9 @@ enum class VideoFilter : u8 {
 	Bilinear,       // Linear interpolation (gamma-correct: the texture is sRGB).
 	SmoothBilinear, // Bilinear with smoothstep weights (SameBoy SmoothBilinear).
 	Scale2x,        // EPX: smooths diagonals, keeps axis-aligned edges crisp.
+	SlotMask,       // Rounded subpixel slot mask (LCD Grid slider = depth).
+	Grille,         // Vertical RGB stripe grille (LCD Grid slider = depth).
+	XBRZ,           // xBRZ upscale (4x then resample; keeps diagonals).
 	Count,
 };
 
@@ -79,6 +82,12 @@ inline const char *video_filter_name(VideoFilter f)
 		return "Smooth Bilinear";
 	case VideoFilter::Scale2x:
 		return "Scale2x";
+	case VideoFilter::SlotMask:
+		return "Slot Mask";
+	case VideoFilter::Grille:
+		return "Grille";
+	case VideoFilter::XBRZ:
+		return "xBRZ";
 	case VideoFilter::Count:
 		break;
 	}

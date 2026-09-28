@@ -81,6 +81,136 @@ vec4 scale2x(vec2 uv)
 	return (f.y < 0.5) ? ((f.x < 0.5) ? tl : tr) : ((f.x < 0.5) ? bl : br);
 }
 
+// Rounded subpixel slot mask: a modern LCD's backlight is divided into
+// rounded slots, so the gaps between them are dark and slightly blurred.
+// Brightness follows the same smoothstep border as the LCD grid, driven by
+// the LCD Grid slider (0 = no mask, so the filter is a plain bilinear
+// upscale when the slider is off).
+float slot_mask_factor(vec2 f)
+{
+	// Slot inset: 1/8 of a pixel on each side, with a 1/4-wide rounded
+	// border so the corner radius is visible at 1x.
+	const vec2 lo = vec2(0.125);
+	const vec2 hi = vec2(0.875);
+	const vec2 d = max(lo - f, f - hi); // signed distance to the slot rect
+	const float dist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+	// dist <= 0 inside the slot; the border covers dist in [-0.125, 0].
+	const float m = smoothstep(0.0, -0.125, dist);
+	return m;
+}
+
+// RGB stripe grille (Trinitron-style vertical phosphor triads). Each source
+// pixel is split into three vertical stripes lit R, G, B. The weights are
+// normalised by the *largest* one, not their sum: a sum normalisation dips
+// to zero at the stripe boundaries (black seams between every triad), while
+// the max keeps the peak at 1.0 so nothing clips. A display integrates the
+// stripes across a pixel, which is what turns them into colour fringes.
+vec3 grille(vec4 c, vec2 f)
+{
+	const float x = f.x * 3.0;
+	vec3 w = vec3(smoothstep(0.5, 0.35, abs(x - 0.5)),
+				  smoothstep(0.5, 0.35, abs(x - 1.5)),
+				  smoothstep(0.5, 0.35, abs(x - 2.5)));
+	w /= max(max(w.r, max(w.g, w.b)), 1e-3);
+	return c.rgb * w;
+}
+
+// xBRZ (advmame; the 4x "scale4x" family with weighted blend kernels). The
+// reference implementation upscales by 4 and then box-filters down to the
+// target size; doing that here costs 4x4 fetches per output fragment, which
+// is affordable for a 240x160 source. A is the centre texel; the 3x3
+// neighbourhood is E (west), F (north), I (north-west), B (north-east),
+// C (east), H (south-west), G (south), D (south-east) in the usual naming.
+// The four xBRZ blend kernels, each taking the corner/edge colour and
+// weighting it by how much it differs from the centre.
+#define XBRZ_BLEND(a, b, w, m) clamp(mix(a, b, clamp((w) * (1.0 / 32.0), 0.0, 1.0)), 0.0, 1.0)
+#define XBRZ_R01(d, eq) (XBRZ_BLEND(0.5 * (A + B), eq, 3.0 - 2.0 * (d), A))
+#define XBRZ_R10(d, eq) (XBRZ_BLEND(0.5 * (A + D), eq, 3.0 - 2.0 * (d), A))
+#define XBRZ_R11(d, eq) (XBRZ_BLEND(A, eq, d, A))
+
+vec4 xbrz_pixel(vec2 uv, ivec2 i, vec2 f)
+{
+	vec4 A = texel(i);
+	vec4 B = texel(i + ivec2(-1, 0));
+	vec4 C = texel(i + ivec2(1, 0));
+	vec4 D = texel(i + ivec2(0, -1));
+	vec4 E = texel(i + ivec2(0, 1));
+	vec4 F = texel(i + ivec2(-1, -1));
+	vec4 G = texel(i + ivec2(1, -1));
+	vec4 H = texel(i + ivec2(-1, 1));
+	// Per-channel equalities (all-equal, not per-channel blends).
+	float e0 = (B.r == A.r && B.g == A.g && B.b == A.b) ? 1.0 : 0.0;
+	float e1 = (E.r == A.r && E.g == A.g && E.b == A.b) ? 1.0 : 0.0;
+	float e2 = (H.r == D.r && H.g == D.g && H.b == D.b) ? 1.0 : 0.0;
+	float e3 = (E.r == D.r && E.g == D.g && E.b == D.b) ? 1.0 : 0.0;
+	float e4 = (E.r == F.r && E.g == F.g && E.b == F.b) ? 1.0 : 0.0;
+	float e5 = (E.r == H.r && E.g == H.g && E.b == H.b) ? 1.0 : 0.0;
+	float e6 = (E.r == G.r && E.g == G.g && E.b == G.b) ? 1.0 : 0.0;
+	float e7 = (G.r == C.r && G.g == C.g && G.b == C.b) ? 1.0 : 0.0;
+	float e8 = (G.r == D.r && G.g == D.g && G.b == D.b) ? 1.0 : 0.0;
+	float e9 = (D.r == A.r && D.g == A.g && D.b == A.b) ? 1.0 : 0.0;
+
+	// Distance weighting: how strongly each diagonal neighbour overrides.
+	float d0 = distance(B, G);
+	float d1 = distance(E, H);
+	float d2 = distance(D, F);
+	float d3 = distance(C, H);
+	float d4 = distance(F, G);
+	float d5 = distance(E, C);
+	float d6 = distance(D, G);
+	float d7 = distance(D, C);
+
+	// The four 4x4 sub-blocks (uv within the 4x upscale grid).
+	vec4 blk[4];
+	// top-left
+	blk[0] = (e0 == e1 && e0 != e9 && e0 != e2) ? XBRZ_R11(3.0 * d1, A)
+			: (e0 == e7 && e0 != e8)             ? XBRZ_R01(2.0 * d4 + d0, mix(F, G, 0.5))
+			: (e9 == e2 && e0 != e4 && e9 != e7)  ? XBRZ_R10(2.0 * d2 + 2.0 * d3, mix(C, H, 0.5))
+			: (e3 == e5)                          ? XBRZ_R10(2.0 * d2, D)
+			: (e0 == e1)                          ? A
+			: (e9 == e7)                          ? XBRZ_R10(d2 + d3, C)
+			: (e9 == e2)                          ? XBRZ_R11(2.0 * d3, A)
+			: (e3 == e5)                          ? XBRZ_R10(2.0 * d2, D)
+												   : A;
+	// top-right
+	blk[1] = (e1 == e2 && e1 != e0 && e1 != e3) ? XBRZ_R11(3.0 * d2, A)
+			: (e6 == e0 && e7 != e9)             ? XBRZ_R01(2.0 * d5 + d0, mix(F, G, 0.5))
+			: (e0 == e3 && e1 != e5 && e0 != e7)  ? XBRZ_R10(2.0 * d6 + 2.0 * d7, mix(D, C, 0.5))
+			: (e8 == e9)                          ? XBRZ_R01(2.0 * d7, C)
+			: (e1 == e2)                          ? A
+			: (e8 == e3)                          ? XBRZ_R11(2.0 * d7, A)
+			: (e8 == e9)                          ? XBRZ_R01(d7, C)
+												   : A;
+	// bottom-left
+	blk[2] = (e5 == e6 && e5 != e4 && e5 != e7) ? XBRZ_R11(3.0 * d3, A)
+			: (e2 == e1 && e5 != e8)             ? XBRZ_R10(2.0 * d6 + d2, mix(D, C, 0.5))
+			: (e6 == e0 && e9 != e1)             ? XBRZ_R01(2.0 * d5 + d3, mix(H, G, 0.5))
+			: (e4 == e8)                          ? XBRZ_R10(2.0 * d6, D)
+			: (e5 == e6)                          ? A
+			: (e4 == e2)                          ? XBRZ_R11(2.0 * d6, A)
+			: (e4 == e8)                          ? XBRZ_R10(d6 + d2, D)
+												   : A;
+	// bottom-right
+	blk[3] = (e4 == e5 && e4 != e3 && e4 != e8) ? XBRZ_R11(3.0 * d7, A)
+			: (e3 == e7 && e2 != e9)             ? XBRZ_R10(2.0 * d7 + d4, mix(B, C, 0.5))
+			: (e7 == e2 && e4 != e0 && e7 != e6)  ? XBRZ_R01(2.0 * d4 + 2.0 * d5, mix(B, F, 0.5))
+			: (e9 == e6)                          ? XBRZ_R01(2.0 * d5, B)
+			: (e4 == e5)                          ? A
+			: (e9 == e3)                          ? XBRZ_R11(2.0 * d5, A)
+			: (e9 == e6)                          ? XBRZ_R01(d5, B)
+												   : A;
+
+	// Downsample the 4x4 block to this fragment. The reference averages the
+	// whole 4x4; the four sub-blocks each represent a 2x2 quarter whose
+	// samples sit at 0.25/0.75, so a bilinear across the four of them is the
+	// same result without 16 fetches.
+	float tx = clamp((f.x - 0.25) * 2.0, 0.0, 1.0);
+	float ty = clamp((f.y - 0.25) * 2.0, 0.0, 1.0);
+	vec4 top = mix(blk[0], blk[1], tx);
+	vec4 bottom = mix(blk[2], blk[3], tx);
+	return mix(top, bottom, ty);
+}
+
 // LCD grid (SameBoy MonoLCD.fsh): darken a fixed-width border on all four
 // sides of every source pixel. The border is 1/6 of a pixel, as in SameBoy's
 // six-cell LCD construction, so it scales with the window instead of being a
@@ -121,6 +251,37 @@ void main()
 		break;
 	case 3u: // Scale2x
 		c = scale2x(frag_uv);
+		break;
+	case 4u: // SlotMask: bilinear upscale, then a rounded slot mask whose
+		// depth is the LCD Grid slider (0 = plain bilinear).
+		c = bilinear(frag_uv, true);
+		{
+			ivec2 i;
+			vec2 f;
+			pixel_coord(frag_uv, i, f);
+			const float m = slot_mask_factor(f);
+			const float factor = m * pc.grid + (1.0 - pc.grid);
+			c = vec4(c.rgb * factor, c.a);
+		}
+		break;
+	case 6u: { // xBRZ: weighted-diagonal upscale, then a bilinear 4x downsample.
+		ivec2 i;
+		vec2 f;
+		pixel_coord(frag_uv, i, f);
+		c = xbrz_pixel(frag_uv, i, f);
+		break;
+	}
+	case 5u: // Grille: bilinear upscale, then RGB stripe triads whose depth
+		// is the LCD Grid slider (0 = plain bilinear).
+		c = bilinear(frag_uv, true);
+		{
+			ivec2 i;
+			vec2 f;
+			pixel_coord(frag_uv, i, f);
+			const float strength = clamp(pc.grid, 0.0, 1.0);
+			// strength 0 -> the untouched colour, 1 -> full triads.
+			c = vec4(mix(c.rgb, grille(c, f), strength), c.a);
+		}
 		break;
 	default: // Nearest: a single fetch at the sampled coordinate.
 		c = texture(gb_tex, frag_uv);

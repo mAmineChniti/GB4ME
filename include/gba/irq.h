@@ -6,6 +6,7 @@ namespace gba
 {
 
 class Arm7Tdmi;
+class GbaScheduler;
 
 // GBA interrupt controller (Phase 5): IE/IF/IME + level-triggered IRQ
 // delivery to the CPU. Follows the gb::MMU pattern (bus routes the three
@@ -37,6 +38,27 @@ class GbaIrq
 	{
 		cpu_ = cpu;
 	}
+	// A raised IF bit reaches the CPU two cycles later (GBATEK "GBA
+	// Interrupts": interrupt delay; mGBA GBAIRQDelay). The flag itself is
+	// visible immediately - software polls IF right after a source fires -
+	// so only the delivery to the CPU is deferred through the scheduler.
+	void setScheduler(GbaScheduler *scheduler)
+	{
+		scheduler_ = scheduler;
+	}
+	static constexpr u32 kIrqDelay = 2;
+	// True while a deferred delivery is scheduled (save states cannot carry
+	// it: the callback is type-erased, so rearmPending() re-arms it).
+	bool delivery_pending() const
+	{
+		return delay_armed_;
+	}
+	// How many IRQs have been handed to the CPU (diagnostic / tests).
+	u32 deliveries() const
+	{
+		return deliveries_;
+	}
+	void rearmPending();
 
 	u16 readIe() const
 	{
@@ -65,6 +87,9 @@ class GbaIrq
 
   private:
 	Arm7Tdmi *cpu_ = nullptr;
+	GbaScheduler *scheduler_ = nullptr;
+	bool delay_armed_ = false;
+	u32 deliveries_ = 0;
 	u16 ie_ = 0;
 	u16 if_ = 0;
 	u16 ime_ = 0;

@@ -3,6 +3,7 @@
 #include "types.h"
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,6 +31,31 @@ class MBC
 	virtual u32 raw_bank_count() const = 0;
 	virtual bool has_battery() const
 	{
+		return false;
+	}
+	// Rumble motor state (MBC5 bit 3, Pak13/other rumble mappers). The core
+	// only records it; the frontend drives the controller from it.
+	virtual bool has_rumble() const
+	{
+		return false;
+	}
+	virtual bool rumble() const
+	{
+		return false;
+	}
+	// MBC3 real-time clock persistence. Default: no RTC hardware.
+	virtual bool has_rtc() const
+	{
+		return false;
+	}
+	virtual bool save_rtc(const std::string &path) const
+	{
+		(void) path;
+		return false;
+	}
+	virtual bool load_rtc(const std::string &path)
+	{
+		(void) path;
 		return false;
 	}
 };
@@ -136,6 +162,12 @@ class MBC3 : public MBC
 	{
 		return battery_;
 	}
+	bool has_rtc() const override
+	{
+		return rtc_;
+	}
+	bool save_rtc(const std::string &path) const override;
+	bool load_rtc(const std::string &path) override;
 
   private:
 	std::vector<u8> rom_;
@@ -143,13 +175,29 @@ class MBC3 : public MBC
 	bool battery_ = false;
 	bool rtc_ = false;
 	bool ram_enabled_ = false;
-	u8 rom_bank_ = 1;              // 7 bits.
-	u8 ram_bank_ = 0;              // 0-3 = RAM, 8-C = RTC (stubbed).
-	std::array<u8, 5> rtc_regs_{}; // S M H DL DH (latched, stubbed).
+	u8 rom_bank_ = 1; // 7 bits.
+	u8 ram_bank_ = 0; // 0-3 = RAM, 8-C = RTC.
+	// Real-time clock (types 0x0F/0x10): host wall-clock backed.
+	// https://gbdev.io/pandocs/MBC3.html#the-clock-counter-registers
+	// `rtc_latched_` is what reads return (updated by the 0->1 latch edge);
+	// `rtc_set_` is the game-written base. The live time is
+	// `rtc_base_secs_ + (halted ? 0 : host_now - rtc_base_host_)`.
+	std::array<u8, 5> rtc_latched_{}; // S M H DL DH (latched reads).
+	std::array<u8, 5> rtc_set_{};     // S M H DL DH shadow (game writes).
+	std::int64_t rtc_base_secs_ = 0;  // Emulated RTC seconds at rebase.
+	std::int64_t rtc_base_host_ = 0;  // Host time() at rebase.
+	bool rtc_base_valid_ = false;
+	bool rtc_halt_ = false;
+	bool rtc_carry_ = false; // Sticky day-counter overflow (>= 512 days).
 	u8 latch_state_ = 0;
+	void rtc_ensure_base();
+	std::int64_t rtc_total_seconds() const;
+	void rtc_latch();
+	void rtc_apply_write(u8 index, u8 value);
 };
 
-// MBC5: up to 8MB ROM / 128KB RAM (+ rumble, ignored).
+// MBC5: up to 8MB ROM / 128KB RAM, with the rumble motor (bit 3 of a
+// 0x4000-0x5FFF write selects it; Pan Docs "MBC5").
 // https://gbdev.io/pandocs/MBC5.html
 class MBC5 : public MBC
 {
@@ -166,14 +214,23 @@ class MBC5 : public MBC
 	{
 		return battery_;
 	}
+	bool has_rumble() const override
+	{
+		return true;
+	}
+	bool rumble() const override
+	{
+		return rumble_;
+	}
 
   private:
 	std::vector<u8> rom_;
 	std::vector<u8> ram_;
 	bool battery_ = false;
 	bool ram_enabled_ = false;
-	u16 rom_bank_ = 1; // 9 bits (0 maps to 1).
-	u8 ram_bank_ = 0;  // 4 bits.
+	bool rumble_ = false; // MBC5 rumble motor bit.
+	u16 rom_bank_ = 1;    // 9 bits (0 maps to 1).
+	u8 ram_bank_ = 0;     // 4 bits.
 };
 
 enum class MBCType : u8 {
@@ -219,6 +276,15 @@ class Cartridge
 	bool has_battery() const;
 	void save_ram(const std::string &path) const;
 	void load_ram(const std::string &path);
+	// MBC3 RTC wall-clock persistence (`<rom>.rtc` sidecar). No-op without
+	// RTC hardware; safe to call unconditionally from the frontend.
+	bool has_rtc() const;
+	// Rumble motor (MBC5 bit 3). The frontend polls this each frame and
+	// drives the controller; no-op on carts without a motor.
+	bool has_rumble() const;
+	bool rumble() const;
+	bool save_rtc(const std::string &path) const;
+	bool load_rtc(const std::string &path);
 
 	const CartridgeHeader &header() const
 	{
@@ -244,9 +310,16 @@ class Cartridge
 	{
 		return mbc_ != nullptr;
 	}
+	// Human-readable reason the last load() failed (unsupported mapper,
+	// bad header, short file). Empty when the last load succeeded.
+	const std::string &last_error() const
+	{
+		return last_error_;
+	}
 
   private:
 	std::vector<u8> rom_image_;
+	std::string last_error_;
 	CartridgeHeader header_{};
 	MBCType mbc_type_ = MBCType::None;
 	HardwareMode hardware_mode_ = HardwareMode::DMG;

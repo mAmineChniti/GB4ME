@@ -13,22 +13,26 @@
 #include "gba/keypad.h"
 #include "gba/ppu.h"
 #include "gba/timers.h"
+#include <cstdio>
 
 namespace gba
 {
 
 // GBATEK: the 64K SRAM field is mirrored across the whole 32MB window at
-// 0x0E000000-0x0FFFFFFF, and a 32K chip repeats twice inside that field.
-// Masking here makes every alias hit the same physical byte.
+// 0x0E000000-0x0FFFFFFF. The offset therefore wraps at the chip's *window*
+// size, which is the smaller of the chip capacity and that 64K field: a
+// 128KB flash chip exposes 64KB here and switches the second bank with the
+// B0 command (mGBA src/gba/savedata.c does the same), and a 32K chip simply
+// repeats twice inside the field.
 u32 GbaBus::sramOffset(u32 addr) const
 {
-	u32 off = addr - kSramBase;
+	u32 window = 0x10000u;
 	if (cartridge_ != nullptr) {
 		const u32 size = cartridge_->saveSize();
-		if (size > 0)
-			off &= size - 1;
+		if (size > 0 && size < window)
+			window = size; // All modelled capacities are powers of two.
 	}
-	return off & 0xFFFFu;
+	return (addr - kSramBase) & (window - 1);
 }
 
 GbaBus::GbaBus()
@@ -116,14 +120,14 @@ bool GbaBus::gpioActive() const
 uint16_t GbaBus::eepromDmaRead() const
 {
 	if (cartridge_ != nullptr)
-		return cartridge_->eepromDmaRead();
+		return cartridge_->eepromDmaRead(cycle());
 	return 1;
 }
 
 void GbaBus::eepromDmaWrite(uint16_t value, uint32_t remaining)
 {
 	if (cartridge_ != nullptr)
-		cartridge_->eepromDmaWrite(value, remaining);
+		cartridge_->eepromDmaWrite(value, remaining, cycle());
 }
 
 u8 GbaBus::read8(u32 addr)
@@ -170,11 +174,10 @@ u8 GbaBus::read8(u32 addr)
 		// Device-owned registers outside the LCD/keypad/audio blocks:
 		// compose the byte from the owning unit's 16-bit register so byte
 		// reads observe live device state instead of the io_ shadow.
-		const bool device_owned =
-			(addr >= 0x040000B0u && addr < 0x040000E0u) ||  // DMA
-			(addr >= 0x04000100u && addr < 0x04000110u) || // Timers
-			(addr >= 0x04000200u && addr <= 0x04000205u) || // IE/IF/WAITCNT
-			(addr >= 0x04000208u && addr <= 0x04000209u);   // IME
+		const bool device_owned = (addr >= 0x040000B0u && addr < 0x040000E0u) ||  // DMA
+								  (addr >= 0x04000100u && addr < 0x04000110u) ||  // Timers
+								  (addr >= 0x04000200u && addr <= 0x04000205u) || // IE/IF/WAITCNT
+								  (addr >= 0x04000208u && addr <= 0x04000209u);   // IME
 		if (device_owned) {
 			const u16 reg = deviceByte16(addr);
 			return static_cast<u8>((addr & 1u) != 0 ? (reg >> 8) : (reg & 0xFFu));
@@ -230,6 +233,12 @@ u16 GbaBus::deviceByte16(u32 addr, bool *owned) const
 		return ppu_->readIo(addr);
 	if (keypad_ != nullptr && addr == GbaKeypad::kKeyCntAddr)
 		return keypad_->readCnt();
+	// Serial ports (SIO): no link cable, no multiplayer, no link radio.
+	// Reporting the io shadow would let a game read back what it wrote and
+	// believe a transfer happened, so answer with the documented "idle"
+	// values instead and say so once (dev builds only).
+	if (addr >= 0x04000120u && addr < 0x0400012Cu)
+		return readSerialIdle(addr);
 	// No unit owns it: report the shadow instead of 0xFFFF, otherwise an
 	// 8-bit write would merge 0xFF into the untouched half (e.g. a STRB to
 	// DISPCNT would turn 0x34 into 0xFF34).
@@ -287,6 +296,9 @@ u16 GbaBus::read16(u32 addr)
 		}
 		if (addr == 0x04000204u)
 			return waitcnt_;
+		// Serial ports (SIO): idle, never the io shadow.
+		if (addr >= 0x04000120u && addr < 0x0400012Cu)
+			return readSerialIdle(addr);
 	}
 	// GBATEK "Accessing SRAM Area by 16bit/32bit": SRAM sits on an 8-bit
 	// bus, so a wide read fetches ONE byte and replicates it, rather than
@@ -322,13 +334,15 @@ u32 GbaBus::read32(u32 addr)
 	switch (decode(addr)) {
 	case Region::Iwram: {
 		const u32 m = kIwramSize - 1;
-		return static_cast<u32>(iwram_[addr & m]) | (static_cast<u32>(iwram_[(addr + 1) & m]) << 8) |
+		return static_cast<u32>(iwram_[addr & m]) |
+			   (static_cast<u32>(iwram_[(addr + 1) & m]) << 8) |
 			   (static_cast<u32>(iwram_[(addr + 2) & m]) << 16) |
 			   (static_cast<u32>(iwram_[(addr + 3) & m]) << 24);
 	}
 	case Region::Ewram: {
 		const u32 m = kEwramSize - 1;
-		return static_cast<u32>(ewram_[addr & m]) | (static_cast<u32>(ewram_[(addr + 1) & m]) << 8) |
+		return static_cast<u32>(ewram_[addr & m]) |
+			   (static_cast<u32>(ewram_[(addr + 1) & m]) << 8) |
 			   (static_cast<u32>(ewram_[(addr + 2) & m]) << 16) |
 			   (static_cast<u32>(ewram_[(addr + 3) & m]) << 24);
 	}
@@ -380,13 +394,12 @@ void GbaBus::write8(u32 addr, u8 value)
 			// an explicit `owned` flag keeps the two cases obvious.
 			bool owned = false;
 			const u16 cur = deviceByte16(kIoBase + aligned, &owned);
-			(void)owned;
+			(void) owned;
 			u16 merged = 0;
 			if ((index & 1u) != 0)
 				merged = static_cast<u16>((cur & 0x00FFu) | (static_cast<u16>(value) << 8));
 			else
-				merged = static_cast<u16>((static_cast<u16>(value) & 0x00FFu) |
-										  (cur & 0xFF00u));
+				merged = static_cast<u16>((static_cast<u16>(value) & 0x00FFu) | (cur & 0xFF00u));
 			// Keep the shadow in step so the next merge sees this write.
 			io_[aligned] = static_cast<u8>(merged & 0xFFu);
 			io_[aligned + 1] = static_cast<u8>(merged >> 8);
@@ -442,9 +455,10 @@ void GbaBus::write16(u32 addr, u16 value)
 	// cannot corrupt the unlock sequence (mGBA parity).
 	if (decode(addr) == Region::Sram && cartridge_ != nullptr) {
 		const u32 rot = (addr & 3u) * 8u;
-		const u32 src = (rot == 0) ? static_cast<u32>(value)
-								   : ((static_cast<u32>(value) >> rot) |
-									  (static_cast<u32>(value) << (32u - rot)));
+		const u32 src =
+			(rot == 0)
+				? static_cast<u32>(value)
+				: ((static_cast<u32>(value) >> rot) | (static_cast<u32>(value) << (32u - rot)));
 		cartridge_->writeSave(sramOffset(addr), static_cast<u8>(src & 0xFFu));
 		return;
 	}
@@ -461,6 +475,31 @@ void GbaBus::write16(u32 addr, u16 value)
 	}
 	write8(addr, static_cast<u8>(value & 0xFFu));
 	write8(addr + 1, static_cast<u8>(value >> 8));
+}
+
+// GBATEK "Serial I/O (SIO)": with no cable attached the ports are idle.
+// SIOCNT (04000128h) reports bit0 = shift busy = 0, bit1 = ... the safe
+// answer for every port register is 0 (nothing shifting, no IRQ pending);
+// RCNT's baud/game-only bits read back zero, which is what a disconnected
+// port does.
+u16 GbaBus::readSerialIdle(u32 addr) const
+{
+	noteSerialUse(addr);
+	return 0;
+}
+
+void GbaBus::noteSerialUse(u32 addr) const
+{
+#ifndef GB4ME_RELEASE
+	if (!serial_warned_) {
+		serial_warned_ = true;
+		std::printf("gba-sio: serial port use at %08X is not emulated (no link "
+					"hardware); reads return idle values\n",
+					addr);
+	}
+#else
+	(void) addr;
+#endif
 }
 
 bool GbaBus::dispatchIo16(u32 addr, u16 value)
@@ -497,6 +536,13 @@ bool GbaBus::dispatchIo16(u32 addr, u16 value)
 	}
 	if (audio_ != nullptr && addr >= 0x04000060u && addr < 0x040000A8u) {
 		audio_->write16(addr, value);
+		return true;
+	}
+	// Serial ports (SIO): consumed and dropped. Keeping the write out of the
+	// io shadow is the point - a game that polls its own status word must
+	// not see its own values come back.
+	if (addr >= 0x04000120u && addr < 0x0400012Cu) {
+		noteSerialUse(addr);
 		return true;
 	}
 	// Video memory 16-bit writes are native (byte semantics differ:

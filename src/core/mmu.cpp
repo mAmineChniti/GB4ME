@@ -55,6 +55,12 @@ void MMU::set_hardware_mode(HardwareMode m)
 		ppu_->set_hardware_mode(m);
 }
 
+void MMU::set_div_frozen(bool frozen)
+{
+	if (timer_)
+		timer_->set_div_frozen(frozen);
+}
+
 void MMU::do_speed_switch(CPU *cpu)
 {
 	// https://gbdev.io/pandocs/CGB_Registers.html#ff4d--key1-cgb-mode-only-prepare-speed-switch
@@ -69,6 +75,10 @@ void MMU::do_speed_switch(CPU *cpu)
 		key1_ |= 0x80;
 	else
 		key1_ &= ~0x80;
+	// The divider runs at 2x wall-rate in double-speed (timer/TIMA with it;
+	// PPU/APU keep their usual rate — see Timer::set_double_speed).
+	if (timer_)
+		timer_->set_double_speed(new_double);
 	// GBC: this will branch on double_speed mode (KEY1 register).
 }
 
@@ -152,6 +162,10 @@ void MMU::hdma_step_hblank()
 		else
 			write(hdma_dst_ - 0x8000 + i, val);
 	}
+	// The block owns the bus for ~2us; the PPU blocks CPU VRAM/OAM access
+	// for that window (CGB only, Pan Docs "CGB VRAM DMA").
+	if (ppu_)
+		ppu_->note_hdma_block();
 	hdma_src_ += 16;
 	hdma_dst_ += 16;
 	if (hdma_len_ == 0) {
@@ -400,7 +414,8 @@ void MMU::write_io(u16 addr, u8 value)
 			serial_sc &= ~0x80; // Transfer completes instantly; clear start bit.
 			// A completed transfer raises the serial interrupt (Pan Docs:
 			// requested on the 8->1 edge of the transfer-complete bit).
-			request_interrupt(8);
+			// Serial = IF bit 3.
+			request_interrupt(3);
 		}
 		return;
 	case 0xFF04:
@@ -554,29 +569,13 @@ void MMU::write_io(u16 addr, u8 value)
 			return;
 		}
 	} else {
-		// DMG: ignore CGB regs
-		switch (addr) {
-		case 0xFF4D:
-		case 0xFF4F:
-		case 0xFF51:
-		case 0xFF52:
-		case 0xFF53:
-		case 0xFF54:
-		case 0xFF55:
-		case 0xFF68:
-		case 0xFF69:
-		case 0xFF6A:
-		case 0xFF6B:
-		case 0xFF6C:
-		case 0xFF70:
-		case 0xFF72:
-		case 0xFF73:
-		case 0xFF74:
-		case 0xFF75:
-			return;
-		default:
-			return;
-		}
+		// DMG: the CGB-only registers - KEY1 (FF4Dh), VBK (FF4Fh), HDMA1-5
+		// (FF51h-FF55h), the palette block (FF68h-FF6Bh), OPRI (FF6Ch), SVBK
+		// (FF70h) and the undocumented FF72h-FF75h - read as open bus and
+		// ignore writes. Every address took that path, so the old switch (with
+		// a `default` that repeated each case) is now this comment.
+		(void) addr;
+		return;
 	}
 }
 

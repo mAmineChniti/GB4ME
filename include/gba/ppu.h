@@ -9,6 +9,7 @@ namespace gba
 class GbaBus;
 class GbaIrq;
 class GbaDma;
+class GbaScheduler;
 
 // GBA PPU (Phase 6): scanline-timed video, modes 0-5, sprites, windows,
 // blending, mosaic. Owns palette/VRAM/OAM (gb::PPU precedent); the bus
@@ -81,6 +82,17 @@ class GbaPpu
 
 	// Advance the dot clock; fires HBlank/VBlank/VCount events (IRQ + DMA).
 	void step(u32 cycles);
+	// Scheduler wiring: the PPU's HBlank and line-end points are *events*,
+	// not something step() polls for, so they land on the exact dot
+	// instead of up to a slice late (GBATEK "Timing": HBlank starts at dot
+	// 1008, the line ends at 1232). rearmEvents() re-schedules from the
+	// restored state, which is what makes a save state safe: the scheduler
+	// queue holds type-erased callbacks and is not serialized itself.
+	void setScheduler(GbaScheduler *scheduler)
+	{
+		scheduler_ = scheduler;
+	}
+	void rearmEvents();
 
 	const FrameData &frame() const
 	{
@@ -164,7 +176,7 @@ class GbaPpu
 	// Affine reference points: latch = write-only IO register,
 	// internal = accumulator that advances each scanline (reloaded from latch at VBlank).
 	i32 bgx_latch_[2]{}, bgy_latch_[2]{}; // Written by BGxX/BGxY IO writes.
-	i32 bgx_[2]{}, bgy_[2]{}; // Internal 28-bit reference points (reloaded at VBlank).
+	i32 bgx_[2]{}, bgy_[2]{};             // Internal 28-bit reference points (reloaded at VBlank).
 	u16 win0h_ = 0, win1h_ = 0, win0v_ = 0, win1v_ = 0;
 	u16 winin_ = 0, winout_ = 0;
 	u16 mosaic_ = 0;
@@ -179,6 +191,14 @@ class GbaPpu
 	// Event helpers.
 	void enterHBlank();
 	void endLine();
+	// Event bodies (run by the scheduler on the exact tick).
+	void onHBlankEvent();
+	void onLineEndEvent();
+	// Schedules whichever of the two points comes next. No-op while one is
+	// already armed.
+	void armNextEvent();
+	GbaScheduler *scheduler_ = nullptr;
+	bool event_armed_ = false;
 	void updateVCountFlag(bool raise_irq);
 	static u32 rgb555(u16 c);
 	u16 palEntry(unsigned i) const;

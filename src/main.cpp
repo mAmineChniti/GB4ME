@@ -8,7 +8,6 @@
 #include "gba/core.h"
 
 #if !defined(GB4ME_RELEASE) || defined(GB4ME_KEEP_SELFTEST)
-#include "gba/core.h"
 #include "selftest.h"
 #endif
 
@@ -21,17 +20,22 @@ void usage(const char *prog)
 	std::printf("usage:\n");
 	std::printf("  %s [rom.gb]              play in a window (ROM menu if omitted)\n", prog);
 	std::printf("  %s --selftest [rom]      run the built-in GB/GBC/GBA hardware self test\n",
-			prog);
+				prog);
 	std::printf("  %s --list-roms <folder>  print playable ROMs in a folder\n", prog);
 	std::printf("  %s --dump-gba <rom> <frames> <prefix>\n", prog);
 	std::printf("                           headless: run <frames>, write <prefix>.ppm +\n");
 	std::printf("                           <prefix>.txt (video regs, OAM, audio state)\n");
+	std::printf("  %s --blargg <rom> [frames]\n", prog);
+	std::printf("                           headless: run a Blargg cpu_instrs test ROM\n");
+	std::printf("                           until its serial output says Passed/Failed\n");
+	std::printf("                           (default 3600 frames); exit 0/1\n");
 	std::printf("  optional: --input \"frame:key,...\" --hold N --snap N\n");
 	std::printf("           injects key presses to advance past title/name-entry\n");
 	std::printf("           screens; key in A,B,S,E,U,D,L,R,H,J (A,B,START,SELECT,UP,\n");
 	std::printf("           DOWN,LEFT,RIGHT,L-Shoulder,R-Shoulder). --snap N writes a\n");
 	std::printf("           frame every N frames as <prefix>_<frame>.ppm\n");
-	std::printf("format support: .gb (DMG) .gbc (CGB) .gba (GBA, built-in HLE BIOS — no firmware\n");
+	std::printf(
+		"format support: .gb (DMG) .gbc (CGB) .gba (GBA, built-in HLE BIOS — no firmware\n");
 	std::printf("files are needed or requested)\n");
 	std::printf("exit codes (--selftest): 0 = all checks passed, 1 = failures\n");
 }
@@ -48,8 +52,8 @@ void usage(const char *prog)
 // sprites could never be observed). Format: "frame:key,frame:key,..." with
 // key in {A,B,START,SELECT,UP,DOWN,LEFT,RIGHT,L,R}. Each press is held for
 // `holdFrames` frames.
-int dump_gba(const char *rom, int frames, const char *prefix, const char *script,
-			 int holdFrames, int snap)
+int dump_gba(const char *rom, int frames, const char *prefix, const char *script, int holdFrames,
+			 int snap)
 {
 	gba::GameBoyAdvance gba;
 	if (!gba.load(rom)) {
@@ -67,24 +71,54 @@ int dump_gba(const char *rom, int frames, const char *prefix, const char *script
 				break;
 			const size_t comma = s.find(',', colon);
 			const std::string frameStr = s.substr(pos, colon - pos);
-			const std::string keyStr = s.substr(colon + 1, (comma == std::string::npos)
-																	  ? std::string::npos
-																	  : comma - colon - 1);
+			const std::string keyStr = s.substr(
+				colon + 1, (comma == std::string::npos) ? std::string::npos : comma - colon - 1);
 			const int f = std::atoi(frameStr.c_str());
 			std::vector<gba::GbaKeypad::Key> keys;
 			for (const char *p2 = keyStr.c_str(); *p2; ++p2) {
 				switch (*p2) {
-				case 'a': case 'A': keys.push_back(gba::GbaKeypad::Key::A); break;
-				case 'b': case 'B': keys.push_back(gba::GbaKeypad::Key::B); break;
-				case 's': case 'S': keys.push_back(gba::GbaKeypad::Key::Start); break;
-				case 'e': case 'E': keys.push_back(gba::GbaKeypad::Key::Select); break;
-				case 'u': case 'U': keys.push_back(gba::GbaKeypad::Key::Up); break;
-				case 'd': case 'D': keys.push_back(gba::GbaKeypad::Key::Down); break;
-				case 'l': case 'L': keys.push_back(gba::GbaKeypad::Key::Left); break;
-				case 'r': case 'R': keys.push_back(gba::GbaKeypad::Key::Right); break;
-				case 'h': case 'H': keys.push_back(gba::GbaKeypad::Key::L); break;
-				case 'j': case 'J': keys.push_back(gba::GbaKeypad::Key::R); break;
-				default: break;
+				case 'a':
+				case 'A':
+					keys.push_back(gba::GbaKeypad::Key::A);
+					break;
+				case 'b':
+				case 'B':
+					keys.push_back(gba::GbaKeypad::Key::B);
+					break;
+				case 's':
+				case 'S':
+					keys.push_back(gba::GbaKeypad::Key::Start);
+					break;
+				case 'e':
+				case 'E':
+					keys.push_back(gba::GbaKeypad::Key::Select);
+					break;
+				case 'u':
+				case 'U':
+					keys.push_back(gba::GbaKeypad::Key::Up);
+					break;
+				case 'd':
+				case 'D':
+					keys.push_back(gba::GbaKeypad::Key::Down);
+					break;
+				case 'l':
+				case 'L':
+					keys.push_back(gba::GbaKeypad::Key::Left);
+					break;
+				case 'r':
+				case 'R':
+					keys.push_back(gba::GbaKeypad::Key::Right);
+					break;
+				case 'h':
+				case 'H':
+					keys.push_back(gba::GbaKeypad::Key::L);
+					break;
+				case 'j':
+				case 'J':
+					keys.push_back(gba::GbaKeypad::Key::R);
+					break;
+				default:
+					break;
 				}
 			}
 			if (!keys.empty())
@@ -154,24 +188,24 @@ int dump_gba(const char *rom, int frames, const char *prefix, const char *script
 	}
 	std::fprintf(o, "pc=%08X dispcnt=%04X\n", gba.cpu().pc(), gba.bus().read16(0x04000000));
 	for (u32 b = 0; b < 4; ++b)
-		std::fprintf(o, "bg%dcnt=%04X hofs=%04X vofs=%04X\n", b, gba.bus().read16(0x04000008 + 2 * b),
-					gba.ppu().scrollH(b), gba.ppu().scrollV(b));
+		std::fprintf(o, "bg%dcnt=%04X hofs=%04X vofs=%04X\n", b,
+					 gba.bus().read16(0x04000008 + 2 * b), gba.ppu().scrollH(b),
+					 gba.ppu().scrollV(b));
 	std::fprintf(o, "winin=%04X winout=%04X bldcnt=%04X bldalpha=%04X\n",
-				gba.bus().read16(0x04000048), gba.bus().read16(0x0400004A),
-				gba.bus().read16(0x04000050), gba.bus().read16(0x04000052));
-	std::fprintf(o, "bg2pa=%04X pb=%04X pc=%04X pd=%04X x=%08X y=%08X\n",
-				gba.ppu().affineParam(0, 0), gba.ppu().affineParam(0, 1),
-				gba.ppu().affineParam(0, 2), gba.ppu().affineParam(0, 3),
-				static_cast<unsigned>(gba.ppu().affineX(0)),
-				static_cast<unsigned>(gba.ppu().affineY(0)));
+				 gba.bus().read16(0x04000048), gba.bus().read16(0x0400004A),
+				 gba.bus().read16(0x04000050), gba.bus().read16(0x04000052));
+	std::fprintf(
+		o, "bg2pa=%04X pb=%04X pc=%04X pd=%04X x=%08X y=%08X\n", gba.ppu().affineParam(0, 0),
+		gba.ppu().affineParam(0, 1), gba.ppu().affineParam(0, 2), gba.ppu().affineParam(0, 3),
+		static_cast<unsigned>(gba.ppu().affineX(0)), static_cast<unsigned>(gba.ppu().affineY(0)));
 	std::fprintf(o, "sndh=%04X nr50=%02X nr51=%02X tm0c=%04X tm1c=%04X dma1h=%04X dma2h=%04X\n",
-				gba.bus().read16(0x04000082), gba.bus().read16(0x04000080),
-				gba.bus().read16(0x04000081), gba.bus().read16(0x04000102),
-				gba.bus().read16(0x04000106), gba.bus().read16(0x040000BE),
-				gba.bus().read16(0x040000CA));
+				 gba.bus().read16(0x04000082), gba.bus().read16(0x04000080),
+				 gba.bus().read16(0x04000081), gba.bus().read16(0x04000102),
+				 gba.bus().read16(0x04000106), gba.bus().read16(0x040000BE),
+				 gba.bus().read16(0x040000CA));
 	for (u32 i = 0; i < 128; ++i)
 		std::fprintf(o, "oam%03u: %04X %04X %04X xxxx\n", i, gba.bus().read16(0x07000000 + 8 * i),
-					gba.bus().read16(0x07000002 + 8 * i), gba.bus().read16(0x07000004 + 8 * i));
+					 gba.bus().read16(0x07000002 + 8 * i), gba.bus().read16(0x07000004 + 8 * i));
 	unsigned vrnz = 0, plnz = 0;
 	for (u32 a = 0x06000000; a < 0x06018000; a += 32)
 		if (gba.bus().read32(a) != 0)
@@ -238,6 +272,65 @@ int dump_gba(const char *rom, int frames, const char *prefix, const char *script
 }
 #endif // dev CLI
 
+#if !defined(GB4ME_RELEASE) || defined(GB4ME_KEEP_SELFTEST)
+// Headless Blargg cpu_instrs runner: same bring-up as the frontend's
+// direct-boot path (no boot ROM), stepped frame by frame with no pacing.
+// Blargg tests report over the link cable (SB/SC); the MMU captures those
+// bytes into serial_log, where "Passed"/"Failed" appears at the end.
+int run_blargg(const char *rom, int max_frames)
+{
+	gb::Cartridge cart;
+	if (!cart.load(rom)) {
+		std::printf("not a loadable GB/GBC ROM: '%s' (%s)\n", rom,
+					cart.last_error().empty() ? "unknown format" : cart.last_error().c_str());
+		return 1;
+	}
+	gb::MMU mmu;
+	gb::CPU cpu;
+	gb::PPU ppu;
+	gb::APU apu;
+	gb::Timer timer;
+	gb::Joypad joypad;
+	mmu.set_ppu(&ppu);
+	mmu.set_apu(&apu);
+	mmu.set_timer(&timer);
+	mmu.set_joypad(&joypad);
+	mmu.set_cartridge(&cart);
+	cpu.set_mmu(&mmu);
+	ppu.set_mmu(&mmu);
+	apu.set_mmu(&mmu);
+	timer.set_mmu(&mmu);
+	joypad.set_mmu(&mmu);
+	const HardwareMode mode = cart.hardware_mode();
+	cpu.reset(mode);
+	mmu.set_hardware_mode(mode);
+	ppu.set_hardware_mode(mode);
+	mmu.boot_rom_enabled = false;
+	cpu.double_speed = false;
+	cpu.clock_speed_hz = kDefaultDmgClockHz;
+	for (int f = 0; f < max_frames; ++f) {
+		// One frame = 70224 T-cycles; cpu.step() returns M-cycles.
+		for (u32 t = 0; t < 70224;) {
+			const u32 mc = cpu.step();
+			timer.step(mc);
+			ppu.step(mc);
+			t += mc * 4;
+		}
+		const std::string &log = mmu.serial_log;
+		if (log.find("Passed") != std::string::npos) {
+			std::printf("%s: Passed (%d frames)\n%s\n", rom, f + 1, log.c_str());
+			return 0;
+		}
+		if (log.find("Failed") != std::string::npos) {
+			std::printf("%s: FAILED (%d frames)\n%s\n", rom, f + 1, log.c_str());
+			return 1;
+		}
+	}
+	std::printf("%s: TIMEOUT after %d frames\n%s\n", rom, max_frames, mmu.serial_log.c_str());
+	return 1;
+}
+#endif // dev CLI
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -259,10 +352,12 @@ int main(int argc, char **argv)
 	gb.run();
 	gb.shutdown();
 	return 0;
-#else // developer build (or release+keep-selftest): full CLI and dumps
+#else  // developer build (or release+keep-selftest): full CLI and dumps
 	bool selftest = false;
 	std::string rom_path;
 	std::string list_folder;
+	std::string blargg_rom;
+	int blargg_frames = 3600;
 	std::string dump_rom;
 	int dump_frames = 0;
 	std::string dump_prefix;
@@ -275,6 +370,15 @@ int main(int argc, char **argv)
 		} else if (!std::strcmp(argv[i], "--list-roms") && i + 1 < argc) {
 			list_folder = argv[i + 1];
 			i += 1;
+		} else if (!std::strcmp(argv[i], "--blargg") && i + 1 < argc) {
+			blargg_rom = argv[i + 1];
+			if (i + 2 < argc && argv[i + 2][0] != '-') {
+				blargg_frames = std::atoi(argv[i + 2]);
+				if (blargg_frames <= 0)
+					blargg_frames = 3600;
+				i += 1;
+			}
+			i += 1;
 		} else if (!std::strcmp(argv[i], "--dump-gba") && i + 3 < argc) {
 			dump_rom = argv[i + 1];
 			dump_frames = std::atoi(argv[i + 2]);
@@ -286,12 +390,10 @@ int main(int argc, char **argv)
 				if (!std::strcmp(argv[j], "--input") && j + 1 < static_cast<size_t>(argc)) {
 					dump_input = argv[j + 1];
 					j += 2;
-				} else if (!std::strcmp(argv[j], "--hold") &&
-						   j + 1 < static_cast<size_t>(argc)) {
+				} else if (!std::strcmp(argv[j], "--hold") && j + 1 < static_cast<size_t>(argc)) {
 					dump_hold = std::atoi(argv[j + 1]);
 					j += 2;
-				} else if (!std::strcmp(argv[j], "--snap") &&
-						   j + 1 < static_cast<size_t>(argc)) {
+				} else if (!std::strcmp(argv[j], "--snap") && j + 1 < static_cast<size_t>(argc)) {
 					dump_snap = std::atoi(argv[j + 1]);
 					j += 2;
 				} else {
@@ -313,15 +415,17 @@ int main(int argc, char **argv)
 	if (selftest)
 		return gb::run_selftest(rom_path);
 
+	if (!blargg_rom.empty())
+		return run_blargg(blargg_rom.c_str(), blargg_frames);
+
 	if (!dump_rom.empty())
 		return dump_gba(dump_rom.c_str(), dump_frames, dump_prefix.c_str(),
-					 dump_input.empty() ? nullptr : dump_input.c_str(), dump_hold,
-					 dump_snap);
+						dump_input.empty() ? nullptr : dump_input.c_str(), dump_hold, dump_snap);
 
 	if (!list_folder.empty()) {
 		for (const auto &e : gb::GameBoy::scan_rom_folder(list_folder)) {
 			std::printf("%s | %s | %s\n", e.title.c_str(), e.path.c_str(),
-					e.gba ? "GBA" : (e.cgb ? "CGB" : "DMG"));
+						e.gba ? "GBA" : (e.cgb ? "CGB" : "DMG"));
 		}
 		return 0;
 	}

@@ -45,6 +45,7 @@ class MMU
 	{
 		timer_ = timer;
 	}
+	void set_div_frozen(bool frozen);
 	void set_joypad(Joypad *joypad)
 	{
 		joypad_ = joypad;

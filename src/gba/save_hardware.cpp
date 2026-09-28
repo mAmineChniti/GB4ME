@@ -33,7 +33,8 @@ void SramSave::saveToFile(const std::string &path) const
 	std::ofstream file(path, std::ios::binary);
 	if (!file)
 		return;
-	file.write(reinterpret_cast<const char *>(data_.data()), data_.size());
+	file.write(reinterpret_cast<const char *>(data_.data()),
+			   static_cast<std::streamsize>(data_.size()));
 }
 
 void SramSave::loadFromFile(const std::string &path)
@@ -46,7 +47,7 @@ void SramSave::loadFromFile(const std::string &path)
 		return;
 	file.seekg(0, std::ios::beg);
 	std::vector<u8> data(std::min<size_t>(static_cast<size_t>(size), data_.size()));
-	file.read(reinterpret_cast<char *>(data.data()), data.size());
+	file.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(data.size()));
 	std::copy(data.begin(), data.end(), data_.begin());
 }
 
@@ -118,17 +119,20 @@ void FlashSave::write(u32 offset, u8 value)
 		if (addr == 0x5555) {
 			if (value == 0x90) {
 				state_ = State::ReadId;
-			} else if (value == 0xF0) {
-				state_ = State::ReadArray;
 			} else if (value == 0x80) {
 				state_ = State::EraseSetup;
 			} else if (value == 0xA0) {
 				state_ = State::ProgramSetup;
 			} else if (value == 0xB0) {
 				state_ = State::BankPending; // 128KB bank switch.
-			} else {
-				state_ = State::ReadArray;
+			} else if (value == 0x10) {
+				// Chip erase is complete with the unlock pair itself.
+				handleCommand(addr, value);
 			}
+			// 0xF0 (cancel) and anything unrecognised fall through to
+			// ReadArray below.
+			if (state_ == State::Unlock2)
+				state_ = State::ReadArray;
 		} else {
 			state_ = State::ReadArray;
 		}
@@ -159,26 +163,23 @@ void FlashSave::write(u32 offset, u8 value)
 		break;
 	}
 	case State::EraseConfirm: {
-		if (addr == 0x2AAA && value == 0x55) {
-			// Erase confirm, ready for sector/chip erase command
+		// Sector erase is the unlock pair repeated after 0x80, then 0x30
+		// at the sector address (GBATEK "Flash Memory"): AA 55 80 AA 55
+		// 30. The 0x55@0x2AAA byte must not consume the command, so stay
+		// in this state until the sector address shows up.
+		if (addr == 0x2AAA && value == 0x55)
+			break;
+		if (value == 0x30) {
 			handleCommand(addr, value);
-			state_ = State::ReadArray;
-		} else if ((addr & 0xFFF) == 0x000) {
-			// Sector erase command
-			handleCommand(addr, value);
-			state_ = State::ReadArray;
-		} else {
-			state_ = State::ReadArray;
 		}
-		break;
-	}
-	case State::ProgramSetup: {
-		// After 0xA0, next write at any address programs that byte
-		handleCommand(addr, value);
 		state_ = State::ReadArray;
 		break;
 	}
+	case State::ProgramSetup:
 	case State::ProgramConfirm: {
+		// After 0xA0, the next write at any address programs that byte.
+		// (ProgramConfirm exists so a future "program with verify" can
+		// differ; today both are the same single-byte program.)
 		handleCommand(addr, value);
 		state_ = State::ReadArray;
 		break;
@@ -210,7 +211,8 @@ void FlashSave::saveToFile(const std::string &path) const
 	std::ofstream file(path, std::ios::binary);
 	if (!file)
 		return;
-	file.write(reinterpret_cast<const char *>(data_.data()), data_.size());
+	file.write(reinterpret_cast<const char *>(data_.data()),
+			   static_cast<std::streamsize>(data_.size()));
 }
 
 void FlashSave::loadFromFile(const std::string &path)
@@ -223,8 +225,27 @@ void FlashSave::loadFromFile(const std::string &path)
 		return;
 	file.seekg(0, std::ios::beg);
 	std::vector<u8> data(std::min<size_t>(static_cast<size_t>(size), data_.size()));
-	file.read(reinterpret_cast<char *>(data.data()), data.size());
+	file.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(data.size()));
 	std::copy(data.begin(), data.end(), data_.begin());
+}
+
+void FlashSave::programByte(u32 offset, u8 value)
+{
+	const u32 eff = physAddr(offset);
+	if (eff < data_.size())
+		data_[eff] &= value;
+}
+
+void FlashSave::eraseChip()
+{
+	std::fill(data_.begin(), data_.end(), 0xFF);
+}
+
+void FlashSave::eraseSector(u32 physical)
+{
+	const u32 sector = (physical >> 12) * 4096;
+	for (u32 i = 0; i < 4096 && (sector + i) < data_.size(); i++)
+		data_[sector + i] = 0xFF;
 }
 
 void FlashSave::reset()
@@ -265,21 +286,13 @@ FlashPanasonic::FlashPanasonic(u32 size_bytes) : FlashSave(Manufacturer::Panason
 void FlashPanasonic::handleCommand(u32 offset, u8 value)
 {
 	const u32 addr = offset & 0xFFFF;
-	const u32 eff = physAddr(offset); // Bank-mapped data address (128KB chips).
-	if (addr == 0x10) { // Sector erase command
-		// Erase 4KB sector
-		u32 sector = (eff >> 12) * 4096;
-		for (u32 i = 0; i < 4096 && (sector + i) < data_.size(); i++) {
-			data_[sector + i] = 0xFF;
-		}
-	} else if (addr == 0x30) { // Chip erase (Panasonic uses 0x10/0x30 differently)
-		// Chip erase - erase all
-		std::fill(data_.begin(), data_.end(), 0xFF);
+	if (addr == 0x5555 && value == 0x10) {
+		eraseChip();
+	} else if (value == 0x30) {
+		eraseSector(physAddr(offset));
 	} else {
-		// Byte program
-		if (eff < data_.size()) {
-			data_[eff] = value;
-		}
+		// Byte program: AND (bits only clear; erase restores 1s).
+		programByte(offset, value);
 	}
 }
 
@@ -307,24 +320,13 @@ FlashSanyo::FlashSanyo(u32 size_bytes) : FlashSave(Manufacturer::Sanyo, size_byt
 void FlashSanyo::handleCommand(u32 offset, u8 value)
 {
 	const u32 addr = offset & 0xFFFF;
-	const u32 eff = physAddr(offset); // Bank-mapped data address (128KB chips).
-	if (addr == 0x2AAA && value == 0x80) {
-		state_ = State::SectorEraseSetup;
-	} else if (state_ == State::SectorEraseSetup && value == 0x30) {
-		// Sector erase
-		u32 sector = (eff >> 12) * 4096;
-		for (u32 i = 0; i < 4096 && (sector + i) < data_.size(); i++) {
-			data_[sector + i] = 0xFF;
-		}
-		state_ = State::ReadArray;
-	} else if (addr == 0x5555 && value == 0x10) {
-		// Chip erase
-		std::fill(data_.begin(), data_.end(), 0xFF);
+	if (addr == 0x5555 && value == 0x10) {
+		eraseChip();
+	} else if (value == 0x30) {
+		eraseSector(physAddr(offset));
 	} else {
-		// Byte program
-		if (eff < data_.size()) {
-			data_[eff] = value;
-		}
+		// Byte program: AND (bits only clear; erase restores 1s).
+		programByte(offset, value);
 	}
 }
 
@@ -352,21 +354,13 @@ FlashMacronix::FlashMacronix(u32 size_bytes) : FlashSave(Manufacturer::Macronix,
 void FlashMacronix::handleCommand(u32 offset, u8 value)
 {
 	const u32 addr = offset & 0xFFFF;
-	const u32 eff = physAddr(offset); // Bank-mapped data address (128KB chips).
-	if (addr == 0x2AAA && value == 0x80) {
-		state_ = State::SectorEraseSetup;
-	} else if (state_ == State::SectorEraseSetup && value == 0x30) {
-		u32 sector = (eff >> 12) * 4096;
-		for (u32 i = 0; i < 4096 && (sector + i) < data_.size(); i++) {
-			data_[sector + i] = 0xFF;
-		}
-		state_ = State::ReadArray;
-	} else if (addr == 0x5555 && value == 0x10) {
-		std::fill(data_.begin(), data_.end(), 0xFF);
+	if (addr == 0x5555 && value == 0x10) {
+		eraseChip();
+	} else if (value == 0x30) {
+		eraseSector(physAddr(offset));
 	} else {
-		if (eff < data_.size()) {
-			data_[eff] = value;
-		}
+		// Byte program: AND (bits only clear; erase restores 1s).
+		programByte(offset, value);
 	}
 }
 
@@ -398,21 +392,13 @@ FlashAtmel::FlashAtmel(u32 size_bytes) : FlashSave(Manufacturer::Atmel, size_byt
 void FlashAtmel::handleCommand(u32 offset, u8 value)
 {
 	const u32 addr = offset & 0xFFFF;
-	const u32 eff = physAddr(offset); // Bank-mapped data address (128KB chips).
-	if (addr == 0x2AAA && value == 0x80) {
-		state_ = State::SectorEraseSetup;
-	} else if (state_ == State::SectorEraseSetup && value == 0x30) {
-		u32 sector = (eff >> 12) * 4096;
-		for (u32 i = 0; i < 4096 && (sector + i) < data_.size(); i++) {
-			data_[sector + i] = 0xFF;
-		}
-		state_ = State::ReadArray;
-	} else if (addr == 0x5555 && value == 0x10) {
-		std::fill(data_.begin(), data_.end(), 0xFF);
+	if (addr == 0x5555 && value == 0x10) {
+		eraseChip();
+	} else if (value == 0x30) {
+		eraseSector(physAddr(offset));
 	} else {
-		if (eff < data_.size()) {
-			data_[eff] = value;
-		}
+		// Byte program: AND (bits only clear; erase restores 1s).
+		programByte(offset, value);
 	}
 }
 
@@ -459,7 +445,7 @@ u8 EepromSave::read(u32 offset) const
 	(void) offset;
 	// No memory-mapped read path on hardware; surface the serial output
 	// bit so status polls observe ready/data.
-	return static_cast<u8>(dmaRead() & 1u);
+	return static_cast<u8>(dmaRead(0) & 1u);
 }
 
 void EepromSave::write(u32 offset, u8 value)
@@ -467,16 +453,20 @@ void EepromSave::write(u32 offset, u8 value)
 	(void) offset;
 	// CPU single-step fallback (detection probes); real transfers use
 	// dmaWrite with the DMA unit counter.
-	dmaWrite(value, 1);
+	dmaWrite(value, 1, 0);
 }
 
-uint16_t EepromSave::dmaRead() const
+uint16_t EepromSave::dmaRead(u64 cycle) const
 {
-	// Outside an active readback the chip reports ready (bit 0 = 1).
-	// Program/erase settle delay (~6.5ms on hardware) is not modeled;
-	// writes retire immediately, so busy never surfaces (documented).
-	if (cmd_ != Cmd::Read)
+	// Outside an active readback the chip reports ready (bit 0 = 1),
+	// except while a write is still settling: the serial line reads 0
+	// until the internal program/erase finishes (GBATEK "EEPROM" write
+	// time, mGBA's EEPROM_SETTLE_CYCLES model).
+	if (cmd_ != Cmd::Read) {
+		if (cycle < busy_until_)
+			return 0;
 		return 1;
+	}
 	if (read_left_ <= 0) {
 		cmd_ = Cmd::Null;
 		return 1;
@@ -500,7 +490,7 @@ uint16_t EepromSave::dmaRead() const
 	return 0;
 }
 
-void EepromSave::dmaWrite(uint16_t value, uint32_t remaining)
+void EepromSave::dmaWrite(uint16_t value, uint32_t remaining, u64 cycle)
 {
 	const u32 bit = value & 1u;
 	switch (cmd_) {
@@ -532,6 +522,9 @@ void EepromSave::dmaWrite(uint16_t value, uint32_t remaining)
 				data_[byte] = cur;
 			}
 			++write_addr_;
+			// Every data bit re-arms the settle window, so the chip only
+			// reports ready once the burst has stopped writing (mGBA).
+			busy_until_ = cycle + kSettleCycles;
 		}
 		break;
 	case Cmd::ReadPending:
@@ -566,7 +559,8 @@ void EepromSave::saveToFile(const std::string &path) const
 	std::ofstream file(path, std::ios::binary);
 	if (!file)
 		return;
-	file.write(reinterpret_cast<const char *>(data_.data()), data_.size());
+	file.write(reinterpret_cast<const char *>(data_.data()),
+			   static_cast<std::streamsize>(data_.size()));
 }
 
 void EepromSave::loadFromFile(const std::string &path)
@@ -579,7 +573,7 @@ void EepromSave::loadFromFile(const std::string &path)
 		return;
 	file.seekg(0, std::ios::beg);
 	std::vector<u8> data(std::min<size_t>(static_cast<size_t>(size), data_.size()));
-	file.read(reinterpret_cast<char *>(data.data()), data.size());
+	file.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(data.size()));
 	std::copy(data.begin(), data.end(), data_.begin());
 }
 
@@ -589,6 +583,7 @@ void EepromSave::reset()
 	write_addr_ = 0;
 	read_addr_ = 0;
 	read_left_ = 0;
+	busy_until_ = 0;
 }
 
 void EepromSave::save(StateBuffer &out) const
@@ -597,6 +592,7 @@ void EepromSave::save(StateBuffer &out) const
 	out.write(write_addr_);
 	out.write(read_addr_);
 	out.write(read_left_);
+	out.write(busy_until_);
 	out.write(static_cast<u8>(size_));
 	out.writeVector(data_);
 }
@@ -609,6 +605,9 @@ void EepromSave::load(const StateBuffer &in)
 	in.read(write_addr_);
 	in.read(read_addr_);
 	in.read(read_left_);
+	// busy_until_ joined the stream later; older states resume ready.
+	if (!in.read(busy_until_))
+		busy_until_ = 0;
 	u8 sz = 0;
 	if (in.read(sz))
 		size_ = static_cast<Size>(sz);

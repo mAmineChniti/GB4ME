@@ -1,7 +1,9 @@
 // GBA timers: prescaled counting, cascade, overflow IRQ.
 
 #include "gba/timers.h"
+
 #include "gba/irq.h"
+#include "gba/scheduler.h"
 
 namespace gba
 {
@@ -15,21 +17,94 @@ void GbaTimers::reset()
 {
 	for (auto &ch : channels_)
 		ch = Channel{};
+	for (unsigned i = 0; i < kCount; i++) {
+		armed_[i] = false;
+		gen_[i] = 0;
+	}
+	increments_ = 0;
+}
+
+void GbaTimers::armChannel(unsigned i)
+{
+	Channel &ch = channels_[i];
+	if (scheduler_ == nullptr || armed_[i] || !enabled(i) || cascade(i))
+		return;
+	const u32 wait = prescaler(ch.control) - ch.phase;
+	if (wait == 0) {
+		// Cannot happen: phase is kept below the prescaler, and a zero here
+		// would mean the prescaler shrank under a pending event. Clock it
+		// inline rather than spinning.
+		clockChannel(i);
+		return;
+	}
+	armed_[i] = true;
+	const u32 gen = ++gen_[i];
+	scheduler_->schedule(wait, [this, i, gen] { onTimerTick(i, gen); });
+}
+
+void GbaTimers::onTimerTick(unsigned i, u32 gen)
+{
+	if (gen != gen_[i]) {
+		// The control register changed under this event (new prescaler or a
+		// disable): a newer event owns the channel now.
+		return;
+	}
+	armed_[i] = false;
+	channels_[i].phase = 0;
+	++increments_;
+	clockChannel(i);
+	// clockChannel can cascade into the next channel, and the overflow hook
+	// can touch the audio unit, so re-arm everything from scratch.
+	armAll();
+}
+
+void GbaTimers::armAll()
+{
+	for (unsigned i = 0; i < kCount; i++)
+		armChannel(i);
+}
+
+void GbaTimers::rearmEvents()
+{
+	for (unsigned i = 0; i < kCount; i++)
+		armed_[i] = false;
+	armAll();
+}
+
+u32 GbaTimers::ticks_to_next(unsigned i) const
+{
+	return prescaler(channels_[i].control) - channels_[i].phase;
+}
+
+void GbaTimers::invalidate(unsigned i)
+{
+	// Bump the generation so a pending event becomes a no-op, then re-arm with
+	// the new prescaler.
+	++gen_[i];
+	armed_[i] = false;
 }
 
 void GbaTimers::step(u32 cycles)
 {
-	for (unsigned i = 0; i < kCount; i++) {
-		if (!enabled(i) || cascade(i))
-			continue;
-		Channel &ch = channels_[i];
-		ch.phase += cycles;
-		const u32 scale = prescaler(ch.control);
-		while (ch.phase >= scale) {
-			ch.phase -= scale;
-			clockChannel(i);
+	// With a scheduler the events own the counting (see armChannel); without
+	// one - unit tests, headless bring-up - fall back to counting here so the
+	// timers still run.
+	if (scheduler_ == nullptr) {
+		for (unsigned i = 0; i < kCount; i++) {
+			if (!enabled(i) || cascade(i))
+				continue;
+			Channel &ch = channels_[i];
+			ch.phase += cycles;
+			const u32 scale = prescaler(ch.control);
+			while (ch.phase >= scale) {
+				ch.phase -= scale;
+				clockChannel(i);
+			}
 		}
+		return;
 	}
+	(void) cycles;
+	armAll();
 }
 
 void GbaTimers::clockChannel(unsigned i)
@@ -84,6 +159,12 @@ void GbaTimers::write(u32 addr, u16 value)
 		ch.counter = ch.reload;
 		ch.phase = 0;
 	}
+	// GBATEK "GBA Timers": writing CNT_H restarts the prescaler progress, and
+	// any event armed for the previous period (or for a now-disabled
+	// channel) is no longer valid - invalidate and re-arm from scratch.
+	ch.phase = 0;
+	invalidate(i);
+	armAll();
 }
 
 void GbaTimers::save(StateBuffer &out) const

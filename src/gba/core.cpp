@@ -18,7 +18,11 @@ GameBoyAdvance::GameBoyAdvance()
 	bus_.setPpu(&ppu_);
 	bus_.setKeypad(&keypad_);
 	bus_.setAudio(&audio_);
+	bus_.setScheduler(&scheduler_);
 	bus_.setCartridge(&cartridge_);
+	ppu_.setScheduler(&scheduler_);    // HBlank / line-end are scheduler events.
+	irq_.setScheduler(&scheduler_);    // 2-cycle interrupt delivery delay.
+	timers_.setScheduler(&scheduler_); // prescaled increments are events.
 	irq_.setCpu(&cpu_);
 	timers_.setIrq(&irq_);
 	// Timer 0/1 overflows drive Direct Sound FIFO consumption.
@@ -124,8 +128,8 @@ void GameBoyAdvance::step(u32 cycles)
 					// waking (only exception entry). pollWait above only wakes
 					// IntrWait-family waits, so check the plain condition here;
 					// otherwise a bare Halt sleeps forever.
-					const u16 fired = static_cast<u16>(bus_.read16(0x04000200) &
-													   bus_.read16(0x04000202));
+					const u16 fired =
+						static_cast<u16>(bus_.read16(0x04000200) & bus_.read16(0x04000202));
 					if (fired != 0) {
 						cpu_.wake();
 						break;
@@ -144,6 +148,14 @@ void GameBoyAdvance::step(u32 cycles)
 			bios_.pollWait(cpu_, bus_);
 			continue;
 		}
+		// NOTE for event producers: the scheduler clock only advances *between*
+		// instructions (below), so an event armed by a register write inside
+		// this instruction is placed relative to the instruction's start and
+		// can be up to one instruction long early. Self-re-arming events (the
+		// PPU's, the timers' steady state, the IRQ delay) are exact because
+		// they are armed from inside their own callback, where the clock is
+		// current. Fixing the first case needs the CPU to run in per-cycle
+		// slices, which the prefetch/WAITCNT work also wants.
 		const u32 cpu_cycles = cpu_.step();
 		// DMA transfers inside the step consumed bus time (CPU stalled);
 		// timers, PPU and audio observe CPU + DMA time together.
@@ -210,6 +222,14 @@ bool GameBoyAdvance::loadState(const std::string &path)
 	// (a v1 state saved mid-wait resumes running instead of waiting).
 	bios_.load(buf);
 	scheduler_.load(buf);
+	// The scheduler's queue holds type-erased callbacks and is not
+	// serialized, so every producer re-arms from its restored state - and it
+	// has to happen *after* the scheduler's clock is restored, or the event
+	// would be scheduled against the wrong "now". The PPU is the only
+	// producer today; timers/DMA/audio will join it.
+	ppu_.rearmEvents();
+	irq_.rearmPending();
+	timers_.rearmEvents();
 	return true;
 }
 

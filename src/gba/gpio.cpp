@@ -6,7 +6,9 @@
 
 #include "gba/gpio.h"
 
+#include <cstdio>
 #include <ctime>
+#include <fstream>
 
 namespace gba
 {
@@ -17,9 +19,30 @@ namespace
 // Command numbers (bits 6-4 of the command byte).
 constexpr unsigned kCmdReset = 0;
 constexpr unsigned kCmdDatetime = 2;
-constexpr unsigned kCmdForceIrq = 3;
 constexpr unsigned kCmdControl = 4;
 constexpr unsigned kCmdTime = 6;
+
+// Days from 1970-01-01 (Howard Hinnant's civil algorithm). Used instead of
+// timegm()/mktime() so the emulated RTC stays independent of the host
+// timezone and DST rules.
+std::int64_t daysFromCivil(int year, unsigned month, unsigned day)
+{
+	year -= month <= 2;
+	const int era = (year >= 0 ? year : year - 399) / 400;
+	const unsigned yoe = static_cast<unsigned>(year - era * 400);
+	const unsigned doy = (153u * (month + (month > 2 ? -3u : 9u)) + 2u) / 5u + day - 1u;
+	const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+	return static_cast<std::int64_t>(era) * 146097 + static_cast<int>(doe) - 719468;
+}
+
+// Seconds for a broken-down local wall time, as if it were UTC. The
+// offset is a difference of two such values, so any constant bias
+// cancels; only the day/hour arithmetic has to be right.
+std::int64_t epochLike(int year, int month, int day, int hour, int minute, int second)
+{
+	return daysFromCivil(year, static_cast<unsigned>(month), static_cast<unsigned>(day)) * 86400 +
+		   hour * 3600 + minute * 60 + second;
+}
 
 } // namespace
 
@@ -44,6 +67,11 @@ void GpioRtc::reset()
 		b = 0;
 	rtc_sck_edge_ = true;
 	rtc_sio_out_ = true;
+	rtc_write_len_ = 0;
+	for (u8 &b : rtc_write_)
+		b = 0;
+	// offset_ survives a reset: the clock is battery-backed, so a soft
+	// reset must not undo a game-set time.
 }
 
 u8 GpioRtc::read(u32 addr) const
@@ -101,14 +129,7 @@ void GpioRtc::readPins()
 	outputPins(pin_state_ & 2);
 	if ((pin_state_ & 4) == 0) {
 		// CS low aborts the transfer; SIO idles high.
-		rtc_bits_ = 0;
-		rtc_bits_read_ = 0;
-		rtc_remaining_ = 0;
-		rtc_active_ = false;
-		rtc_command_ = 0;
-		rtc_sck_edge_ = true;
-		rtc_sio_out_ = true;
-		outputPins(2);
+		abortTransfer();
 		return;
 	}
 	const bool sck = (pin_state_ & 1) != 0;
@@ -157,6 +178,19 @@ void GpioRtc::readPins()
 	rtc_sck_edge_ = sck;
 }
 
+void GpioRtc::abortTransfer()
+{
+	rtc_bits_ = 0;
+	rtc_bits_read_ = 0;
+	rtc_remaining_ = 0;
+	rtc_active_ = false;
+	rtc_command_ = 0;
+	rtc_write_len_ = 0;
+	rtc_sck_edge_ = true;
+	rtc_sio_out_ = true;
+	outputPins(2);
+}
+
 void GpioRtc::beginCommand()
 {
 	const u8 raw = rtc_bits_; // Full command byte, read flag included.
@@ -168,13 +202,17 @@ void GpioRtc::beginCommand()
 	rtc_command_ = raw;
 	rtc_active_ = true;
 	rtc_remaining_ = cmdBytes(command);
+	rtc_write_len_ = 0;
 	switch (command) {
 	case kCmdReset:
 		rtc_control_ = 0;
 		break;
 	case kCmdDatetime:
 	case kCmdTime:
-		updateClock();
+		// A read latches the running clock; a write collects the payload
+		// and rebases the clock once it is complete.
+		if ((raw & 0x80u) != 0)
+			updateClock();
 		break;
 	default:
 		break;
@@ -197,16 +235,27 @@ unsigned GpioRtc::cmdBytes(unsigned command)
 
 void GpioRtc::processByte()
 {
-	if (((rtc_command_ >> 4) & 7u) == kCmdControl)
+	const unsigned command = (rtc_command_ >> 4) & 7u;
+	const bool reading = (rtc_command_ & 0x80u) != 0;
+	if (command == kCmdControl) {
 		rtc_control_ = rtc_bits_;
-	// Other commands take no payload (reset/force-IRQ strobes, date/time
-	// and force-IRQ are read-only here).
+	} else if (!reading && (command == kCmdDatetime || command == kCmdTime) &&
+			   rtc_write_len_ < sizeof rtc_write_) {
+		// Date/time write payload, same register order as a read
+		// (year, month, day, day-of-week, hour, minute, second).
+		rtc_write_[rtc_write_len_++] = rtc_bits_;
+	}
+	const bool last = rtc_remaining_ <= 1;
+	// Reset/force-IRQ strobes take no payload; a control write is
+	// applied above, a date/time write once its last byte is in.
 	rtc_bits_ = 0;
 	rtc_bits_read_ = 0;
 	if (rtc_remaining_ > 0)
 		--rtc_remaining_;
+	if (!reading && last && rtc_write_len_ == cmdBytes(command))
+		applyWrite(command);
 	if (rtc_remaining_ == 0)
-		rtc_remaining_ = cmdBytes((rtc_command_ >> 4) & 7u);
+		rtc_remaining_ = cmdBytes(command);
 }
 
 unsigned GpioRtc::outputBit()
@@ -229,7 +278,11 @@ unsigned GpioRtc::outputBit()
 
 void GpioRtc::updateClock()
 {
-	std::time_t t = std::time(nullptr);
+	// Host local time, shifted by the battery-backed offset a game may
+	// have written. localtime_r on the shifted epoch keeps DST behaviour
+	// consistent with the host clock.
+	const std::time_t t =
+		static_cast<std::time_t>(static_cast<std::int64_t>(std::time(nullptr)) + offset_);
 	std::tm date{};
 #if defined(_WIN32)
 	localtime_s(&date, &t);
@@ -247,6 +300,104 @@ void GpioRtc::updateClock()
 	}
 	rtc_time_[5] = bcd(static_cast<unsigned>(date.tm_min));
 	rtc_time_[6] = bcd(static_cast<unsigned>(date.tm_sec));
+}
+
+bool GpioRtc::fromBcd(unsigned value, int *out)
+{
+	const int hi = static_cast<int>((value >> 4) & 0x0Fu);
+	const int lo = static_cast<int>(value & 0x0Fu);
+	if (hi > 9 || lo > 9)
+		return false;
+	*out = hi * 10 + lo;
+	return true;
+}
+
+void GpioRtc::clockNow(int *year, int *month, int *day, int *weekday, int *hour, int *min,
+					   int *sec) const
+{
+	const std::time_t t =
+		static_cast<std::time_t>(static_cast<std::int64_t>(std::time(nullptr)) + offset_);
+	std::tm date{};
+#if defined(_WIN32)
+	localtime_s(&date, &t);
+#else
+	localtime_r(&t, &date);
+#endif
+	*year = date.tm_year + 1900;
+	*month = date.tm_mon + 1;
+	*day = date.tm_mday;
+	*weekday = date.tm_wday;
+	*hour = date.tm_hour;
+	*min = date.tm_min;
+	*sec = date.tm_sec;
+}
+
+void GpioRtc::applyWrite(unsigned command)
+{
+	// Payload uses the same register order as a date/time read: year,
+	// month, day, day-of-week, hour, minute, second. A time-only write
+	// (command 6) sends the last three and keeps the host date.
+	int second = 0, minute = 0, hour = 0, day = 0, month = 0, year = 0;
+	int hy = 0, hm = 0, hd = 0, hwd = 0, hh = 0, hmi = 0, hs = 0;
+	clockNow(&hy, &hm, &hd, &hwd, &hh, &hmi, &hs);
+	if (command == kCmdTime) {
+		year = hy;
+		month = hm;
+		day = hd;
+		if (!fromBcd(rtc_write_[0], &hour) || !fromBcd(rtc_write_[1], &minute) ||
+			!fromBcd(rtc_write_[2], &second))
+			return; // Malformed BCD: keep the running clock.
+	} else {
+		int year_bcd = 0;
+		if (!fromBcd(rtc_write_[0], &year_bcd) || !fromBcd(rtc_write_[1], &month) ||
+			!fromBcd(rtc_write_[2], &day) || !fromBcd(rtc_write_[4], &hour) ||
+			!fromBcd(rtc_write_[5], &minute) || !fromBcd(rtc_write_[6], &second))
+			return;
+		year = year_bcd + 2000;
+	}
+	if (second > 59 || minute > 59 || hour > 23 || month < 1 || month > 12 || day < 1 || day > 31)
+		return;
+	if ((rtc_control_ & 0x40u) == 0 && hour >= 1 && hour <= 12) {
+		// 12-hour mode: the register holds 1-12 and the chip keeps the
+		// current AM/PM, so borrow the host clock's half of the day.
+		hour = (hh >= 12) ? hour + 12 : hour;
+	}
+	// Smallest shift that lands the running clock on the written time.
+	// The base is the *emulated* now, so this composes with an offset a
+	// previous write already installed.
+	offset_ +=
+		epochLike(year, month, day, hour, minute, second) - epochLike(hy, hm, hd, hh, hmi, hs);
+	rtc_write_len_ = 0;
+	updateClock();
+}
+
+void GpioRtc::saveToFile(const std::string &path) const
+{
+	if (!present_)
+		return;
+	std::ofstream file(path, std::ios::trunc);
+	if (!file)
+		return;
+	file << "GB4ME-GPARTC-1 " << offset_ << '\n';
+}
+
+void GpioRtc::loadFromFile(const std::string &path)
+{
+	if (!present_)
+		return;
+	std::ifstream file(path);
+	if (!file)
+		return;
+	std::string tag;
+	long long off = 0;
+	if (!(file >> tag >> off) || tag != "GB4ME-GPARTC-1")
+		return;
+	// A game may set any date, so allow a century either way; outside
+	// that the sidecar is corrupt.
+	constexpr long long kMaxOffset = 100LL * 365LL * 24LL * 3600LL;
+	if (off < -kMaxOffset || off > kMaxOffset)
+		return;
+	offset_ = off;
 }
 
 u8 GpioRtc::bcd(unsigned value)
@@ -270,6 +421,10 @@ void GpioRtc::save(StateBuffer &out) const
 	out.writeBytes(rtc_time_, sizeof rtc_time_);
 	out.write(rtc_sck_edge_);
 	out.write(rtc_sio_out_);
+	// Battery-backed clock state (newer states only).
+	out.write(rtc_write_len_);
+	out.writeBytes(rtc_write_, sizeof rtc_write_);
+	out.write(offset_);
 }
 
 void GpioRtc::load(const StateBuffer &in)
@@ -288,6 +443,13 @@ void GpioRtc::load(const StateBuffer &in)
 	in.readBytes(rtc_time_, sizeof rtc_time_);
 	in.read(rtc_sck_edge_);
 	in.read(rtc_sio_out_);
+	u8 len = 0;
+	if (in.read(len))
+		rtc_write_len_ = len;
+	in.readBytes(rtc_write_, sizeof rtc_write_);
+	std::int64_t off = 0;
+	if (in.read(off))
+		offset_ = off;
 }
 
 } // namespace gba

@@ -59,8 +59,8 @@ static Arm7Tdmi::ShiftResult barrelShift(Arm7Tdmi &cpu, u32 instr, bool imm_form
 	const u8 rm = instr & 0xF;
 	const u32 rm_val = cpu.reg(rm);
 	const u8 type = (instr >> 5) & 3;
-	u32 amount;
-	bool is_imm;
+	u32 amount = 0;
+	bool is_imm = 0;
 	if (((instr >> 4) & 1) == 0) {
 		amount = (instr >> 7) & 0x1F;
 		is_imm = true;
@@ -158,7 +158,7 @@ static u32 executeGroup00(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 		}
 		// Multiply long (U = bit 22, S = bit 21).
 		const bool is_signed = ((instr >> 22) & 1) != 0;
-		u64 res;
+		u64 res = 0;
 		if (is_signed) {
 			const i64 a = static_cast<i32>(cpu.reg(rm));
 			const i64 b = static_cast<i32>(cpu.reg(rs));
@@ -207,7 +207,7 @@ static u32 executeGroup00(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 		const bool load = ((instr >> 20) & 1) != 0;
 		const u8 h = (instr >> 5) & 3;
 		const bool is_imm = ((instr >> 22) & 1) != 0;
-		u32 offset;
+		u32 offset = 0;
 		if (is_imm)
 			offset = (((instr >> 8) & 0xF) << 4) | (instr & 0xF);
 		else
@@ -236,8 +236,7 @@ static u32 executeGroup00(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 					// Aligned: load halfword and sign-extend to 32-bit
 					val = cpu.loadHalf(addr, true);
 				}
-			}
-			else { // H=00 loads are LDRD/STRD (ARMv5): Undefined on v4T.
+			} else { // H=00 loads are LDRD/STRD (ARMv5): Undefined on v4T.
 				cpu.enterException(CpuException::Undefined);
 				return 3;
 			}
@@ -434,7 +433,7 @@ static u32 executeSingle(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 	const bool load = ((instr >> 20) & 1) != 0;
 	const u8 rn = (instr >> 16) & 0xF;
 	const u8 rd = (instr >> 12) & 0xF;
-	u32 offset;
+	u32 offset = 0;
 	if (imm) {
 		offset = instr & 0xFFFu;
 	} else {
@@ -485,7 +484,7 @@ static u32 executeBlock(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 		rlist = 0x8000u; // Empty list: R15-only (documented).
 	const unsigned n = popcount16(rlist);
 	const u32 base = cpu.reg(rn);
-	u32 addr;
+	u32 addr = 0;
 	if (!pre && up)
 		addr = base; // IA
 	else if (pre && up)
@@ -496,7 +495,9 @@ static u32 executeBlock(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 		addr = base - n * 4; // DB
 	const u32 orig_base = base;
 	// S without PC: user-bank transfer. Resolve accessors up front.
-	const bool user_transfer = psr && !(load && (rlist & 0x8000u) != 0);
+	// S without PC: user-bank transfer, unless this is an LDR (bit 4 of
+	// rlist is the "user" flag; the classic GBATEK table lists bit 4 = 0).
+	const bool user_transfer = psr && (!load || (rlist & 0x8000u) != 0);
 	auto getReg = [&](u8 i) -> u32 {
 		if (user_transfer) {
 			if (i < 8)

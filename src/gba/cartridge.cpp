@@ -46,6 +46,7 @@ bool Cartridge::loadFromBytes(const std::vector<u8> &data)
 	if (loaded_) {
 		save_type_ = detectSaveType();
 		createSaveHardware();
+		gpio_.clearOffset(); // New cart: new battery (offset comes from its sidecar).
 		gpio_.reset();
 		gpio_.setPresent(detectGpio());
 	}
@@ -210,21 +211,21 @@ bool Cartridge::isEeprom() const
 		   save_type_ == SaveType::EEPROM_512Kbit;
 }
 
-uint16_t Cartridge::eepromDmaRead() const
+uint16_t Cartridge::eepromDmaRead(u64 cycle) const
 {
 	if (!isEeprom())
 		return 1;
 	if (auto *e = dynamic_cast<const EepromSave *>(save_.get()))
-		return e->dmaRead();
+		return e->dmaRead(cycle);
 	return 1;
 }
 
-void Cartridge::eepromDmaWrite(uint16_t value, uint32_t remaining)
+void Cartridge::eepromDmaWrite(uint16_t value, uint32_t remaining, u64 cycle)
 {
 	if (!isEeprom())
 		return;
 	if (auto *e = dynamic_cast<EepromSave *>(save_.get()))
-		e->dmaWrite(value, remaining);
+		e->dmaWrite(value, remaining, cycle);
 }
 
 u32 Cartridge::saveSize() const
@@ -252,10 +253,10 @@ SaveType Cartridge::detectSaveType() const
 {
 	// Industry standard: scan ROM for ASCII marker strings like mGBA/VBA-M.
 	// Markers: "EEPROM_Vnnn", "FLASH_V123", "FLASH512_Vnnn", "FLASH1M_Vnnn", "SRAM_Vnnn"
-	
+
 	// Search for marker strings in ROM
-	const std::string rom_str(reinterpret_cast<const char*>(rom_.data()), rom_.size());
-	
+	const std::string rom_str(reinterpret_cast<const char *>(rom_.data()), rom_.size());
+
 	// Per-title overrides FIRST (mGBA src/gba/overrides.c). Some carts ship
 	// a marker that contradicts the real chip, so mGBA forces the type for
 	// them; without the table those titles silently get a wrong-sized save.
@@ -277,28 +278,27 @@ SaveType Cartridge::detectSaveType() const
 		// 4Kbit (mGBA's autodetect default; most EEPROM titles are 4Kbit).
 		return SaveType::EEPROM_4Kbit;
 	}
-	
+
 	// Check for Flash1M (128KB Flash)
 	if (rom_str.find("FLASH1M_V") != std::string::npos ||
-	    rom_str.find("FLASH1M_") != std::string::npos) {
+		rom_str.find("FLASH1M_") != std::string::npos) {
 		// 128KB Flash - use Macronix (most common)
 		// Note: would need to instantiate FlashMacronix with 128KB size
 		return SaveType::Flash_Macronix; // Caller needs to handle 128KB
 	}
-	
+
 	// Check for Flash512 or generic FLASH_V (64KB Flash)
 	if (rom_str.find("FLASH512_V") != std::string::npos ||
-	    rom_str.find("FLASH_V") != std::string::npos ||
-	    rom_str.find("FLASH_") != std::string::npos) {
+		rom_str.find("FLASH_V") != std::string::npos ||
+		rom_str.find("FLASH_") != std::string::npos) {
 		return SaveType::Flash_Macronix; // 64KB
 	}
-	
+
 	// Check for SRAM marker
-	if (rom_str.find("SRAM_V") != std::string::npos ||
-	    rom_str.find("SRAM_") != std::string::npos) {
+	if (rom_str.find("SRAM_V") != std::string::npos || rom_str.find("SRAM_") != std::string::npos) {
 		return SaveType::SRAM;
 	}
-	
+
 	// Fallback: try game code heuristic for games without markers
 	std::string gcode = gameCode();
 	if (!gcode.empty()) {
@@ -306,7 +306,7 @@ SaveType Cartridge::detectSaveType() const
 		if (t != SaveType::None)
 			return t;
 	}
-	
+
 	// Default to SRAM (most common, largest compatibility)
 	return SaveType::SRAM;
 }
@@ -324,25 +324,25 @@ SaveType Cartridge::forcedSaveType(const std::string &code)
 	// its size on first out-of-range access, so 4Kbit is the right default.
 	static constexpr Row kOverrides[] = {
 		// DigiCommunication Nyo - marker says SRAM_F_V103, chip is EEPROM.
-		{ "BDKJ", SaveType::EEPROM_4Kbit },
+		{"BDKJ", SaveType::EEPROM_4Kbit},
 		// Crash Bandicoot 2, Boktai series, etc. - no EEPROM marker at all.
-		{ "AC8J", SaveType::EEPROM_4Kbit },
-		{ "AC8E", SaveType::EEPROM_4Kbit },
-		{ "AC8P", SaveType::EEPROM_4Kbit },
-		{ "U3IJ", SaveType::EEPROM_4Kbit },
-		{ "U3IE", SaveType::EEPROM_4Kbit },
-		{ "U3IP", SaveType::EEPROM_4Kbit },
-		{ "U32J", SaveType::EEPROM_4Kbit },
-		{ "U32E", SaveType::EEPROM_4Kbit },
-		{ "U32P", SaveType::EEPROM_4Kbit },
-		{ "U33J", SaveType::EEPROM_4Kbit },
-		{ "KHPJ", SaveType::EEPROM_4Kbit },
+		{"AC8J", SaveType::EEPROM_4Kbit},
+		{"AC8E", SaveType::EEPROM_4Kbit},
+		{"AC8P", SaveType::EEPROM_4Kbit},
+		{"U3IJ", SaveType::EEPROM_4Kbit},
+		{"U3IE", SaveType::EEPROM_4Kbit},
+		{"U3IP", SaveType::EEPROM_4Kbit},
+		{"U32J", SaveType::EEPROM_4Kbit},
+		{"U32E", SaveType::EEPROM_4Kbit},
+		{"U32P", SaveType::EEPROM_4Kbit},
+		{"U33J", SaveType::EEPROM_4Kbit},
+		{"KHPJ", SaveType::EEPROM_4Kbit},
 		// No battery-backed save at all (mGBA GBA_SAVEDATA_NONE).
-		{ "AI2E", SaveType::None },
-		{ "AI2P", SaveType::None },
-		{ "ASLE", SaveType::None },
-		{ "ASLF", SaveType::None },
-		{ "A2YE", SaveType::None },
+		{"AI2E", SaveType::None},
+		{"AI2P", SaveType::None},
+		{"ASLE", SaveType::None},
+		{"ASLF", SaveType::None},
+		{"A2YE", SaveType::None},
 	};
 	for (const Row &r : kOverrides)
 		if (code == r.code)

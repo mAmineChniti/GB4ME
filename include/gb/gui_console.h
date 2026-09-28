@@ -26,8 +26,6 @@ struct ButtonRegion {
 	bool is_circle = false; // A/B are circles
 };
 
-
-
 enum class ConsoleColor : u8 {
 	Purple = 0,
 	Green,
@@ -47,6 +45,13 @@ struct InputProfile {
 };
 
 struct Settings {
+	// settings.cfg schema version, written as the first `schema=` line.
+	// 1 = the original hand-rolled key=value file (no version line; still
+	// read, see load()), 2 = this version (versioned header + unknown-key
+	// reporting). Bump when a key changes meaning or is removed; older
+	// files keep loading because every key has a default and unknown keys
+	// are ignored.
+	static constexpr int kSchemaVersion = 2;
 	// Total profile cap, including the built-in Default at index 0. The
 	// Inputs tab profile list, so this also bounds how many can be picked.
 	static constexpr int kMaxProfiles = 16;
@@ -70,6 +75,41 @@ struct Settings {
 	// above, which stay the single source of truth for gameplay.
 	std::vector<InputProfile> profiles;
 	int active_profile = 0;
+	int loaded_schema_ = 0;
+	std::vector<std::string> unknown_keys_;
+	// Every key the last load() actually saw, recognised or not, in file
+	// order. load() treats an absent key as "keep the current value", so the
+	// per-game overlay below needs this to tell "not in the file" from
+	// "explicitly set to the value I already have".
+	std::vector<std::string> present_keys_;
+
+	// Per-game config overlay: `<rom>.cfg` beside the ROM (same key=value
+	// format), applied over the global settings when that ROM loads, so one
+	// game can insist on its own palette/filter/scale without touching
+	// everyone else's. Only the DISPLAY keys below may be set in it - input
+	// bindings and profiles deliberately stay global, because they are
+	// profiles the user switches on purpose.
+	struct GameOverride {
+		// The ROM the overlay came from, and whether one is applied.
+		std::string rom;
+		bool active = false;
+		// The global value each overridden key displaced, so save() can put
+		// it back: without this, saving the global config while a game is
+		// running would copy the game's values into everyone's settings.
+		// A key is only restored if it was actually in the file, so an
+		// overlay that sets one key cannot reset the others to defaults.
+		float volume = 0.0f;
+		int video_scale = 0;
+		int video_filter = 0;
+		int lcd_grid = 0;
+		int palette = 0;
+		int console_color = 0;
+		std::string hardware_mode;
+		bool has_volume = false, has_video_scale = false, has_video_filter = false;
+		bool has_lcd_grid = false, has_palette = false, has_console_color = false;
+		bool has_hardware_mode = false;
+	};
+	GameOverride game;
 
 	// Total profiles including Default.
 	int profileCount() const
@@ -136,8 +176,8 @@ struct Settings {
 			return 7; // Down
 		}
 	}
-	float volume = 1.0f;                // 0.0 -1.0
-	int video_scale = 4;                // 1-6
+	float volume = 1.0f; // 0.0 -1.0
+	int video_scale = 4; // 1-6
 	// Upscaling QUALITY options, all optional and all off by default so the
 	// default look is unchanged. These resample the image; they do NOT change
 	// the window or frame size. `video_filter` is a VideoFilter value
@@ -152,17 +192,55 @@ struct Settings {
 	static constexpr float kLcdGridDepth[kLcdGridMax + 1] = {0.0f, 0.12f, 0.22f, 0.34f};
 	float lcdGridDepth() const
 	{
-		return kLcdGridDepth[lcd_grid < 0 ? 0
-										  : (lcd_grid > kLcdGridMax ? kLcdGridMax : lcd_grid)];
+		return kLcdGridDepth[lcd_grid < 0 ? 0 : (lcd_grid > kLcdGridMax ? kLcdGridMax : lcd_grid)];
 	}
 	int palette = 0;                    // DMG palette or CGB palette index
 	std::string hardware_mode = "Auto"; // DMG / CGB / Auto
 	ConsoleColor console_color = ConsoleColor::Purple;
+	// Recently played ROMs, most-recent-first (serialised recent0..7).
+	// Pinned to the top of the ROM menu with 1-8 quick-launch.
+	static constexpr size_t kMaxRecent = 8;
+	std::vector<std::string> recent_roms;
+	// Fronts `path` (dedupe + cap). Missing files are pruned on rescan,
+	// not here, so a temporarily unmounted folder is not forgotten.
+	void push_recent(const std::string &path);
 
 	Settings();
 
 	bool save(const std::string &path);
 	bool load(const std::string &path);
+	// Schema version of the last file loaded (0 = none/defaults). Reported
+	// so the UI and the selftest can tell a legacy file from a current one.
+	int loaded_schema() const
+	{
+		return loaded_schema_;
+	}
+	// Keys the last load did not recognise, in file order. A newer build
+	// writing keys this one does not know leaves them here instead of
+	// dropping them silently on the next save.
+	const std::vector<std::string> &unknown_keys() const
+	{
+		return unknown_keys_;
+	}
+	// True when the last load() saw `key` at all, so an overlay can apply
+	// only the keys its file actually contains.
+	bool has_key(const std::string &key) const;
+	const std::vector<std::string> &present_keys() const
+	{
+		return present_keys_;
+	}
+
+	// `<rom>.cfg`: the ROM's path with its extension replaced. "mario.gbc"
+	// -> "mario.cfg", beside the ROM, so it travels with the game.
+	static std::string game_override_path(const std::string &rom_path);
+	// Reads that file and applies the display keys it sets over the current
+	// values, remembering what they displaced in `game`. A missing file is
+	// not an error: it just restores the globals from any previous overlay
+	// (so a per-game config cannot follow you into the next game). Returns
+	// true when a file was read and at least one key applied.
+	bool load_game_override(const std::string &rom_path);
+	// Drops the overlay and restores the global values it displaced.
+	void clear_game_override();
 	SDL_Scancode scancode_for(Joypad::Key k) const;
 	void set_mapping(Joypad::Key k, SDL_Scancode code);
 };
@@ -187,7 +265,8 @@ class GUIConsole
 		std::string title;
 		std::string path;
 		bool cgb = false;
-		bool gba = false; // GBA image (routed to the GBA core, Phases 2+ execute)
+		bool gba = false;    // GBA image (routed to the GBA core, Phases 2+ execute)
+		bool recent = false; // pinned recent: shown first, 1-8 quick-launch
 	};
 
 	enum class SettingsTab : u8 { General = 0, Inputs = 1 };
@@ -201,23 +280,23 @@ class GUIConsole
 		Volume,
 		Palette,
 		HwMode,
-		Filter,       // cycle VideoFilter (Nearest / Bilinear / Smooth / Scale2x)
-		LcdGrid,      // cycle the LCD grid strength (Off .. Strong)
-		PadButton,    // index = logical button on the GBA diagram
+		Filter,      // cycle VideoFilter (Nearest / Bilinear / Smooth / Scale2x)
+		LcdGrid,     // cycle the LCD grid strength (Off .. Strong)
+		PadButton,   // index = logical button on the GBA diagram
 		AutoMap,     // one-click layout: pad defaults, or keyboard defaults
-		ProfileBox,   // open the profile dropdown (or the name prompt)
-		ProfileItem,  // index = entry picked from the profile dropdown
+		ProfileBox,  // open the profile dropdown (or the name prompt)
+		ProfileItem, // index = entry picked from the profile dropdown
 		ProfileLoad,
 		ProfileSave,
 		DeviceBox,
-		DeviceItem,   // index = entry picked from the device dropdown
+		DeviceItem, // index = entry picked from the device dropdown
 	};
 
 	struct SettingsHit {
 		SettingsAction action = SettingsAction::None;
 		// MapButton: logical PadButton index.
 		int index = -1;
-		float ratio = 0.0f;   // Volume: 0..1 position of the click
+		float ratio = 0.0f; // Volume: 0..1 position of the click
 	};
 
 	// Visual treatment for a settings row.

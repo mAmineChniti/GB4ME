@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libsdl3-dev \
+            libvulkan-dev vulkan-validationlayers glslc
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Self-test
+        run: ./bin/GB4ME --selftest
+
+  # Blargg cpu_instrs suite: the real SM83 conformance check. Runs headless
+  # via --blargg (serial pass/fail); any subtest failure fails the job.
+  blargg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libsdl3-dev \
+            libvulkan-dev vulkan-validationlayers glslc git
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Fetch Blargg test ROMs
+        run: git clone --depth 1 https://github.com/retrio/gb-test-roms.git test-roms
+
+      - name: Run cpu_instrs (01-11)
+        run: |
+          fail=0
+          for rom in test-roms/cpu_instrs/individual/*.gb; do
+            ./bin/GB4ME --blargg "$rom" || fail=1
+          done
+          exit $fail
+
+  # clang-format gate. The tree is formatted to .clang-format; this keeps it
+  # that way. The version is pinned to the PyPI mirror of the LLVM release so
+  # the result does not drift with the runner image (22.1.8 = the version the
+  # sources were formatted with).
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned clang-format
+        run: pip install --user clang-format==22.1.8
+
+      - name: Check formatting
+        run: |
+          # First-party sources only; the stb_* single-header libraries are
+          # vendored upstream and keep their own formatting.
+          { git ls-files '*.cpp' '*.h'
+            git ls-files --others --exclude-standard '*.cpp' '*.h'
+          } | grep -vE '^src/stb_(truetype|image)\.h$' > /tmp/gb4me-format.txt
+          xargs -a /tmp/gb4me-format.txt clang-format --dry-run -Werror
+
+  # clang-tidy gate. run-clang-tidy parallelises across the first-party
+  # translation units; .clang-tidy is the check list and holds the reasoning
+  # for the checks deliberately left out. WarningsAsErrors is '*', so a new
+  # finding fails the job.
+  clang-tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libsdl3-dev \
+            libvulkan-dev vulkan-validationlayers glslc clang-tidy
+
+      - name: Configure
+        run: cmake --preset dev
+
+      - name: Build (compiles everything, so clang-tidy sees every header)
+        run: cmake --build --preset dev
+
+      - name: clang-tidy
+        run: |
+          files=$(find src -name '*.cpp' -not -name 'stb_*' | sort)
+          run-clang-tidy -p build/dev -j "$(nproc)" -quiet $files
+
+  # CMake discovery paths. The three ways of finding SDL3 are separate
+  # branches of one if/else, and a wrong branch only shows up at configure
+  # time on a machine that has no SDL3 package - which is exactly the machine
+  # none of the build jobs above are. Configure-only: FetchContent adds SDL
+  # as a subproject but nothing is compiled, so this stays cheap while still
+  # catching the trap that SDL's own CMakeLists rewrites SDL_SHARED (see the
+  # comment by the fetch block in CMakeLists.txt).
+  cmake-discovery-paths:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libsdl3-dev \
+            libvulkan-dev vulkan-validationlayers glslc
+
+      - name: find_package path (default)
+        run: cmake -S . -B build/pkgconfig-default -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: pkg-config path (forced)
+        run: |
+          cmake -S . -B build/pkgconfig-forced -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DGB4ME_SDL3_PKGCONFIG=ON
+
+      - name: FetchContent path (forced, no system package)
+        run: |
+          # Unset the package dirs so find_package/pkg-config cannot succeed
+          # and the fetch branch is the one actually taken.
+          cmake -S . -B build/fetch -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DGB4ME_SDL3_FETCH=ON \
+            -DCMAKE_DISABLE_FIND_PACKAGE_SDL3=ON \
+            -DCMAKE_IGNORE_PATH="/usr/lib/x86_64-linux-gnu/cmake/SDL3;/usr/lib/cmake/SDL3"
+          grep -q "SDL3: fetching" build/fetch/CMakeCache.txt || \
+            grep -rl "SDL3: fetching" build/fetch/CMakeFiles 2>/dev/null || \
+            echo "note: the fetch message is only in the configure log"
+
+  # ASan + UBSan over the whole selftest (including the ROM boot smoke test
+  # when a ROM is passed). Third-party ImGui is built without the sanitizers.
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libsdl3-dev \
+            libvulkan-dev vulkan-validationlayers glslc
+
+      - name: Configure (ASan + UBSan)
+        run: cmake --preset dev-asan
+
+      - name: Build
+        run: cmake --build --preset dev-asan
+
+      - name: Self-test under sanitizers
+        run: ctest --preset selftest-asan --output-on-failure
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=0
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+

@@ -2,15 +2,17 @@
 // https://github.com/aquova/gb-book (SDL frontend chapter)
 
 #include "gb/gameboy.h"
+
 #include "gba/cartridge.h"
 #include "stb_image.h"
+#include <SDL3/SDL_gamepad.h>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <cstring>
-#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 
@@ -19,14 +21,14 @@ namespace gb
 
 #ifdef GB4ME_RELEASE
 // Release builds have no tracing at all, and the env var is not even read.
-#define GB4ME_ITRACE(...) \
-	do {                  \
+#define GB4ME_ITRACE(...)                                                                          \
+	do {                                                                                           \
 	} while (0)
 #else
-#define GB4ME_ITRACE(...)                              \
-	do {                                               \
-		if (input_trace_)                              \
-			std::fprintf(stderr, __VA_ARGS__);         \
+#define GB4ME_ITRACE(...)                                                                          \
+	do {                                                                                           \
+		if (input_trace_)                                                                          \
+			std::fprintf(stderr, __VA_ARGS__);                                                     \
 	} while (0)
 #endif
 
@@ -56,7 +58,7 @@ GameBoy::GameBoy()
 	// the existing key_map, the controller tables are the new pad maps.
 	for (unsigned i = 0; i < kPadButtonCount; ++i) {
 		input_.setKeyBinding(static_cast<PadButton>(i),
-		                    Binding::makeKey(settings.key_map[static_cast<size_t>(i)]));
+							 Binding::makeKey(settings.key_map[static_cast<size_t>(i)]));
 		input_.setPadBinding(static_cast<PadButton>(i), settings.pad_map[i]);
 		input_.setPadBinding2(static_cast<PadButton>(i), settings.pad_map_alt[i]);
 	}
@@ -106,6 +108,7 @@ bool GameBoy::initialize()
 	// keyboard path still works unchanged.
 	SDL_InitSubSystem(SDL_INIT_GAMEPAD);
 	input_.openControllers();
+	open_rumble();
 	// Audio is best-effort: the emulator runs silent without a device.
 	// Apply volume from settings
 	apu.open_audio();
@@ -136,7 +139,7 @@ bool GameBoy::initialize()
 										  "/usr/share/icons/hicolor/512x512/apps/GB4ME.png",
 										  "assets/GB4ME.png", "assets/icon.png"};
 		for (auto &p : icon_candidates) {
-			int w, h, comp;
+			int w = 0, h = 0, comp = 0;
 			unsigned char *pix = stbi_load(p.c_str(), &w, &h, &comp, 4);
 			if (pix) {
 				SDL_Surface *surf = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_RGBA32);
@@ -154,14 +157,68 @@ bool GameBoy::initialize()
 		SDL_Log("Vulkan renderer init failed");
 		return false;
 	}
+	// Dear ImGui overlay (debug readout): best-effort, never fatal.
+	renderer.init_imgui();
 
 	// Boot to the ROM menu; a ROM can be passed on the command line
 	// (load_rom) or picked via the OPEN button / file dialog.
 	gui_console.set_menu_active(true);
 	rescan_roms();
+#ifndef GB4ME_RELEASE
+	// Every GB4ME_* env hook is a developer facility, so none of them
+	// survive a GB4ME_RELEASE build (the audit: the *_TRACE loggers are
+	// all behind this guard too).
+	ff_env_ = std::getenv("GB4ME_FASTFORWARD") != nullptr;
+	// Screenshot hook for the volume OSD (no key injector headless).
+	if (std::getenv("GB4ME_VOLUME_OSD") != nullptr)
+		renderer.flash_volume_for(settings.volume, 30.0);
+#endif
 	running = true;
 	last_time = SDL_GetTicks() / 1000.0;
 	return true;
+}
+
+// Per-frame readout for the Dear ImGui debug overlay (1 frame of lag is
+// irrelevant here). Cheap: a few string copies only while visible.
+void GameBoy::push_imgui_stats()
+{
+	if (!renderer.imgui_visible())
+		return;
+	VulkanRenderer::ImguiStats s;
+	s.frame = frame_count;
+	if (rom_loaded_ && !last_rom_path_.empty()) {
+		const size_t slash = last_rom_path_.find_last_of("/\\");
+		s.rom = slash == std::string::npos ? last_rom_path_ : last_rom_path_.substr(slash + 1);
+		s.core = gba_mode_ ? "GBA" : (cpu.double_speed ? "CGB-D" : "DMG/CGB");
+	} else {
+		s.core = "menu";
+	}
+	s.volume = settings.volume;
+	s.filter = settings.video_filter;
+	s.ff = fast_forward();
+	// Emulation load: T-cycles executed in the last wall-clock second vs
+	// what the hardware would have run. >100% means fast-forward, and the
+	// audio line then says how many batches the device could not keep up
+	// with.
+	{
+		const double now = SDL_GetTicks() / 1000.0;
+		if (emu_window_t_ > 0.0 && now > emu_window_t_) {
+			const double window = now - emu_window_t_;
+			const double mhz = static_cast<double>(emu_tcycles_) / window / 1e6;
+			s.emulated_mhz = static_cast<float>(mhz);
+			s.emu_speed_pct =
+				static_cast<float>(mhz * 1e6 / (gba_mode_ ? 16777216.0 : 4194304.0) * 100.0);
+			emu_tcycles_ = 0;
+			emu_window_t_ = now;
+		} else if (emu_window_t_ == 0.0) {
+			emu_window_t_ = now;
+		}
+		s.underruns = gba_mode_ ? gba_.audio().dropouts() : apu.dropouts();
+		s.audio_target_ms =
+			static_cast<float>(audio_sync_.target_frames()) * 1000.0f / gb::APU::kSampleRate;
+		s.resample_pct = (audio_sync_.resample_ratio() - 1.0f) * 100.0f;
+	}
+	renderer.set_imgui_stats(s);
 }
 
 void GameBoy::flush_active_save()
@@ -171,9 +228,15 @@ void GameBoy::flush_active_save()
 	if (gba_mode_) {
 		if (gba_.cartridge().hasSave())
 			gba_.cartridge().saveToFile(last_rom_path_ + ".sav");
+		// RTC carts (Pokemon R/S/E, Boktai): keep the game-set clock so a
+		// restart resumes the same emulated date/time.
+		if (gba_.cartridge().hasRtc())
+			gba_.cartridge().saveRtc(last_rom_path_ + ".rtc");
 	} else if (cartridge.has_battery()) {
 		cartridge.save_ram(last_rom_path_ + ".sav");
 	}
+	if (cartridge.has_rtc())
+		cartridge.save_rtc(last_rom_path_ + ".rtc");
 }
 
 bool GameBoy::load_rom(const std::string &rom_path)
@@ -189,7 +252,9 @@ bool GameBoy::load_rom(const std::string &rom_path)
 			// running game's save is flushed or its core is replaced.
 			gba::Cartridge gprobe;
 			if (!gprobe.load(rom_path)) {
-				SDL_Log("load_rom: not a supported ROM: %s", rom_path.c_str());
+				const std::string reason =
+					probe.last_error().empty() ? "unknown format" : probe.last_error();
+				SDL_Log("load_rom: not a supported ROM: %s (%s)", rom_path.c_str(), reason.c_str());
 				return false;
 			}
 		}
@@ -198,6 +263,13 @@ bool GameBoy::load_rom(const std::string &rom_path)
 	// save before its cartridge is replaced (GBA included - previously a
 	// GBA->GBA switch dropped the first game's save entirely).
 	flush_active_save();
+	// Per-game config: <rom>.cfg wins over the global display settings for
+	// as long as this game is the one loaded. Applied BEFORE either branch
+	// reads a setting (the GB branch picks its hardware mode from
+	// settings.hardware_mode), and applied to the live systems, not just the
+	// struct - the cores were configured from the old values.
+	settings.load_game_override(rom_path);
+	apply_game_override_to_systems();
 	if (!is_gb) {
 		if (!gba_.load(rom_path)) {
 			SDL_Log("load_rom: GBA load failed: %s", rom_path.c_str());
@@ -206,7 +278,17 @@ bool GameBoy::load_rom(const std::string &rom_path)
 		last_rom_path_ = rom_path;
 		rom_loaded_ = true;
 		gba_mode_ = true;
+		gba_.cartridge().loadRtc(rom_path + ".rtc");
+		settings.push_recent(rom_path);
+		settings.save("");
 		gui_console.set_gba_mode(true);
+		// Fresh audio-clock window for the new cartridge: the device may
+		// still hold the previous game's audio, and the produced watermark
+		// has to start from the new core's counter.
+		audio_sync_.reset(gb::APU::kSampleRate, 0); // Same rate in both cores.
+		audio_produced_ = 0;
+		if (gba_mode_)
+			gba_.audio().set_resample_ratio(1.0f);
 		release_mouse_buttons();
 		gui_console.cancel_mapping();
 		gui_console.set_menu_active(false);
@@ -220,8 +302,7 @@ bool GameBoy::load_rom(const std::string &rom_path)
 		{
 			const size_t slash = rom_path.find_last_of("/\\");
 			const std::string title =
-				"GB4ME - " +
-				(slash == std::string::npos ? rom_path : rom_path.substr(slash + 1));
+				"GB4ME - " + (slash == std::string::npos ? rom_path : rom_path.substr(slash + 1));
 			SDL_SetWindowTitle(window, title.c_str());
 		}
 		return true;
@@ -233,8 +314,11 @@ bool GameBoy::load_rom(const std::string &rom_path)
 		return false; // probed OK above
 	gba_mode_ = false;
 	last_rom_path_ = rom_path;
+	settings.push_recent(rom_path);
+	settings.save("");
 	// Battery saves sit next to the ROM.
 	cartridge.load_ram(rom_path + ".sav");
+	cartridge.load_rtc(rom_path + ".rtc");
 
 	// ---- CGB Mode Detection (AGENTS Part 1.1) ----
 	// Header 0x0143 CGB flag: 0x80 compatible, 0xC0 CGB-only. Other = DMG.
@@ -313,11 +397,40 @@ void GameBoy::eject_rom()
 	rescan_roms();
 }
 
+// Local probe used by rescan_roms (defined below, after the title helpers).
+static std::optional<GUIConsole::RomEntry> probe_recent_entry(const std::string &path);
+
 void GameBoy::rescan_roms()
 {
+	// Pin live recents first (deduped against the folder scan below), then
+	// the folder hits. Recents whose files vanished are forgotten here, so a
+	// temporarily unmounted folder is only pruned while actually unreachable.
+	std::vector<std::string> live;
+	for (const auto &p : settings.recent_roms) {
+		std::error_code ec;
+		if (std::filesystem::exists(p, ec) && !ec)
+			live.push_back(p);
+	}
+	settings.recent_roms = std::move(live);
 	auto entries = scan_rom_folder(settings.rom_folder);
+	entries.erase(std::remove_if(entries.begin(), entries.end(),
+								 [&](const GUIConsole::RomEntry &e) {
+									 return std::find(settings.recent_roms.begin(),
+													  settings.recent_roms.end(),
+													  e.path) != settings.recent_roms.end();
+								 }),
+				  entries.end());
+	std::vector<GUIConsole::RomEntry> merged;
+	for (const auto &p : settings.recent_roms) {
+		if (auto r = probe_recent_entry(p)) {
+			r->recent = true;
+			merged.push_back(std::move(*r));
+		}
+	}
+	merged.insert(merged.end(), std::make_move_iterator(entries.begin()),
+				  std::make_move_iterator(entries.end()));
 	const int keep = gui_console.menu_selected();
-	gui_console.set_rom_list(std::move(entries));
+	gui_console.set_rom_list(std::move(merged));
 	gui_console.set_menu_selected(keep);
 }
 
@@ -551,6 +664,43 @@ std::string pretty_from_stem(const std::string &stem_raw)
 
 } // namespace
 
+// Probe a single ROM path for the menu (recents may live outside rom_folder).
+// Mirrors the per-file logic in scan_rom_folder; nullopt when unplayable.
+static std::optional<GUIConsole::RomEntry> probe_recent_entry(const std::string &path)
+{
+	size_t dot = path.find_last_of('.');
+	if (dot == std::string::npos)
+		return std::nullopt;
+	std::string ext = path.substr(dot);
+	std::transform(ext.begin(), ext.end(), ext.begin(),
+				   [](unsigned char c) { return std::tolower(c); });
+	if (ext != ".gb" && ext != ".gbc" && ext != ".gba")
+		return std::nullopt;
+	GUIConsole::RomEntry r;
+	r.path = path;
+	const size_t slash = path.find_last_of("/\\");
+	std::string stem = slash == std::string::npos ? path : path.substr(slash + 1);
+	if (ext.size() < stem.size())
+		stem.resize(stem.size() - ext.size());
+	if (ext == ".gba") {
+		gba::Cartridge gba_probe;
+		if (!gba_probe.load(path))
+			return std::nullopt;
+		r.title = pretty_from_stem(stem);
+		if (r.title.empty())
+			r.title = stem;
+		r.gba = true;
+		return r;
+	}
+	Cartridge probe;
+	if (!probe.load(path))
+		return std::nullopt;
+	const std::string stem_pretty = pretty_from_stem(stem);
+	r.title = stem_pretty.empty() ? stem : stem_pretty;
+	r.cgb = is_cgb_mode(probe.hardware_mode());
+	return r;
+}
+
 std::vector<GUIConsole::RomEntry> GameBoy::scan_rom_folder(const std::string &folder)
 {
 	std::vector<GUIConsole::RomEntry> entries;
@@ -740,6 +890,7 @@ void GameBoy::set_volume(float v)
 	apu.set_master_volume(settings.volume);
 	// GBA has its own audio stream; the slider/wheel must reach it too.
 	gba_.audio().set_master_volume(settings.volume);
+	renderer.flash_volume(settings.volume);
 }
 
 void GameBoy::apply_profile_name()
@@ -772,6 +923,37 @@ void GameBoy::refresh_controller_names()
 	gui_console.setDeviceOptions(controller_names_, gui_console.selectedDevice());
 }
 
+// Pushes the current display settings into the live systems. Split out of
+// apply_video_settings() (which also saves) because the per-game overlay
+// needs the push without the write.
+void GameBoy::push_display_settings()
+{
+	renderer.setVideoFilter(static_cast<VideoFilter>(settings.video_filter));
+	renderer.setLcdGrid(settings.lcdGridDepth());
+	apu.set_master_volume(settings.volume);
+	gba_.audio().set_master_volume(settings.volume);
+	if (rom_loaded_ && !gba_mode_)
+		ppu.set_dmg_palette(settings.palette);
+}
+
+void GameBoy::apply_game_override_to_systems()
+{
+	push_display_settings();
+}
+
+// Drops the per-game overlay so the settings panel edits the GLOBAL config
+// for the rest of the session. A per-game file is meant to be the game's
+// own default, not a lock: without this, dragging the volume slider while
+// the panel was open would appear to do nothing (the next load would restore
+// the file's value) and the user's change would be lost.
+void GameBoy::leave_game_override()
+{
+	if (!settings.game.active)
+		return;
+	settings.clear_game_override();
+	push_display_settings();
+}
+
 void GameBoy::apply_video_settings()
 {
 	renderer.setVideoFilter(static_cast<VideoFilter>(settings.video_filter));
@@ -782,8 +964,7 @@ void GameBoy::apply_video_settings()
 void GameBoy::sync_input_from_settings()
 {
 	for (unsigned i = 0; i < kPadButtonCount; ++i) {
-		input_.setKeyBinding(static_cast<PadButton>(i),
-		                    Binding::makeKey(settings.key_map[i]));
+		input_.setKeyBinding(static_cast<PadButton>(i), Binding::makeKey(settings.key_map[i]));
 		input_.setPadBinding(static_cast<PadButton>(i), settings.pad_map[i]);
 		input_.setPadBinding2(static_cast<PadButton>(i), settings.pad_map_alt[i]);
 	}
@@ -871,13 +1052,12 @@ void GameBoy::dispatch_settings_hit(const GUIConsole::SettingsHit &hit)
 			}
 		} else if (hit.index == nprof) {
 			gui_console.start_text_entry(GUIConsole::TextPurpose::NewProfile, "New profile name",
-										  std::string(), -1);
+										 std::string(), -1);
 			SDL_StartTextInput(window);
 		} else if (hit.index == nprof + 1) {
 			// Default keeps its name, so there is nothing to rename.
 			if (settings.active_profile > 0) {
-				gui_console.start_text_entry(GUIConsole::TextPurpose::RenameProfile,
-											 "Profile name",
+				gui_console.start_text_entry(GUIConsole::TextPurpose::RenameProfile, "Profile name",
 											 settings.profileName(settings.active_profile),
 											 settings.active_profile);
 				SDL_StartTextInput(window);
@@ -930,7 +1110,7 @@ void GameBoy::dispatch_settings_hit(const GUIConsole::SettingsHit &hit)
 		// when a controller is selected, and restores the factory keyboard
 		// layout when the keyboard is.
 		if (gui_console.deviceIsController() ? gui_console.applyAutoMap(input_)
-										    : gui_console.applyKeyboardDefaults())
+											 : gui_console.applyKeyboardDefaults())
 			sync_input_from_settings();
 		break;
 	default:
@@ -977,8 +1157,16 @@ void GameBoy::handle_menu_key(SDL_Scancode sc, bool pressed)
 	case SDL_SCANCODE_R:
 		rescan_roms();
 		break;
-	default:
+	default: {
+		// Recent quick-launch: 1-8 plays the Nth recent ROM (menu only;
+		// profile naming consumes its own keys before this is reached).
+		if (pressed && sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_8) {
+			const size_t i = static_cast<size_t>(sc - SDL_SCANCODE_1);
+			if (i < settings.recent_roms.size())
+				load_rom(settings.recent_roms[i]);
+		}
 		break;
+	}
 	}
 }
 
@@ -1017,15 +1205,18 @@ void GameBoy::run()
 		handle_events();
 		if (!running || request_stop)
 			break;
+		push_imgui_stats();
 		if (!rom_loaded_) {
 			// Menu mode: no emulation, just draw the ROM list at ~60Hz.
 			// SDL_DelayNS (not SDL_Delay): millisecond sleeps overshoot by
 			// ~1ms per frame, which compounds into visible audio drift.
 			const f64 frame_start = SDL_GetTicks() / 1000.0;
 			renderer.render_menu(gui_console);
+			// Menu: nothing is emulated, so the device buffer is not a clock
+			// here (the PSG is idle). Keep the nominal 60Hz floor.
 			const f64 elapsed = SDL_GetTicks() / 1000.0 - frame_start;
 			const f64 target = 1.0 / 60.0;
-			if (elapsed < target)
+			if (!fast_forward() && elapsed < target)
 				SDL_DelayNS(static_cast<u64>((target - elapsed) * 1e9));
 			last_time = SDL_GetTicks() / 1000.0;
 			continue;
@@ -1050,8 +1241,9 @@ void GameBoy::run()
 										gba::GbaPpu::kHeight);
 				} else {
 					// Use GUI-aware rendering (GBC body + bezel + screen) like GB/GBC
-					renderer.render_gba_with_gui(gba_.ppu().frame().pixels.data(), gba::GbaPpu::kWidth,
-												 gba::GbaPpu::kHeight, gui_console);
+					renderer.render_gba_with_gui(gba_.ppu().frame().pixels.data(),
+												 gba::GbaPpu::kWidth, gba::GbaPpu::kHeight,
+												 gui_console);
 				}
 				gba_.ppu().clearFrameReady();
 				frame_count++;
@@ -1059,6 +1251,12 @@ void GameBoy::run()
 				if (gba_.cartridge().hasSave() && !last_rom_path_.empty() &&
 					frame_count % 600 == 0) {
 					gba_.cartridge().saveToFile(last_rom_path_ + ".sav");
+				}
+				// The GPIO RTC offset is tiny and only changes when a game
+				// sets the clock, but a crash must not lose it either.
+				if (gba_.cartridge().hasRtc() && !last_rom_path_.empty() &&
+					frame_count % 600 == 0) {
+					gba_.cartridge().saveRtc(last_rom_path_ + ".rtc");
 				}
 			}
 		} else {
@@ -1074,26 +1272,119 @@ void GameBoy::run()
 				}
 				ppu.clear_frame_ready();
 				frame_count++;
+				update_rumble();
 				// Autosave battery RAM every ~10s so progress survives a crash
 				// or kill (shutdown also saves). Cheap: a few KB write.
 				if (cartridge.has_battery() && !last_rom_path_.empty() && frame_count % 600 == 0) {
 					cartridge.save_ram(last_rom_path_ + ".sav");
 				}
+				if (cartridge.has_rtc() && !last_rom_path_.empty() && frame_count % 600 == 0) {
+					cartridge.save_rtc(last_rom_path_ + ".rtc");
+				}
 			}
 		}
-		// Pace to ~60Hz (59.7fps real hardware; 60 is close enough for now).
-		// SDL_DelayNS: millisecond sleeps overshoot ~1ms/frame, compounding
-		// into audio starvation crackle and a permanent ~6% slowdown.
+		// Audio-clock pacing (include/gb/audio_sync.h). The device buffer
+		// is the master clock and the video follows it: wait only while too
+		// much audio is buffered, and never wait at all when the device is
+		// running low. That is what removes the fixed-sleep crackle - a
+		// sleep that overshoots by a millisecond used to drain the buffer
+		// and the next put underran. The ±1% resample ratio absorbs the
+		// remaining clock difference instead of dropping frames.
+		// Fast-forward skips the pacing entirely (CPU-bound, audio crackles).
 		const f64 elapsed = SDL_GetTicks() / 1000.0 - frame_start;
-		const f64 target = 1.0 / 60.0;
-		if (elapsed < target)
-			SDL_DelayNS(static_cast<u64>((target - elapsed) * 1e9));
+		const f64 floor_delay = 1.0 / 60.0 - elapsed;
+		const u32 produced = produced_audio();
+		f64 delay = fast_forward() ? 0.0 : audio_sync_.pace(queued_audio(), produced);
+		// The pacer's drift correction goes to whichever core is running
+		// (GBA mixes at the output rate, GB at 8x, so each applies it its own
+		// way - see set_resample_ratio on both).
+		if (gba_mode_)
+			gba_.audio().set_resample_ratio(audio_sync_.resample_ratio());
+		else
+			apu.set_resample_ratio(audio_sync_.resample_ratio());
+		if (delay < 0.0)
+			delay = 0.0;
+		// Even with a starved device, cap the wait at the nominal frame
+		// time: this is what keeps video from running away when audio is
+		// disabled entirely (no device -> paced frames, not a turbo loop).
+		if (delay < floor_delay)
+			delay = floor_delay;
+		if (delay > 0.0)
+			SDL_DelayNS(static_cast<u64>(delay * 1e9));
 		last_time = SDL_GetTicks() / 1000.0;
 	}
 }
 
+u32 GameBoy::produced_audio()
+{
+	const u64 total = gba_mode_ ? gba_.audio().frames_emitted() : apu.frames_emitted();
+	const u32 produced = static_cast<u32>(total - audio_produced_);
+	audio_produced_ = total;
+	return produced;
+}
+
+int GameBoy::queued_audio() const
+{
+	// queued() is a const query on both cores; the const core accessor is
+	// what forces the const_cast here.
+	return gba_mode_ ? const_cast<gba::GameBoyAdvance &>(gba_).audio().queued() : apu.queued();
+}
+
+void GameBoy::open_rumble()
+{
+	// First controller that can rumble wins. SDL_RumbleGamepad needs no
+	// haptic-effect objects, so a pad that supports it is all that is
+	// required; a failure here is silent (no motor, no rumble).
+	int count = 0;
+	SDL_JoystickID *ids = SDL_GetJoysticks(&count);
+	if (ids == nullptr)
+		return;
+	for (int i = 0; i < count && rumble_pad_ == nullptr; i++) {
+		SDL_Gamepad *pad = SDL_OpenGamepad(ids[i]);
+		if (pad == nullptr)
+			continue;
+		// Probe with a zero-length rumble: it either succeeds or the pad
+		// has no motor, without leaving anything playing.
+		if (SDL_RumbleGamepad(pad, 0, 0, 0)) {
+			rumble_pad_ = pad;
+		} else {
+			SDL_CloseGamepad(pad);
+		}
+	}
+	SDL_free(ids);
+}
+
+void GameBoy::stop_rumble()
+{
+	rumble_on_ = false;
+	if (rumble_pad_ != nullptr)
+		SDL_RumbleGamepad(rumble_pad_, 0, 0, 0);
+}
+
+void GameBoy::update_rumble()
+{
+	if (rumble_pad_ == nullptr)
+		return;
+	// Only a cartridge with a motor drives this: a GBA game or a plain
+	// MBC5 cart must never leave a pad buzzing.
+	const bool want = !gba_mode_ && cartridge.has_rumble() && cartridge.rumble();
+	if (want == rumble_on_)
+		return;
+	rumble_on_ = want;
+	// Full strength, indefinitely (duration 0): the motor bit is binary on
+	// the bus, so there is nothing to modulate.
+	SDL_RumbleGamepad(rumble_pad_, want ? 0xFFFF : 0, want ? 0xFFFF : 0, 0);
+}
+
 void GameBoy::shutdown()
 {
+	// Stop the motor before the pad handle goes away, or a game that left it
+	// on would keep buzzing after the window closes.
+	stop_rumble();
+	if (rumble_pad_ != nullptr) {
+		SDL_CloseGamepad(rumble_pad_);
+		rumble_pad_ = nullptr;
+	}
 	flush_active_save();
 	settings.save("");
 	apu.close_audio();
@@ -1111,6 +1402,9 @@ void GameBoy::handle_events()
 {
 	SDL_Event ev;
 	while (SDL_PollEvent(&ev)) {
+		// The ImGui overlay tracks input state for future panels; the
+		// debug window itself is display-only and captures nothing.
+		renderer.imgui_event(ev);
 		if (ev.type == SDL_EVENT_QUIT) {
 			running = false;
 			return;
@@ -1158,10 +1452,10 @@ void GameBoy::handle_events()
 			int my = static_cast<int>(ev.button.y);
 			GB4ME_ITRACE("input: mousedown %d,%d clicks=%u win=%dx%d rom=%d gba=%d panel=%d "
 						 "menu=%d full=%d awaiting=%d\n",
-					mx, my, ev.button.clicks, gui_console.window_w(), gui_console.window_h(),
-					(int) rom_loaded_, (int) gba_mode_, (int) show_settings_panel,
-					(int) !rom_loaded_, (int) gui_console.fullscreen_game(),
-					(int) gui_console.awaiting_input());
+						 mx, my, ev.button.clicks, gui_console.window_w(), gui_console.window_h(),
+						 (int) rom_loaded_, (int) gba_mode_, (int) show_settings_panel,
+						 (int) !rom_loaded_, (int) gui_console.fullscreen_game(),
+						 (int) gui_console.awaiting_input());
 			// Full-window game fill toggle: double-click screen ↔ fill window
 			// Only when a ROM is running and no modal is open.
 			if (rom_loaded_ && !show_settings_panel && !gui_console.awaiting_input()) {
@@ -1211,6 +1505,7 @@ void GameBoy::handle_events()
 			}
 			// OPEN button (file dialog) works in menu and in game.
 			if (gui_console.hit_open(mx, my)) {
+				GB4ME_ITRACE("input: open button -> file dialog\n");
 				open_file_dialog();
 				continue;
 			}
@@ -1218,7 +1513,8 @@ void GameBoy::handle_events()
 			if (gui_console.hit_settings(mx, my)) {
 				show_settings_panel = !show_settings_panel;
 				gui_console.set_show_settings(show_settings_panel);
-				// log removed
+				leave_game_override();
+				GB4ME_ITRACE("input: gear -> panel %d\n", (int) show_settings_panel);
 				continue;
 			}
 			if (!rom_loaded_) {
@@ -1271,8 +1567,7 @@ void GameBoy::handle_events()
 			if (auto hit = gui_console.hit_test(mx, my); hit) {
 				GB4ME_ITRACE("input: button %d -> arm remap\n", (int) *hit);
 				gui_console.set_button_pressed(*hit, true);
-				gui_console.start_binding(
-					static_cast<PadButton>(Settings::shared_key_index(*hit)));
+				gui_console.start_binding(static_cast<PadButton>(Settings::shared_key_index(*hit)));
 				rearmed = true;
 				continue;
 			}
@@ -1297,6 +1592,7 @@ void GameBoy::handle_events()
 			joypad.release_all();
 			gba_.keypad().releaseAll();
 			input_.releaseAll();
+			ff_held_ = false;
 		}
 		// Typed characters reach us as text events (layout/IME aware), which
 		// is what the profile-naming prompt consumes.
@@ -1309,11 +1605,10 @@ void GameBoy::handle_events()
 		// armed, the binding to store. A captured controller input must not
 		// also press the game.
 		if (ev.type == SDL_EVENT_GAMEPAD_ADDED || ev.type == SDL_EVENT_GAMEPAD_REMOVED ||
-		    ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || ev.type == SDL_EVENT_GAMEPAD_BUTTON_UP ||
-		    ev.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
+			ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || ev.type == SDL_EVENT_GAMEPAD_BUTTON_UP ||
+			ev.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
 			input_.handleEvent(ev);
-			if (ev.type == SDL_EVENT_GAMEPAD_ADDED ||
-			    ev.type == SDL_EVENT_GAMEPAD_REMOVED) {
+			if (ev.type == SDL_EVENT_GAMEPAD_ADDED || ev.type == SDL_EVENT_GAMEPAD_REMOVED) {
 				gui_console.refreshControllers(input_);
 				refresh_controller_names();
 				gui_console.rebuild_settings_cells();
@@ -1359,14 +1654,13 @@ void GameBoy::handle_events()
 			// context changed between down and up (e.g. a remap completing).
 			{
 				const SDL_Scancode sc = ev.key.scancode;
-				const bool reserved = sc == SDL_SCANCODE_S || sc == SDL_SCANCODE_O ||
-				                      sc == SDL_SCANCODE_E || sc == SDL_SCANCODE_P ||
-				                      sc == SDL_SCANCODE_F || sc == SDL_SCANCODE_F11 ||
-				                      sc == SDL_SCANCODE_MINUS || sc == SDL_SCANCODE_EQUALS ||
-				                      sc == SDL_SCANCODE_ESCAPE;
+				const bool reserved =
+					sc == SDL_SCANCODE_S || sc == SDL_SCANCODE_O || sc == SDL_SCANCODE_E ||
+					sc == SDL_SCANCODE_P || sc == SDL_SCANCODE_F || sc == SDL_SCANCODE_F11 ||
+					sc == SDL_SCANCODE_F3 || sc == SDL_SCANCODE_TAB || sc == SDL_SCANCODE_MINUS ||
+					sc == SDL_SCANCODE_EQUALS || sc == SDL_SCANCODE_ESCAPE;
 				const bool modal = !rom_loaded_ || show_settings_panel ||
-				                   gui_console.awaiting_input() ||
-				                   gui_console.text_entry_active();
+								   gui_console.awaiting_input() || gui_console.text_entry_active();
 				input_.setSuppressed(sc, pressed && (reserved || modal));
 			}
 			// Profile-naming prompt owns the keyboard outright: Enter accepts,
@@ -1402,16 +1696,28 @@ void GameBoy::handle_events()
 					continue; // do not also send as joypad press
 				}
 			}
-			GB4ME_ITRACE("input: key %d %s\n", (int) ev.key.scancode,
-					pressed ? "down" : "up");
+			GB4ME_ITRACE("input: key %d %s\n", (int) ev.key.scancode, pressed ? "down" : "up");
 			// Fullscreen toggle (Esc exits fullscreen first, F/F11 toggles).
 			// Now works for both GB and GBA modes.
-			if (pressed && (ev.key.scancode == SDL_SCANCODE_F || ev.key.scancode == SDL_SCANCODE_F11)) {
+			if (pressed &&
+				(ev.key.scancode == SDL_SCANCODE_F || ev.key.scancode == SDL_SCANCODE_F11)) {
 				if (rom_loaded_ && !show_settings_panel && !gui_console.awaiting_input()) {
 					gui_console.toggle_fullscreen_game();
 					// log removed
 					continue;
 				}
+			}
+			// Dear ImGui debug overlay toggle (works in menu and in game).
+			if (pressed && ev.key.scancode == SDL_SCANCODE_F3) {
+				renderer.toggle_imgui();
+				continue;
+			}
+			// Fast-forward while held (Tab): skip frame pacing for hurrying
+			// through slow intros/grinding (audio may crackle — the standard FF
+			// tradeoff). Reserved above, so it never drives the game.
+			if (!gui_console.text_entry_active() && ev.key.scancode == SDL_SCANCODE_TAB) {
+				ff_held_ = pressed;
+				continue;
 			}
 			// Global shortcuts — Esc returns to menu, never quits app (use window X to quit)
 			if (pressed && ev.key.scancode == SDL_SCANCODE_ESCAPE) {
@@ -1436,6 +1742,7 @@ void GameBoy::handle_events()
 			if (pressed && ev.key.scancode == SDL_SCANCODE_S) {
 				show_settings_panel = !show_settings_panel;
 				gui_console.set_show_settings(show_settings_panel);
+				leave_game_override();
 				// log removed
 				continue;
 			}
@@ -1463,6 +1770,7 @@ void GameBoy::handle_events()
 					settings.volume = std::min(1.0f, settings.volume + 0.1f);
 				apu.set_master_volume(settings.volume);
 				gba_.audio().set_master_volume(settings.volume);
+				renderer.flash_volume(settings.volume);
 				settings.save("");
 				// log removed
 				continue;
@@ -1495,6 +1803,9 @@ void GameBoy::step_frame()
 	// (recommended model: keep PPU/APU fixed, CPU variable per AGENTS.md).
 	// CPU double means 35112 M per frame, PPU still 17556 M. We achieve this
 	// by stepping CPU at double rate but feeding PPU/Timer/APU at half rate.
+	// Note: the timer compensates internally (Timer::set_double_speed, wired
+	// in do_speed_switch), so DIV/TIMA still run at double wall-rate per Pan
+	// Docs while PPU/APU stay fixed.
 	constexpr u32 kMCyclesPerFrame = CYCLES_PER_FRAME / 4;
 	const u32 cpu_target = cpu.double_speed ? kMCyclesPerFrame * 2 : kMCyclesPerFrame;
 	u32 cpu_done = 0;
@@ -1526,6 +1837,9 @@ void GameBoy::step_frame()
 	if (ppu_done < kMCyclesPerFrame) {
 		update_timers(kMCyclesPerFrame - ppu_done);
 	}
+	// CPU cycles executed this frame (what the load meter counts: the PPU
+	// tail above is the same work, not extra emulation).
+	emu_tcycles_ += static_cast<u64>(cpu_done) * 4;
 }
 
 void GameBoy::step_gba_frame()
@@ -1539,6 +1853,7 @@ void GameBoy::step_gba_frame()
 	while (!gba_.ppu().frameReady() && gba_.tick() - start < 1200000) {
 		gba_.step(4096);
 	}
+	emu_tcycles_ += gba_.tick() - start;
 }
 
 void GameBoy::update_timers(u32 cycles)

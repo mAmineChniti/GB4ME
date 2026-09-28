@@ -98,9 +98,10 @@ class Cartridge
 	void writeSave(u32 addr, u8 value);
 	// EEPROM serial engine (0x0D000000 DMA path). Valid only when
 	// saveType() is an EEPROM variant; otherwise no-ops/returns ready.
+	// `cycle` is the core tick the busy window is measured against.
 	bool isEeprom() const;
-	uint16_t eepromDmaRead() const;
-	void eepromDmaWrite(uint16_t value, uint32_t remaining);
+	uint16_t eepromDmaRead(u64 cycle) const;
+	void eepromDmaWrite(uint16_t value, uint32_t remaining, u64 cycle);
 	// Cart GPIO + RTC (0x080000C4-0x080000C8, Pokemon R/S/E, Boktai, ...).
 	// The bus routes that window here exactly when hasGpio() holds.
 	bool hasGpio() const
@@ -114,6 +115,20 @@ class Cartridge
 	const GpioRtc &gpio() const
 	{
 		return gpio_;
+	}
+	// GPIO RTC wall-clock persistence (`<rom>.rtc` sidecar, same idea as
+	// the GB MBC3 clock). No-op on carts without an RTC.
+	bool hasRtc() const
+	{
+		return gpio_.present();
+	}
+	void saveRtc(const std::string &path) const
+	{
+		gpio_.saveToFile(path);
+	}
+	void loadRtc(const std::string &path)
+	{
+		gpio_.loadFromFile(path);
 	}
 	bool hasSave() const
 	{
