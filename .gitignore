@@ -97,7 +97,7 @@ conaninfo.txt
 graphInfo.json
 
 # Testing
-test_*
+/test_*
 my_project/
 
 # Local third-party reference copies (re-fetchable, never committed)
