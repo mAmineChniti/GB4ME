@@ -63,6 +63,38 @@ class GpioRtc
 		return offset_;
 	}
 
+	// WarioWare Twisted Z-axis gyro (GBATEK "GBA Cart Gyro Sensor"): an
+	// ADC bit-banged over GPIO0 (start conversion), GPIO1 (serial clock),
+	// GPIO2 (serial data). Each conversion yields 4 dummy zeros then 12
+	// data bits MSB-first. The sample centers at 0x800; the frontend
+	// drives tilt_ with the tilt keys (COMMA/PERIOD) while a gyro cart
+	// runs. Rumble (GPIO3) is not modelled.
+	void setGyro(bool present)
+	{
+		gyro_ = present;
+	}
+	bool gyro() const
+	{
+		return gyro_;
+	}
+	// Tilt velocity from the frontend (-2048..+2047, full ADC scale);
+	// sampled at each conversion start, so games see a steady offset while
+	// held. Test hook doubles as the frontend entry point.
+	void setTilt(int tilt)
+	{
+		tilt_ = tilt < -2048 ? -2048 : (tilt > 2047 ? 2047 : tilt);
+	}
+	int tilt() const
+	{
+		return tilt_;
+	}
+	// Current 12-bit sample (center + tilt, clamped). Test hook.
+	unsigned gyroSample() const
+	{
+		const int v = 0x800 + tilt_;
+		return static_cast<unsigned>(v < 0 ? 0 : (v > 0xFFF ? 0xFFF : v));
+	}
+
 	void save(StateBuffer &out) const;
 	void load(const StateBuffer &in);
 
@@ -109,6 +141,16 @@ class GpioRtc
 	u8 rtc_write_len_ = 0;
 	// Signed seconds added to host time; 0 = "follow the host clock".
 	std::int64_t offset_ = 0;
+	// Twisted gyro ADC state (edge latches + shift position). tilt_ is
+	// live frontend input, so it is deliberately excluded from save/load.
+	bool gyro_ = false;
+	u16 adc_shift_ = 0; // Latched 12-bit sample at conversion start.
+	u8 adc_pos_ = 0;    // Clock edges consumed (4 dummies, then 12 data).
+	bool adc_p0_ = false, adc_p1_ = false;
+	int tilt_ = 0;
+	// Edge-detect P0/P1 in pin_state_ after a data write and drive P2
+	// from the ADC (input direction only).
+	void updateGyroAdc();
 };
 
 } // namespace gba

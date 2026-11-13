@@ -1,8 +1,13 @@
 #include "gb/gui_console.h"
 #include <SDL3/SDL.h>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 
 namespace gb
@@ -234,9 +239,12 @@ bool Settings::save(const std::string &path)
 	f << "video_scale=" << video_scale << "\n";
 	f << "video_filter=" << video_filter << "\n";
 	f << "lcd_grid=" << lcd_grid << "\n";
+	f << "ghosting=" << ghosting << "\n";
 	f << "palette=" << palette << "\n";
 	f << "hardware_mode=" << hardware_mode << "\n";
 	f << "console_color=" << static_cast<int>(console_color) << "\n";
+	f << "body_skin=" << body_skin << "\n";
+	f << "theme=" << theme << "\n";
 	for (size_t i = 0; i < recent_roms.size() && i < Settings::kMaxRecent; i++)
 		f << "recent" << i << "=" << recent_roms[i] << "\n";
 	for (int i = 0; i < 10; i++)
@@ -409,6 +417,10 @@ bool Settings::load(const std::string &path)
 			const int v2 = safe_index(v);
 			if (v2 >= 0 && v2 <= kLcdGridMax)
 				lcd_grid = v2;
+		} else if (k == "ghosting") {
+			const int v2 = safe_index(v);
+			if (v2 >= 0 && v2 <= kGhostMax)
+				ghosting = v2;
 		} else if (k == "palette") {
 			const int p = safe_index(v);
 			if (p >= 0 && p <= 4)
@@ -420,6 +432,13 @@ bool Settings::load(const std::string &path)
 			const int c = safe_index(v);
 			if (c >= 0 && c <= static_cast<int>(ConsoleColor::ClearPurple))
 				console_color = static_cast<ConsoleColor>(c);
+		} else if (k == "body_skin") {
+			if (!v.empty())
+				body_skin = v; // unknown values fall back at resolve time
+		} else if (k == "theme") {
+			const int t = safe_index(v);
+			if (t == 0 || t == 1)
+				theme = t;
 		} else if (k.rfind("recent", 0) == 0) {
 			// recentN=path, N = recency rank. Staged and compacted below so
 			// out-of-order or sparse lines still load most-recent-first.
@@ -437,7 +456,7 @@ bool Settings::load(const std::string &path)
 			// padN / altN: packed controller bindings (kind<<16 | code).
 			const bool alt = k.rfind("alt", 0) == 0;
 			const int idx = safe_index(k.substr(3));
-			const int packed = std::atoi(v.c_str());
+			const int packed = safe_index(v);
 			if (idx >= 0 && idx < static_cast<int>(kPadButtonCount) && packed >= 0) {
 				const Binding b = Binding::unpack(packed);
 				if (alt)
@@ -475,7 +494,7 @@ bool Settings::load(const std::string &path)
 			} else if (fld.rfind("pad", 0) == 0 || fld.rfind("alt", 0) == 0) {
 				const bool alt = fld.rfind("alt", 0) == 0;
 				const int idx = safe_index(fld.substr(3));
-				const int packed = std::atoi(v.c_str());
+				const int packed = safe_index(v);
 				if (idx >= 0 && idx < static_cast<int>(kPadButtonCount) && packed >= 0) {
 					const Binding b = Binding::unpack(packed);
 					if (alt)
@@ -597,6 +616,7 @@ bool Settings::load_game_override(const std::string &rom_path)
 	take_int("video_filter", video_filter, over.video_filter, game.video_filter,
 			 game.has_video_filter);
 	take_int("lcd_grid", lcd_grid, over.lcd_grid, game.lcd_grid, game.has_lcd_grid);
+	take_int("ghosting", ghosting, over.ghosting, game.ghosting, game.has_ghosting);
 	take_int("palette", palette, over.palette, game.palette, game.has_palette);
 	if (over.has_key("console_color")) {
 		game.console_color = static_cast<int>(console_color);
@@ -615,8 +635,8 @@ bool Settings::load_game_override(const std::string &rom_path)
 	}
 	// A file with only unrecognised keys is not an overlay.
 	game.active = game.has_volume || game.has_video_scale || game.has_video_filter ||
-				  game.has_lcd_grid || game.has_palette || game.has_console_color ||
-				  game.has_hardware_mode;
+				  game.has_lcd_grid || game.has_ghosting || game.has_palette ||
+				  game.has_console_color || game.has_hardware_mode;
 	return game.active;
 }
 
@@ -634,6 +654,8 @@ void Settings::clear_game_override()
 		video_filter = game.video_filter;
 	if (game.has_lcd_grid)
 		lcd_grid = game.lcd_grid;
+	if (game.has_ghosting)
+		ghosting = game.ghosting;
 	if (game.has_palette)
 		palette = game.palette;
 	if (game.has_console_color)
@@ -670,14 +692,160 @@ u32 GUIConsole::color_for_console(ConsoleColor c)
 	}
 }
 
+u32 GUIConsole::color_for_console_dim(ConsoleColor c)
+{
+	switch (c) {
+	case ConsoleColor::Purple:
+		return 0xFF4A3266;
+	case ConsoleColor::Green:
+		return 0xFF2E6B4A;
+	case ConsoleColor::Blue:
+		return 0xFF2E4A6B;
+	case ConsoleColor::Yellow:
+		return 0xFF6B6B2E;
+	case ConsoleColor::ClearPurple:
+		return 0xFF5F4A86;
+	default:
+		return 0xFF4A3266;
+	}
+}
+
+const char *GUIConsole::console_color_name(ConsoleColor c)
+{
+	switch (c) {
+	case ConsoleColor::Purple:
+		return "Purple";
+	case ConsoleColor::Green:
+		return "Green";
+	case ConsoleColor::Blue:
+		return "Blue";
+	case ConsoleColor::Yellow:
+		return "Yellow";
+	case ConsoleColor::ClearPurple:
+		return "Clear";
+	default:
+		return "Purple";
+	}
+}
+
+// The bundled skins. GBC geometry is the long-measured set from
+// update_layout()/rebuild_buttons (asset pixels / 1370 x 2430);
+// button order is Up Down Left Right A B Select Start.
+static const BodySkin kBodySkinTable[kBodySkins] = {{
+	"gbc",
+	"Game Boy Color",
+	"gbc_body.png",
+	75.0f / 133.0f,
+	{0.21314f, 0.10041f, 0.57080f, 0.30247f}, // bezel (LCD glass)
+	{0.09489f, 0.59259f, 0.24453f, 0.14815f}, // dpad enclosing area
+	{0.797f, 0.100f, 0.080f, 0.046f},         // settings corner
+	{0.123f, 0.100f, 0.080f, 0.046f},         // open corner
+	{
+		{0.17810f, 0.59259f, 0.08832f, 0.07202f}, // Up
+		{0.17810f, 0.66872f, 0.08832f, 0.07202f}, // Down
+		{0.09854f, 0.64000f, 0.11460f, 0.05700f}, // Left
+		{0.22044f, 0.64000f, 0.11533f, 0.05700f}, // Right
+		{0.79416f, 0.61687f, 0.11095f, 0.06337f}, // A
+		{0.61971f, 0.64856f, 0.10511f, 0.06420f}, // B
+		{0.36131f, 0.81481f, 0.11679f, 0.02469f}, // Select
+		{0.50000f, 0.81481f, 0.11679f, 0.02469f}, // Start
+	},
+	{false, false, false, false, true, true, false, false},
+	{
+		{0.020f, 0.012f, 0.130f, 0.055f}, // L (overlay pill)
+		{0.850f, 0.012f, 0.130f, 0.055f}, // R (overlay pill)
+	},
+}};
+
+const BodySkin *body_skin_by_id(const char *id)
+{
+	if (id == nullptr)
+		return nullptr;
+	for (int i = 0; i < kBodySkins; i++) {
+		if (std::strcmp(kBodySkinTable[i].id, id) == 0)
+			return &kBodySkinTable[i];
+	}
+	return nullptr;
+}
+
+const BodySkin *body_skin_at(int index)
+{
+	if (index < 0 || index >= kBodySkins)
+		return nullptr;
+	return &kBodySkinTable[index];
+}
+
+const BodySkin *resolve_body_skin(const char *setting, bool gba_mode)
+{
+	(void) gba_mode; // second photo (gba) not bundled yet; Auto is GBC.
+	if (setting != nullptr && std::strcmp(setting, "Auto") != 0) {
+		if (const BodySkin *named = body_skin_by_id(setting))
+			return named;
+	}
+	return &kBodySkinTable[0]; // GBC default + unknown fallback.
+}
+
+std::string GUIConsole::body_skin_value() const
+{
+	const std::string setting = settings_ ? settings_->body_skin : "Auto";
+	const BodySkin *skin = active_skin();
+	if (setting == "Auto")
+		return std::string("Auto (") + skin->name + ")";
+	return std::string(skin->name);
+}
+
+static const UiTheme kUiThemeDark = {
+	0xFF2A2A33, // panel_outer (legacy)
+	0xFF16161C, // panel_inner (legacy)
+	0xFF23232D, // row_bg (legacy)
+	0xFF32323F, // pill_bg (legacy)
+	0xFFECECF2, // text (legacy)
+	0xFF8E8EA3, // text_mute (contrast-audit floor)
+	0xFF4FB477, // ok (legacy green)
+	0xFF101418, // menu_bg (game-screen menu ground)
+	0xFF22252B, // menu_row
+	0xFF3A3A8F, // menu_row_sel
+	0xFF2E3190, // menu_row_sel_edge
+	0xFFFFFFFF, // menu_text
+	0xFFD8D8D8, // menu_text_dim
+	0xFFAAAAAA, // menu_hint
+};
+static const UiTheme kUiThemeLight = {
+	0xFFF0F0F4, // panel_outer
+	0xFFFFFFFF, // panel_inner
+	0xFFE8E8EE, // row_bg
+	0xFFDCDCE4, // pill_bg
+	0xFF16161C, // text
+	0xFF5A5A66, // text_mute
+	0xFF2E7D4F, // ok (darkened for contrast on light fills)
+	0xFFE9E9EE, // menu_bg
+	0xFFDCDCE2, // menu_row
+	0xFFB9B9F2, // menu_row_sel
+	0xFF4A4A9A, // menu_row_sel_edge
+	0xFF14141A, // menu_text
+	0xFF3A3A44, // menu_text_dim
+	0xFF55555F, // menu_hint
+};
+
+const UiTheme &ui_theme_dark()
+{
+	return kUiThemeDark;
+}
+
+const UiTheme &ui_theme_light()
+{
+	return kUiThemeLight;
+}
+
 void GUIConsole::update_layout(int window_w, int window_h)
 {
 	window_w_ = window_w;
 	window_h_ = window_h;
-	// Body aspect 75:133 (W:H =0.5639). Fit centered with letterbox.
-	// Matches assets/gbc_body.png exactly (1370x2430 crop of the Evan-Amos
-	// public-domain GBC photo), so fractional photo coordinates map 1:1.
-	const float body_aspect = 75.0f / 133.0f;
+	// Body aspect from the active photo skin (GBC default). Fractional
+	// photo coordinates map 1:1 only against the skin they were measured
+	// from, so every rect below comes from the same skin entry.
+	const BodySkin *skin = active_skin();
+	const float body_aspect = skin->aspect;
 	const float win_aspect = static_cast<float>(window_w) / window_h;
 	float body_w = 0, body_h = 0;
 	if (win_aspect > body_aspect) {
@@ -692,17 +860,18 @@ void GUIConsole::update_layout(int window_w, int window_h)
 	body_rect_ = {body_x, body_y, body_w, body_h};
 
 	// Feature rects as fractions of the body rect, calibrated against the
-	// photo asset (see tools notes: LCD glass, D-pad cross, A/B disks,
-	// SELECT/START pills measured in asset pixels / 1370 x 2430).
+	// active skin's photo asset (the GBC numbers below live in the skin
+	// table now; LCD glass, D-pad cross, A/B disks, SELECT/START pills were
+	// measured in asset pixels / 1370 x 2430).
 	const auto F = [&](float fx, float fy, float fw, float fh) -> Rect {
 		return {body_x + fx * body_w, body_y + fy * body_h, fw * body_w, fh * body_h};
 	};
-	// Game screen: the photo's LCD glass, measured from the asset pixels
-	// (1370x2430). Black-bezel to gray-LCD transitions sit at x 292/1073 and
-	// y 244/978 (stable across scanlines), i.e. a 782x735 glass rect.
-	// The old rect (330-1036 x 264-902) was inset ~40px left/right and
-	// ~20/76px top/bottom, leaving gray photo borders around the game.
-	bezel_rect_ = F(0.21314f, 0.10041f, 0.57080f, 0.30247f);
+	const auto SF = [&](BodySkinRect r) -> Rect { return F(r.x, r.y, r.w, r.h); };
+	// Game screen: the photo's LCD glass. The GBC glass (black-bezel to
+	// gray-LCD transitions at x 292/1073, y 244/978) is a 782x735 rect;
+	// the old hardcoded rect was inset ~40px left/right, leaving gray
+	// photo borders around the game.
+	bezel_rect_ = SF(skin->bezel);
 	// Fit the 160x144 (10:9) game image inside the glass preserving aspect.
 	// The glass (~1.064) is slightly taller than 10:9 (~1.111), so fit to
 	// the width and letterbox top/bottom (~15 asset px each).
@@ -728,16 +897,14 @@ void GUIConsole::update_layout(int window_w, int window_h)
 		gba_screen_rect_ = {bezel_rect_.x + (gw - sw) * 0.5f, bezel_rect_.y + (gh - sh) * 0.5f, sw,
 							sh};
 	}
-	// D-pad enclosing area (cross + well): x 130-465, y 1440-1800.
-	dpad_rect_ = F(0.09489f, 0.59259f, 0.24453f, 0.14815f);
+	// D-pad enclosing area (cross + well), from the active skin.
+	dpad_rect_ = SF(skin->dpad);
 	// Screen bezel corners: OPEN top-left of the glass, gear top-right.
 	// Both sit on the near-black bezel beside the glass (grey circle +
 	// white glyph read well there). Hit-testing uses these same rects.
-	settings_rect_ = {body_x + body_w * 0.797f, body_y + body_h * 0.100f, body_w * 0.080f,
-					  body_h * 0.046f};
+	settings_rect_ = SF(skin->settings);
 	// OPEN button (file dialog): top-left bezel corner, mirroring the gear.
-	open_rect_ = {body_x + body_w * 0.123f, body_y + body_h * 0.100f, body_w * 0.080f,
-				  body_h * 0.046f};
+	open_rect_ = SF(skin->open);
 
 	rebuild_buttons();
 	rebuild_settings_cells();
@@ -752,23 +919,19 @@ void GUIConsole::rebuild_buttons()
 						 bool circle) {
 		buttons_.push_back({bx + fx * bw, by + fy * bh, fw * bw, fh * bh, name, key, circle});
 	};
-	// D-pad cross arms, re-measured from the asset pixels: vertical bar
-	// x 244-365, horizontal bar y 1555-1694 x 130-460, cross center
-	// ~(307, 1625). Arms stop 10px short of the center so the dead zone is
-	// a tiny 10x10 square.
-	add(0.17810f, 0.59259f, 0.08832f, 0.07202f, "Up", Joypad::Key::Up, false);
-	add(0.17810f, 0.66872f, 0.08832f, 0.07202f, "Down", Joypad::Key::Down, false);
-	add(0.09854f, 0.64000f, 0.11460f, 0.05700f, "Left", Joypad::Key::Left, false);
-	add(0.22044f, 0.64000f, 0.11533f, 0.05700f, "Right", Joypad::Key::Right, false);
-	// A/B disks (circles; hit_test does a radius check). Measured dark
-	// extents: A x 1092-1236 y 1500-1652 (center ~1164, 1576, r ~76),
-	// B x 848-992 y 1576-1732 (center ~920, 1654, r ~75).
-	add(0.79416f, 0.61687f, 0.11095f, 0.06337f, "A", Joypad::Key::A, true);
-	add(0.61971f, 0.64856f, 0.10511f, 0.06420f, "B", Joypad::Key::B, true);
-	// SELECT/START pills: measured extents x 495-655 / 685-845,
-	// y 1980-2040 (centers y ~2010).
-	add(0.36131f, 0.81481f, 0.11679f, 0.02469f, "Select", Joypad::Key::Select, false);
-	add(0.50000f, 0.81481f, 0.11679f, 0.02469f, "Start", Joypad::Key::Start, false);
+	// Pad buttons from the active skin's measured geometry (GBC: D-pad
+	// cross arms re-measured from the asset pixels, A/B disks, SELECT/START
+	// pills). Order matches BodySkin::buttons: Up Down Left Right A B
+	// Select Start.
+	const BodySkin *skin = active_skin();
+	static const char *kNames[8] = {"Up", "Down", "Left", "Right", "A", "B", "Select", "Start"};
+	static const Joypad::Key kKeys[8] = {Joypad::Key::Up,     Joypad::Key::Down, Joypad::Key::Left,
+										 Joypad::Key::Right,  Joypad::Key::A,    Joypad::Key::B,
+										 Joypad::Key::Select, Joypad::Key::Start};
+	for (int i = 0; i < 8; i++) {
+		const BodySkinRect r = skin->buttons[i];
+		add(r.x, r.y, r.w, r.h, kNames[i], kKeys[i], skin->button_circle[i]);
+	}
 	// GBA shoulders: the GBC photo has no L/R controls, so they live as
 	// overlay pills on the body's top corners, like real shoulder buttons.
 	// That corner plastic is light lavender, so the pills use a bright fill
@@ -776,12 +939,14 @@ void GUIConsole::rebuild_buttons()
 	// in-game; remapping happens through the settings Inputs tab (GBA
 	// rows), same click-to-remap flow as the rest.
 	shoulders_.clear();
-	shoulders_.push_back({{bx + 0.020f * bw, by + 0.012f * bh, 0.130f * bw, 0.055f * bh},
-						  "L",
-						  gba::GbaKeypad::Key::L});
-	shoulders_.push_back({{bx + 0.850f * bw, by + 0.012f * bh, 0.130f * bw, 0.055f * bh},
-						  "R",
-						  gba::GbaKeypad::Key::R});
+	const char *kShoulderNames[2] = {"L", "R"};
+	const gba::GbaKeypad::Key kShoulderKeys[2] = {gba::GbaKeypad::Key::L, gba::GbaKeypad::Key::R};
+	for (int i = 0; i < 2; i++) {
+		const BodySkinRect r = skin->shoulders[i];
+		shoulders_.push_back({{bx + r.x * bw, by + r.y * bh, r.w * bw, r.h * bh},
+							  kShoulderNames[i],
+							  kShoulderKeys[i]});
+	}
 }
 
 std::optional<Joypad::Key> GUIConsole::hit_test(int x, int y) const
@@ -864,6 +1029,8 @@ std::string trunc_str(const std::string &s, size_t max_len)
 	return "..." + s.substr(s.size() - (max_len - 3));
 }
 
+} // namespace
+
 const char *palette_name(int p)
 {
 	switch (p) {
@@ -882,9 +1049,104 @@ const char *palette_name(int p)
 	}
 }
 
-} // namespace
-
 // ---- Settings page ----
+
+namespace
+{
+// The General page is data-driven: one descriptor list drives layout,
+// labels, live values and click actions, so adding a row cannot leave a
+// stale hand-maintained index somewhere else.
+enum class GeneralGroup : int { Display = 0, Sound, Interface, System, Library, Count };
+
+struct GeneralSpec {
+	const char *id;
+	const char *label;
+	const char *description;
+	GeneralGroup group;
+};
+
+constexpr GeneralSpec kGeneralSpecs[] = {
+	{"scale", "Scale", "Resize the window (1x-6x)", GeneralGroup::Display},
+	{"filter", "Filter", "Pixel upscaling quality", GeneralGroup::Display},
+	{"lcdgrid", "LCD Grid", "Simulated pixel gaps", GeneralGroup::Display},
+	{"ghost", "Ghosting", "Frame persistence trail", GeneralGroup::Display},
+	{"palette", "Palette", "Green-screen colour tint", GeneralGroup::Display},
+	{"volume", "Volume", "Master output level", GeneralGroup::Sound},
+	{"theme", "Theme", "Panel and menu colours", GeneralGroup::Interface},
+	{"console", "Accent", "Highlight colour", GeneralGroup::Interface},
+	{"skin", "Skin", "Shell photo (next launch)", GeneralGroup::Interface},
+	{"hw", "Hardware", "DMG / CGB / Auto detection", GeneralGroup::System},
+	{"folder", "Folder", "Library scan location", GeneralGroup::Library},
+};
+
+constexpr int kGeneralSpecCount = static_cast<int>(std::size(kGeneralSpecs));
+
+struct GeneralEntry {
+	bool header = false;
+	int spec = -1;
+	GeneralGroup group = GeneralGroup::Display;
+};
+
+std::vector<GeneralEntry> general_entries()
+{
+	std::vector<GeneralEntry> entries;
+	entries.reserve(kGeneralSpecCount + static_cast<int>(GeneralGroup::Count));
+	for (int g = 0; g < static_cast<int>(GeneralGroup::Count); g++) {
+		entries.push_back({true, -1, static_cast<GeneralGroup>(g)});
+		for (int i = 0; i < kGeneralSpecCount; i++) {
+			if (static_cast<int>(kGeneralSpecs[i].group) == g)
+				entries.push_back({false, i, static_cast<GeneralGroup>(g)});
+		}
+	}
+	return entries;
+}
+
+const char *general_group_name(GeneralGroup g)
+{
+	switch (g) {
+	case GeneralGroup::Display:
+		return "DISPLAY";
+	case GeneralGroup::Sound:
+		return "SOUND";
+	case GeneralGroup::Interface:
+		return "INTERFACE";
+	case GeneralGroup::System:
+		return "SYSTEM";
+	case GeneralGroup::Library:
+		return "LIBRARY";
+	default:
+		return "";
+	}
+}
+
+GUIConsole::SettingsAction action_for_row(const std::string &id)
+{
+	using Action = GUIConsole::SettingsAction;
+	if (id == "folder")
+		return Action::RomFolder;
+	if (id == "volume")
+		return Action::Volume;
+	if (id == "scale")
+		return Action::WindowScale;
+	if (id == "palette")
+		return Action::Palette;
+	if (id == "hw")
+		return Action::HwMode;
+	if (id == "filter")
+		return Action::Filter;
+	if (id == "lcdgrid")
+		return Action::LcdGrid;
+	if (id == "ghost")
+		return Action::Ghosting;
+	if (id == "console")
+		return Action::Console;
+	if (id == "skin")
+		return Action::BodySkin;
+	if (id == "theme")
+		return Action::Theme;
+	return Action::None;
+}
+} // namespace
 
 void GUIConsole::refreshControllers(const InputManager &input)
 {
@@ -978,54 +1240,68 @@ std::vector<GUIConsole::SettingsRow> GUIConsole::settings_rows() const
 	if (!settings_)
 		return rows;
 	if (settings_tab_ == SettingsTab::General) {
-		static const char *ids[kGeneralRows] = {"folder", "volume", "palette",
-												"hw",     "filter", "lcdgrid"};
-		static const char *labels[kGeneralRows] = {"ROM Folder",    "Volume", "DMG Palette",
-												   "Hardware Mode", "Filter", "LCD Grid"};
-		for (int i = 0; i < kGeneralRows; i++) {
+		const std::vector<GeneralEntry> entries = general_entries();
+		for (size_t i = 0; i < entries.size(); i++) {
+			const GeneralEntry &entry = entries[i];
 			SettingsRow r;
-			r.id = ids[i];
-			r.label = labels[i];
-			r.label_rect = settings_general_labels_[i];
-			r.value_rect = settings_general_cells_[i];
+			if (i < settings_general_labels_.size())
+				r.label_rect = settings_general_labels_[i];
+			if (i < settings_general_cells_.size())
+				r.value_rect = settings_general_cells_[i];
+			if (entry.header) {
+				r.id = std::string("header:") + general_group_name(entry.group);
+				r.label = general_group_name(entry.group);
+				r.style = RowStyle::Header;
+				rows.push_back(r);
+				continue;
+			}
+			const GeneralSpec &spec = kGeneralSpecs[entry.spec];
+			r.id = spec.id;
+			r.label = spec.label;
+			r.description = spec.description;
 			r.style = RowStyle::Value;
-			switch (i) {
-			case 0:
+			const std::string id = spec.id;
+			if (id == "folder") {
 				r.value = trunc_str(settings_->rom_folder, 20);
-				break;
-			case 1:
+			} else if (id == "volume") {
 				r.value = std::to_string(static_cast<int>(settings_->volume * 100)) + "%";
-				break;
-			case 2:
+			} else if (id == "scale") {
+				r.value = std::to_string(std::clamp(settings_->video_scale, 1, 6)) + "x";
+			} else if (id == "palette") {
 				r.value = palette_name(settings_->palette);
-				break;
-			case 3:
+			} else if (id == "hw") {
 				r.value = settings_->hardware_mode;
-				break;
-			case 4:
+			} else if (id == "filter") {
 				r.value = video_filter_name(static_cast<VideoFilter>(settings_->video_filter));
-				break;
-			case 5: {
+			} else if (id == "lcdgrid") {
 				static const char *kGridNames[Settings::kLcdGridMax + 1] = {"Off", "Light",
 																			"Medium", "Strong"};
-				r.value = kGridNames[settings_->lcd_grid < 0
-										 ? 0
-										 : (settings_->lcd_grid > Settings::kLcdGridMax
-												? Settings::kLcdGridMax
-												: settings_->lcd_grid)];
-				break;
-			}
-			default:
-				break;
+				r.value = kGridNames[std::clamp(settings_->lcd_grid, 0, Settings::kLcdGridMax)];
+			} else if (id == "ghost") {
+				static const char *kGhostNames[Settings::kGhostMax + 1] = {"Off", "Light", "Medium",
+																		   "Strong"};
+				r.value = kGhostNames[std::clamp(settings_->ghosting, 0, Settings::kGhostMax)];
+			} else if (id == "console") {
+				const int idx = static_cast<int>(settings_->console_color);
+				r.value = console_color_name(idx < 0 || idx >= kConsoleColors
+												 ? ConsoleColor::Purple
+												 : static_cast<ConsoleColor>(idx));
+			} else if (id == "skin") {
+				// Shows the resolved skin; Auto names its target so the
+				// single bundled photo reads honestly.
+				r.value = body_skin_value();
+			} else if (id == "theme") {
+				r.value = ui_theme_name(settings_->theme != 1 ? 0 : 1);
 			}
 			rows.push_back(r);
 		}
 		return rows;
 	}
 
-	// The Inputs page is NOT a row list: it is a GBA diagram plus a handful of
-	// widgets, all drawn by the renderer from their own rects. Returning no
-	// rows here stops the generic row loop from drawing anything.
+	// The Inputs page is NOT a row list: it is a GBA diagram, a clickable
+	// binding list and a handful of widgets, all drawn by the renderer from
+	// their own rects. Returning no rows here stops the generic row loop from
+	// drawing anything.
 	return rows;
 }
 
@@ -1050,16 +1326,20 @@ GUIConsole::SettingsHit GUIConsole::settings_hit_test(int x, int y) const
 		return hit;
 	}
 	if (settings_tab_ == SettingsTab::General) {
-		static const SettingsAction acts[kGeneralRows] = {
-			SettingsAction::RomFolder, SettingsAction::Volume, SettingsAction::Palette,
-			SettingsAction::HwMode,    SettingsAction::Filter, SettingsAction::LcdGrid};
-		for (int i = 0; i < kGeneralRows; i++) {
-			if (!in(settings_general_labels_[i], x, y) && !in(settings_general_cells_[i], x, y))
+		const std::vector<GeneralEntry> entries = general_entries();
+		for (size_t i = 0; i < entries.size(); i++) {
+			if (i >= settings_general_labels_.size() || i >= settings_general_cells_.size())
+				break;
+			if (entries[i].header)
 				continue;
-			hit.action = acts[i];
-			if (acts[i] == SettingsAction::Volume) {
-				const Rect &v = settings_volume_rect();
-				hit.ratio = v.w > 0.0f ? static_cast<float>((x - v.x) / v.w) : 0.0f;
+			const Rect &label = settings_general_labels_[i];
+			const Rect &cell = settings_general_cells_[i];
+			if (!in(label, x, y) && !in(cell, x, y))
+				continue;
+			const std::string id = kGeneralSpecs[entries[i].spec].id;
+			hit.action = action_for_row(id);
+			if (hit.action == SettingsAction::Volume) {
+				hit.ratio = cell.w > 0.0f ? static_cast<float>((x - cell.x) / cell.w) : 0.0f;
 				hit.ratio = std::clamp(hit.ratio, 0.0f, 1.0f);
 			}
 			return hit;
@@ -1116,6 +1396,16 @@ GUIConsole::SettingsHit GUIConsole::settings_hit_test(int x, int y) const
 	}
 	if (automapVisible() && in(btn_automap_, x, y)) {
 		hit.action = SettingsAction::AutoMap;
+		return hit;
+	}
+	// Clickable list mirroring the GBA diagram: on a narrow panel the list is
+	// the only remap surface, and on a wide one it is faster than tiny
+	// shoulder tabs.
+	for (int i = 0; i < kInputButtons; i++) {
+		if (!in(binding_rects_[static_cast<size_t>(i)], x, y))
+			continue;
+		hit.action = SettingsAction::PadButton;
+		hit.index = i;
 		return hit;
 	}
 	if (auto b = hit_gba_pad(x, y)) {
@@ -1255,87 +1545,139 @@ void GUIConsole::rebuild_settings_cells()
 	settings_inputs_cells_.clear();
 	settings_general_labels_.clear();
 	settings_inputs_labels_.clear();
-	const float px = body_rect_.x, py = body_rect_.y;
+	binding_rects_.fill({0, 0, 0, 0});
+	inputs_diagram_visible_ = false;
+	const float py = body_rect_.y;
 	const float bw = body_rect_.w, bh = body_rect_.h;
 	if (bw <= 0 || bh <= 0)
 		return;
-	// The panel is anchored BELOW the LCD glass rather than centred on the
-	// body: the point of the Filter / LCD Grid rows is to watch the effect on
-	// the running game, so the screen must stay uncovered.
+
+	// The panel stays below the LCD glass (filter/grid changes should be
+	// visible on the running game) but is allowed to grow wider than the
+	// portrait body. A GBC shell is only 75 mm wide on screen; squeezing a
+	// two-column settings page into that width made every control tiny.
 	const float glass_bottom = bezel_rect_.y + bezel_rect_.h;
-	const float band_top = std::max(py + bh * 0.42f, glass_bottom + bh * 0.015f);
-	const float band_h = std::max(bh * 0.30f, (py + bh) - band_top);
-	const float panel_w = bw * 0.85f;
-	const float want_h = bh * (settings_tab_ == SettingsTab::General ? 0.46f : 0.54f);
-	// Never taller than the band, never taller than the body.
-	const float panel_h = std::min(std::min(want_h, band_h), bh);
-	const float panel_x = px + (bw - panel_w) * 0.5f;
-	const float panel_y = band_top + (band_h - panel_h) * 0.5f;
-	settings_panel_ = {panel_x, panel_y, panel_w, panel_h};
+	const float panel_top = glass_bottom + bh * 0.018f;
+	const float panel_bottom = std::min(py + bh, static_cast<float>(window_h_) - 8.0f);
+	const float available_w = std::max(180.0f, static_cast<float>(window_w_) - 16.0f);
+	const float wanted_w = std::max({bw * 0.92f, 420.0f, window_w_ * 0.62f});
+	const float panel_w = std::min(wanted_w, std::min(620.0f, available_w));
+	const float wanted_h = bh * 0.60f;
+	const float panel_h = std::max(120.0f, std::min(wanted_h, panel_bottom - panel_top));
+	const float panel_x = (window_w_ - panel_w) * 0.5f;
+	settings_panel_ = {panel_x, panel_top, panel_w, panel_h};
 
-	// Close box, top-right of the title bar.
-	const float cs = std::min(bh * 0.032f, 18.0f);
-	settings_close_ = {panel_x + panel_w - 8.0f - cs, panel_y + 7.0f, cs, cs};
+	// Title bar, tabs, footer. Keeping these metrics here (and deriving them
+	// from the panel in the renderer) stops the two from drifting apart on
+	// resize.
+	const float title_h = std::clamp(panel_h * 0.075f, 18.0f, 30.0f);
+	const float bar_top = panel_top + 4.0f;
+	const float close_s = std::clamp(title_h - 10.0f, 12.0f, 18.0f);
+	settings_close_ = {panel_x + panel_w - 8.0f - close_s, bar_top + (title_h - close_s) * 0.5f,
+					   close_s, close_s};
+	const float tabs_y = bar_top + title_h + 6.0f;
+	const float tabs_h = std::clamp(panel_h * 0.065f, 14.0f, 24.0f);
+	const float tab_gap = 4.0f;
+	const float tab_w = (panel_w - 20.0f - tab_gap) * 0.5f;
+	settings_tab_general_ = {panel_x + 10.0f, tabs_y, tab_w, tabs_h};
+	settings_tab_inputs_ = {panel_x + 10.0f + tab_w + tab_gap, tabs_y, tab_w, tabs_h};
 
-	// Tabs under the title bar. Two tabs, split evenly with a small gutter.
-	const float tabs_y = panel_y + bh * 0.075f;
-	const float tabs_h = bh * 0.042f;
-	const float tab_gap = 3.0f;
-	const float tab_w = (panel_w - 12.0f - tab_gap) * 0.5f;
-	settings_tab_general_ = {panel_x + 6.0f, tabs_y, tab_w, tabs_h};
-	settings_tab_inputs_ = {panel_x + 9.0f + tab_w, tabs_y, tab_w, tabs_h};
-
-	// Row geometry, sized to the active tab's row count.
-	const float row_gap = 4.0f;
+	const float footer_h = std::clamp(panel_h * 0.06f, 12.0f, 20.0f);
+	const float content_x = panel_x + 10.0f;
+	const float content_w = panel_w - 20.0f;
 	const float rows_top = tabs_y + tabs_h + 8.0f;
-	const float rows_avail = (panel_y + panel_h - 22.0f) - rows_top; // footer inset
-	// Keep rows legible: if a row would shrink under the font height, reclaim
-	// the inter-row gap first and only then accept a shorter row.
-	constexpr float kMinRowH = 9.0f;
-	const auto fit_rows = [&](int rows, float &out_h, float &out_gap) {
-		out_h = std::min(bh * 0.045f, (rows_avail - (rows - 1) * row_gap) / rows);
-		out_gap = row_gap;
-		if (out_h < kMinRowH && rows > 1) {
-			out_h = std::min(kMinRowH, rows_avail / static_cast<float>(rows));
-			out_gap = std::max(0.0f, (rows_avail - out_h * static_cast<float>(rows)) /
-										 static_cast<float>(rows - 1));
-		}
-	};
-	const float label_x = panel_x + 6.0f, label_w = panel_w * 0.44f;
-	const float value_x = panel_x + panel_w * 0.52f, value_w = panel_w * 0.42f;
+	const float rows_bottom = panel_top + panel_h - footer_h - 6.0f;
+	const float content_h = std::max(20.0f, rows_bottom - rows_top);
 
-	float gen_h = 0, gen_gap = 0;
-	fit_rows(kGeneralRows, gen_h, gen_gap);
-	float row_y = rows_top;
-	for (int i = 0; i < kGeneralRows; i++) {
-		settings_general_labels_.push_back({label_x, row_y, label_w, gen_h});
-		settings_general_cells_.push_back({value_x, row_y, value_w, gen_h});
-		row_y += gen_h + gen_gap;
+	// ---- General: grouped, responsive row grid ----
+	const std::vector<GeneralEntry> entries = general_entries();
+	settings_general_labels_.assign(entries.size(), {0, 0, 0, 0});
+	settings_general_cells_.assign(entries.size(), {0, 0, 0, 0});
+	const bool two_columns = panel_w >= 360.0f;
+	const auto column_of = [&](GeneralGroup g) {
+		if (!two_columns)
+			return 0;
+		return static_cast<int>(g) <= static_cast<int>(GeneralGroup::Sound) ? 0 : 1;
+	};
+	int col_entries[2] = {0, 0};
+	int col_specs[2] = {0, 0};
+	int col_headers[2] = {0, 0};
+	for (const GeneralEntry &e : entries) {
+		const int c = column_of(e.group);
+		col_entries[c]++;
+		if (e.header)
+			col_headers[c]++;
+		else
+			col_specs[c]++;
 	}
-	// The Inputs page does NOT use the row list: it is a diagram plus a few
-	// widgets, laid out explicitly below.
+	const float col_gap = std::max(10.0f, panel_w * 0.035f);
+	const float col_w = two_columns ? (content_w - col_gap) * 0.5f : content_w;
+	float row_gap = std::clamp(panel_h * 0.006f, 2.0f, 5.0f);
+	float header_h = std::clamp(panel_h * 0.030f, 10.0f, 18.0f);
+	float row_h = std::clamp(panel_h * 0.105f, 18.0f, 44.0f);
+	const auto col_need = [&](int c) {
+		return static_cast<float>(col_specs[c]) * row_h +
+			   static_cast<float>(col_headers[c]) * header_h +
+			   static_cast<float>(std::max(0, col_entries[c] - 1)) * row_gap;
+	};
+	const auto tallest = [&]() { return std::max(col_need(0), col_need(1)); };
+	if (tallest() > content_h) {
+		// First hide descriptions by capping rows at the two-line height,
+		// then reclaim gaps and headers, and only then shrink the rows.
+		row_h = std::min(row_h, 22.0f);
+		row_gap = std::min(row_gap, 2.0f);
+		if (tallest() > content_h) {
+			header_h = std::min(header_h, 11.0f);
+			row_gap = 0.0f;
+		}
+		if (tallest() > content_h) {
+			float fit = row_h;
+			for (int c = 0; c < 2; c++) {
+				if (col_specs[c] <= 0)
+					continue;
+				const float room = content_h - static_cast<float>(col_headers[c]) * header_h;
+				fit = std::min(fit, room / static_cast<float>(col_specs[c]));
+			}
+			row_h = std::clamp(fit, 9.0f, row_h);
+		}
+	}
+	const float start_y = rows_top + std::max(0.0f, (content_h - tallest()) * 0.5f);
+	const float col_x[2] = {content_x, content_x + col_w + col_gap};
+	float col_y[2] = {start_y, start_y};
+	for (size_t i = 0; i < entries.size(); i++) {
+		const int c = column_of(entries[i].group);
+		if (entries[i].header) {
+			settings_general_labels_[i] = {col_x[c], col_y[c], col_w, header_h};
+			col_y[c] += header_h + row_gap;
+			continue;
+		}
+		// The label spans the column so the description can use the full
+		// width; the value pill aligns with the first text line.
+		const float line_h = std::min(row_h, std::max(14.0f, 8.0f * settings_text_scale() * 2.0f));
+		settings_general_labels_[i] = {col_x[c], col_y[c], col_w, row_h};
+		settings_general_cells_[i] = {col_x[c] + col_w * 0.53f, col_y[c] + 2.0f, col_w * 0.45f,
+									  std::max(6.0f, std::min(line_h, row_h - 4.0f))};
+		col_y[c] += row_h + row_gap;
+	}
+
+	// ---- Inputs: widgets on top, binding list + diagram below ----
 	profile_dd_.items.clear();
 	device_dd_.items.clear();
-	settings_inputs_labels_.clear();
-	settings_inputs_cells_.clear();
-
-	const float in_x = panel_x + 6.0f;
-	const float in_w = panel_w - 12.0f;
-	// Row rhythm for the widget block at the top.
-	const float wr_h = std::max(14.0f, std::min(bh * 0.032f, 22.0f));
-	const float wr_gap = 4.0f;
-	const float lbl_w = std::max(34.0f, in_w * 0.24f);
-	// Profile row: [label][dropdown .......] [Load] [Save]
-	const float btn_w = std::max(30.0f, in_w * 0.17f);
+	const float wr_h = std::clamp(panel_h * 0.055f, 16.0f, 26.0f);
+	const float wr_gap = std::clamp(panel_h * 0.008f, 3.0f, 5.0f);
+	const float lbl_w = std::max(44.0f, content_w * 0.17f);
+	const float btn_w = std::max(36.0f, content_w * 0.14f);
 	float wy = rows_top;
-	gba_pad_.label_profile = {in_x, wy, lbl_w, wr_h};
-	profile_dd_.closed = {in_x + lbl_w, wy, in_w - lbl_w - btn_w * 2 - wr_gap * 2, wr_h};
-	btn_load_ = {in_x + in_w - btn_w * 2 - wr_gap, wy, btn_w, wr_h};
-	btn_save_ = {in_x + in_w - btn_w, wy, btn_w, wr_h};
+	// Profile row: [label][dropdown .......] [Load] [Save]
+	gba_pad_.label_profile = {content_x, wy, lbl_w, wr_h};
+	profile_dd_.closed = {content_x + lbl_w, wy, content_w - lbl_w - btn_w * 2.0f - wr_gap * 2.0f,
+						  wr_h};
+	btn_load_ = {content_x + content_w - btn_w * 2.0f - wr_gap, wy, btn_w, wr_h};
+	btn_save_ = {content_x + content_w - btn_w, wy, btn_w, wr_h};
 	wy += wr_h + wr_gap;
 	// Device row: [label][dropdown .......]
-	gba_pad_.label_device = {in_x, wy, lbl_w, wr_h};
-	device_dd_.closed = {in_x + lbl_w, wy, in_w - lbl_w, wr_h};
+	gba_pad_.label_device = {content_x, wy, lbl_w, wr_h};
+	device_dd_.closed = {content_x + lbl_w, wy, content_w - lbl_w, wr_h};
 	wy += wr_h + wr_gap;
 
 	// Profile menu: every profile, then New / Rename / Delete.
@@ -1349,73 +1691,147 @@ void GUIConsole::rebuild_settings_cells()
 	profile_dd_.options.push_back("Delete this");
 	if (settings_ != nullptr)
 		profile_dd_.selected = settings_->active_profile;
-	relayout_dropdown(profile_dd_);
-	relayout_dropdown(device_dd_);
 
 	// Auto-map button, only when a controller is the selected source.
 	if (device_dd_.selected > 0) {
-		btn_automap_ = {in_x + in_w * 0.5f - in_w * 0.22f, wy, in_w * 0.44f, wr_h + 2.0f};
+		btn_automap_ = {content_x + content_w * 0.5f - content_w * 0.22f, wy, content_w * 0.44f,
+						wr_h + 2.0f};
 		wy += wr_h + 2.0f + wr_gap;
 	} else {
 		btn_automap_ = {};
 	}
 
-	// GBA outline fills the rest of the panel, centred. Laid out in real
-	// millimetres so the proportions are verifiable: the AGB-001 is
-	// 144.5 x 82 mm with a 61.2 x 40.8 mm screen (Nintendo / GBATEK), and the
-	// control positions follow GBATEK's layout sketch.
+	// Binding list. On a narrow panel the list gets two columns and the
+	// diagram is dropped; on a wide panel the list sits left of the outline.
+	const float list_top = wy + 18.0f; // room for the "BUTTON BINDINGS" caption
+	const float list_h = std::max(20.0f, rows_bottom - list_top);
+	const bool want_diagram = panel_w >= 380.0f && list_h >= 76.0f;
+	inputs_diagram_visible_ = want_diagram;
+	const float diagram_gap = want_diagram ? std::max(10.0f, content_w * 0.035f) : 0.0f;
+	const float list_w = want_diagram ? content_w * 0.44f : content_w;
+	const int list_cols = (!want_diagram && list_w >= 230.0f) ? 2 : 1;
+	const int rows_per_col = (kInputBindings + list_cols - 1) / list_cols;
+	const float list_gap = std::clamp(panel_h * 0.004f, 1.0f, 3.0f);
+	float bind_h = (list_h - static_cast<float>(rows_per_col - 1) * list_gap) /
+				   static_cast<float>(rows_per_col);
+	bind_h = std::clamp(bind_h, 8.0f, 26.0f);
+	const float bind_w =
+		(list_w - static_cast<float>(list_cols - 1) * list_gap) / static_cast<float>(list_cols);
+	const float used_h =
+		static_cast<float>(rows_per_col) * bind_h + static_cast<float>(rows_per_col - 1) * list_gap;
+	const float list_y = list_top + std::max(0.0f, (list_h - used_h) * 0.5f);
+	for (int i = 0; i < kInputBindings; i++) {
+		const int col = i / rows_per_col;
+		const int row = i % rows_per_col;
+		binding_rects_[static_cast<size_t>(i)] = {
+			content_x + static_cast<float>(col) * (bind_w + list_gap),
+			list_y + static_cast<float>(row) * (bind_h + list_gap), bind_w, bind_h};
+	}
+
+	// GBA outline, laid out in real millimetres so the proportions are
+	// verifiable: the AGB-001 is 144.5 x 82 mm with a 61.2 x 40.8 mm screen
+	// (Nintendo / GBATEK), and the control positions follow GBATEK's sketch.
 	constexpr f32 kBodyWmm = 144.5f;
 	constexpr f32 kBodyHmm = 82.0f;
-	const float pad_top = wy + 2.0f;
-	const float pad_bot = panel_y + panel_h - 20.0f;
-	const float avail_h = std::max(40.0f, pad_bot - pad_top);
-	float body_h = avail_h;
-	float body_w = body_h * (kBodyWmm / kBodyHmm);
-	const float max_w = in_w;
-	if (body_w > max_w) {
-		body_w = max_w;
-		body_h = body_w * (kBodyHmm / kBodyWmm);
-	}
-	const float bx = in_x + (in_w - body_w) * 0.5f;
-	const float by = pad_top + (avail_h - body_h) * 0.5f;
-	gba_pad_.body = {bx, by, body_w, body_h};
+	if (want_diagram) {
+		const float gx = content_x + list_w + diagram_gap;
+		const float gw = content_w - list_w - diagram_gap;
+		const float gtop = list_top + 12.0f;
+		const float gbottom = rows_bottom;
+		float body_h = std::max(20.0f, gbottom - gtop);
+		float body_w = body_h * (kBodyWmm / kBodyHmm);
+		if (body_w > gw) {
+			body_w = gw;
+			body_h = body_w * (kBodyHmm / kBodyWmm);
+		}
+		const float bx = gx + (gw - body_w) * 0.5f;
+		const float by = gtop + std::max(0.0f, (gbottom - gtop - body_h) * 0.5f);
+		gba_pad_.body = {bx, by, body_w, body_h};
 
-	// Millimetre -> body rect, so every number below is a real dimension.
-	const auto MM = [&](float x, float y, float w, float h) {
-		return Rect{bx + x / kBodyWmm * body_w, by + y / kBodyHmm * body_h, w / kBodyWmm * body_w,
-					h / kBodyHmm * body_h};
-	};
-	const auto MMPt = [&](float x, float y) {
-		return Vec2{bx + x / kBodyWmm * body_w, by + y / kBodyHmm * body_h};
-	};
+		// Millimetre -> body rect, so every number below is a real dimension.
+		const auto MM = [&](float x, float y, float w, float h) {
+			return Rect{bx + x / kBodyWmm * body_w, by + y / kBodyHmm * body_h,
+						w / kBodyWmm * body_w, h / kBodyHmm * body_h};
+		};
+		const auto MMPt = [&](float x, float y) {
+			return Vec2{bx + x / kBodyWmm * body_w, by + y / kBodyHmm * body_h};
+		};
 
-	gba_pad_.screen = MM(30.0f, 12.0f, 61.2f, 40.8f);
-	// D-pad: 15 mm across, centred at (20, 50) mm on the far left.
-	{
-		const auto c = MMPt(20.0f, 50.0f);
-		const float rx = 7.5f / kBodyWmm * body_w;
-		const float ry = 7.5f / kBodyHmm * body_h;
-		const float tx = 2.4f / kBodyWmm * body_w;
-		const float ty = 2.4f / kBodyHmm * body_h;
-		gba_pad_.dpad_h = {c.x - rx, c.y - ty, rx * 2.0f, ty * 2.0f};
-		gba_pad_.dpad_v = {c.x - tx, c.y - ry, tx * 2.0f, ry * 2.0f};
+		gba_pad_.screen = MM(30.0f, 12.0f, 61.2f, 40.8f);
+		// D-pad: 15 mm across, centred at (20, 50) mm on the far left.
+		{
+			const auto c = MMPt(20.0f, 50.0f);
+			const float rx = 7.5f / kBodyWmm * body_w;
+			const float ry = 7.5f / kBodyHmm * body_h;
+			const float tx = 2.4f / kBodyWmm * body_w;
+			const float ty = 2.4f / kBodyHmm * body_h;
+			gba_pad_.dpad_h = {c.x - rx, c.y - ty, rx * 2.0f, ty * 2.0f};
+			gba_pad_.dpad_v = {c.x - tx, c.y - ry, tx * 2.0f, ry * 2.0f};
+		}
+		// Face buttons: A upper-right of B, both right of the screen.
+		gba_pad_.btn_a = MM(103.0f, 27.0f, 12.0f, 12.0f);
+		gba_pad_.btn_b = MM(89.0f, 38.0f, 12.0f, 12.0f);
+		// START / SELECT sit below the screen (SELECT left, START right).
+		gba_pad_.btn_select = MM(44.0f, 58.0f, 14.0f, 5.0f);
+		gba_pad_.btn_start = MM(61.0f, 58.0f, 14.0f, 5.0f);
+		// Shoulders are tabs on the top edge.
+		gba_pad_.btn_l = MM(14.0f, 0.0f, 22.0f, 9.0f);
+		gba_pad_.btn_r = MM(108.0f, 0.0f, 22.0f, 9.0f);
+	} else {
+		gba_pad_.body = {0, 0, 0, 0};
+		gba_pad_.screen = {0, 0, 0, 0};
+		gba_pad_.dpad_h = {0, 0, 0, 0};
+		gba_pad_.dpad_v = {0, 0, 0, 0};
+		gba_pad_.btn_a = {0, 0, 0, 0};
+		gba_pad_.btn_b = {0, 0, 0, 0};
+		gba_pad_.btn_start = {0, 0, 0, 0};
+		gba_pad_.btn_select = {0, 0, 0, 0};
+		gba_pad_.btn_l = {0, 0, 0, 0};
+		gba_pad_.btn_r = {0, 0, 0, 0};
 	}
-	// Face buttons: A upper-right of B, both right of the screen.
-	gba_pad_.btn_a = MM(103.0f, 27.0f, 12.0f, 12.0f);
-	gba_pad_.btn_b = MM(89.0f, 38.0f, 12.0f, 12.0f);
-	// START / SELECT sit below the screen (SELECT left, START right).
-	gba_pad_.btn_select = MM(44.0f, 58.0f, 14.0f, 5.0f);
-	gba_pad_.btn_start = MM(61.0f, 58.0f, 14.0f, 5.0f);
-	// Shoulders are tabs on the top edge.
-	gba_pad_.btn_l = MM(14.0f, 0.0f, 22.0f, 9.0f);
-	gba_pad_.btn_r = MM(108.0f, 0.0f, 22.0f, 9.0f);
+
+	relayout_dropdown(profile_dd_);
+	relayout_dropdown(device_dd_);
+}
+
+std::vector<GUIConsole::BindingRow> GUIConsole::binding_rows() const
+{
+	std::vector<BindingRow> rows;
+	if (settings_ == nullptr)
+		return rows;
+	rows.reserve(kInputBindings);
+	for (int i = 0; i < kInputBindings; i++) {
+		BindingRow r;
+		r.rect = binding_rects_[static_cast<size_t>(i)];
+		r.button = static_cast<PadButton>(i);
+		r.label = pad_button_name(r.button);
+		const Binding b = settings_->currentBinding(i);
+		r.unbound = !b.bound();
+		r.value = r.unbound ? "Unbound" : pad_label(b);
+		r.selected = awaiting_input_ && pending_pad_ == r.button;
+		rows.push_back(std::move(r));
+	}
+	return rows;
 }
 
 GUIConsole::Rect GUIConsole::settings_volume_rect() const
 {
-	if (settings_general_cells_.size() < 2)
-		return {0, 0, 0, 0};
-	return settings_general_cells_[1];
+	const std::vector<GeneralEntry> entries = general_entries();
+	for (size_t i = 0; i < entries.size() && i < settings_general_cells_.size(); i++) {
+		if (!entries[i].header && std::string(kGeneralSpecs[entries[i].spec].id) == "volume")
+			return settings_general_cells_[i];
+	}
+	return {0, 0, 0, 0};
+}
+
+float GUIConsole::settings_text_scale() const
+{
+	if (settings_panel_.w <= 0.0f)
+		return 1.0f;
+	// The panel always uses at least the atlas's native 8px cell - the old
+	// 0.6 floor made the page unreadable on a default-size window - and grows
+	// modestly on very wide ones. Layout and renderer share this value.
+	return std::clamp(1.08f + (settings_panel_.w - 340.0f) * 0.0006f, 1.0f, 1.30f);
 }
 
 // ---- ROM menu ----
@@ -1423,25 +1839,168 @@ GUIConsole::Rect GUIConsole::settings_volume_rect() const
 void GUIConsole::set_rom_list(std::vector<RomEntry> entries)
 {
 	rom_list_ = std::move(entries);
-	if (rom_list_.empty()) {
+	rebuild_filter();
+	if (filtered_.empty()) {
 		menu_selected_ = 0;
 	} else {
-		menu_selected_ = std::clamp(menu_selected_, 0, static_cast<int>(rom_list_.size()) - 1);
+		menu_selected_ = std::clamp(menu_selected_, 0, static_cast<int>(filtered_.size()) - 1);
 	}
+	refresh_save_counts();
+}
+
+std::string GUIConsole::slot_path_for(const std::string &rom_path, int slot)
+{
+	if (rom_path.empty() || slot < 0 || slot >= 8)
+		return "";
+	return rom_path + ".gb4s" + static_cast<char>('0' + slot);
+}
+
+int GUIConsole::count_save_slots(const std::string &rom_path)
+{
+	if (rom_path.empty())
+		return 0;
+	int n = 0;
+	for (int s = 0; s < 8; s++) {
+		std::error_code ec;
+		if (std::filesystem::exists(slot_path_for(rom_path, s), ec) && !ec)
+			n++;
+	}
+	return n;
+}
+
+void GUIConsole::refresh_save_counts()
+{
+	for (auto &e : rom_list_) {
+		e.save_slots = count_save_slots(e.path);
+		e.thumb_path = thumb_path_for(e.path);
+		e.has_thumb = !e.thumb_path.empty();
+	}
+}
+
+std::string GUIConsole::thumb_path_for(const std::string &rom_path)
+{
+	if (rom_path.empty())
+		return "";
+	// User boxart wins over anything generated.
+	{
+		std::error_code ec;
+		if (std::filesystem::exists(rom_path + ".png", ec) && !ec)
+			return rom_path + ".png";
+	}
+	// Auto-shot written on eject, then slot shots from F5 saves.
+	{
+		std::error_code ec;
+		if (std::filesystem::exists(rom_path + ".thumb.ppm", ec) && !ec)
+			return rom_path + ".thumb.ppm";
+	}
+	for (int s = 0; s < 8; s++) {
+		const std::string p = slot_path_for(rom_path, s) + ".ppm";
+		std::error_code ec;
+		if (std::filesystem::exists(p, ec) && !ec)
+			return p;
+	}
+	return "";
+}
+
+void GUIConsole::rebuild_filter()
+{
+	filtered_.clear();
+	if (!filter_active_ || menu_filter_.empty()) {
+		filtered_.reserve(rom_list_.size());
+		for (int i = 0; i < static_cast<int>(rom_list_.size()); i++)
+			filtered_.push_back(i);
+		return;
+	}
+	std::string needle = menu_filter_;
+	std::transform(needle.begin(), needle.end(), needle.begin(),
+				   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	for (int i = 0; i < static_cast<int>(rom_list_.size()); i++) {
+		std::string hay =
+			rom_list_[static_cast<size_t>(i)].title + " " + rom_list_[static_cast<size_t>(i)].path;
+		std::transform(hay.begin(), hay.end(), hay.begin(),
+					   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (hay.find(needle) != std::string::npos)
+			filtered_.push_back(i);
+	}
+}
+
+void GUIConsole::set_menu_filter(const std::string &f)
+{
+	menu_filter_ = f;
+	filter_active_ = true;
+	rebuild_filter();
+	menu_selected_ = filtered_.empty()
+						 ? 0
+						 : std::clamp(menu_selected_, 0, static_cast<int>(filtered_.size()) - 1);
+}
+
+void GUIConsole::clear_menu_filter()
+{
+	menu_filter_.clear();
+	filter_active_ = false;
+	rebuild_filter();
+	menu_selected_ = filtered_.empty()
+						 ? 0
+						 : std::clamp(menu_selected_, 0, static_cast<int>(filtered_.size()) - 1);
+}
+
+void GUIConsole::set_menu_filter_active(bool v)
+{
+	filter_active_ = v;
+	if (!v)
+		menu_filter_.clear();
+	rebuild_filter();
+	menu_selected_ = filtered_.empty()
+						 ? 0
+						 : std::clamp(menu_selected_, 0, static_cast<int>(filtered_.size()) - 1);
+}
+
+bool GUIConsole::menu_filter_type(const std::string &utf8)
+{
+	if (utf8.empty())
+		return false;
+	if (!filter_active_) {
+		// Whatever physical key a layout uses for "/", SDL delivers "/".
+		if (utf8 == "/") {
+			set_menu_filter_active(true);
+			return true;
+		}
+		return false;
+	}
+	// Space loads the selected ROM (scancode path below); never type it.
+	if (utf8 == " ")
+		return true;
+	set_menu_filter(menu_filter_ + utf8);
+	return true;
+}
+
+int GUIConsole::filtered_to_rom(int filtered_pos) const
+{
+	if (filtered_pos < 0 || filtered_pos >= static_cast<int>(filtered_.size()))
+		return -1;
+	return filtered_[static_cast<size_t>(filtered_pos)];
+}
+
+std::optional<GUIConsole::RomEntry> GUIConsole::selected_rom() const
+{
+	const int ri = filtered_to_rom(menu_selected_);
+	if (ri < 0 || ri >= static_cast<int>(rom_list_.size()))
+		return std::nullopt;
+	return rom_list_[static_cast<size_t>(ri)];
 }
 
 void GUIConsole::set_menu_selected(int i)
 {
-	if (rom_list_.empty()) {
+	if (filtered_.empty()) {
 		menu_selected_ = 0;
 		return;
 	}
-	menu_selected_ = std::clamp(i, 0, static_cast<int>(rom_list_.size()) - 1);
+	menu_selected_ = std::clamp(i, 0, static_cast<int>(filtered_.size()) - 1);
 }
 
 void GUIConsole::menu_move(int delta)
 {
-	if (rom_list_.empty()) {
+	if (filtered_.empty()) {
 		menu_selected_ = 0;
 		return;
 	}
@@ -1501,7 +2060,7 @@ float GUIConsole::menu_cell_h() const
 
 int GUIConsole::menu_grid_rows() const
 {
-	const int n = static_cast<int>(rom_list_.size());
+	const int n = static_cast<int>(filtered_.size());
 	const int cols = menu_grid_cols();
 	if (cols <= 0)
 		return 0;
@@ -1562,7 +2121,7 @@ int GUIConsole::menu_visible_rows() const
 
 int GUIConsole::menu_first_visible() const
 {
-	const int n = static_cast<int>(rom_list_.size());
+	const int n = static_cast<int>(filtered_.size());
 	const int cols = menu_grid_cols();
 	if (n <= 0 || cols <= 0)
 		return 0;
@@ -1577,7 +2136,7 @@ int GUIConsole::menu_first_visible() const
 
 std::optional<int> GUIConsole::menu_hit_test(int x, int y) const
 {
-	if (!menu_active_ || rom_list_.empty())
+	if (!menu_active_ || filtered_.empty())
 		return std::nullopt;
 	const Rect list = menu_list_rect();
 	if (x < list.x || x >= list.x + list.w || y < list.y || y >= list.y + list.h) {
@@ -1596,12 +2155,12 @@ std::optional<int> GUIConsole::menu_hit_test(int x, int y) const
 	if (x >= cell_x + cw)
 		return std::nullopt;
 	const int idx = menu_first_visible() + row * cols + col;
-	if (idx < 0 || idx >= static_cast<int>(rom_list_.size()))
+	if (idx < 0 || idx >= static_cast<int>(filtered_.size()))
 		return std::nullopt;
 	// Last row may be partial — e.g. cols=3, n=7, first=0, idx=7 is second
 	// column of row 2 but that row only has 1 item. Treat remainder as empty.
 	const int row_start = (idx / cols) * cols;
-	const int row_items = std::min(cols, static_cast<int>(rom_list_.size()) - row_start);
+	const int row_items = std::min(cols, static_cast<int>(filtered_.size()) - row_start);
 	if (col >= row_items)
 		return std::nullopt;
 	return idx;

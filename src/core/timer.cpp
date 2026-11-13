@@ -20,6 +20,7 @@ void Timer::reset()
 	tima_ = 0;
 	tma_ = 0;
 	tac_ = 0;
+	tima_reload_ = TimaReload::Running;
 	div_frozen_ = false;
 	double_speed_ = false;
 }
@@ -33,8 +34,17 @@ void Timer::step(u32 mcycles)
 	// so DIV/TIMA run at double wall-rate while PPU/APU stay fixed.
 	const u32 scale = double_speed_ ? 8 : 4;
 	for (u32 i = 0; i < mcycles * scale; i++) {
+		// SameBoy steps the reload state machine once per M-cycle, before the
+		// divider edge for that M-cycle.
+		if ((i % scale) == 0)
+			advance_tima_reload();
 		const u16 prev = div_counter_;
 		div_counter_++;
+		// The serial port is clocked by the same divider: the transfer runs off
+		// the selected bit falling, which is why SC=0x81 does not finish in the
+		// same write (SameBoy GB_set_internal_div_counter -> GB_serial_master_edge).
+		if (mmu_ && (prev & mmu_->serial_mask()) != 0 && (div_counter_ & mmu_->serial_mask()) == 0)
+			mmu_->serial_clock_edge();
 		static constexpr int kBits[4] = {9, 3, 5, 7};
 		const int bit = kBits[tac_ & 0x03];
 		const bool enabled = (tac_ & 0x04) != 0;
@@ -47,13 +57,29 @@ void Timer::step(u32 mcycles)
 
 void Timer::clock_tima()
 {
-	if (tima_ == 0xFF) {
+	tima_++;
+	if (tima_ == 0) {
+		// The register takes TMA straight away, but the *reload* is not
+		// finished: reads report 0 for the next M-cycle, the timer interrupt
+		// arrives one M-cycle after that, and only then does a TIMA write stick
+		// again. Writing TMA inside that window cancels the reload (the TMA
+		// write below also lands in TIMA).
 		tima_ = tma_;
-		// https://gbdev.io/pandocs/Interrupts.html (Timer vector 0x50).
+		tima_reload_ = TimaReload::Reloading;
+	}
+}
+
+void Timer::advance_tima_reload()
+{
+	// Reloaded -> Running is bookkeeping; Reloading -> Reloaded is where the
+	// timer interrupt (vector 0x50) is finally raised.
+	// https://gbdev.io/pandocs/Interrupts.html
+	if (tima_reload_ == TimaReload::Reloaded) {
+		tima_reload_ = TimaReload::Running;
+	} else if (tima_reload_ == TimaReload::Reloading) {
 		if (mmu_)
 			mmu_->request_interrupt(2);
-	} else {
-		tima_++;
+		tima_reload_ = TimaReload::Reloaded;
 	}
 }
 
@@ -64,6 +90,10 @@ u8 Timer::read_div() const
 
 u8 Timer::read_tima() const
 {
+	// During the reload window the counter reads back as 0 even though the
+	// register already holds TMA (SameBoy Core/memory.c GB_IO_TIMA read).
+	if (tima_reload_ == TimaReload::Reloading)
+		return 0;
 	return tima_;
 }
 
@@ -91,12 +121,19 @@ void Timer::write_div(u8 /*value*/)
 
 void Timer::write_tima(u8 value)
 {
-	tima_ = value;
+	// A write in the Reloaded window is dropped: the reload has already
+	// happened, so the value would be overwritten by it anyway.
+	if (tima_reload_ != TimaReload::Reloaded)
+		tima_ = value;
 }
 
 void Timer::write_tma(u8 value)
 {
 	tma_ = value;
+	// Writing TMA while the reload is pending cancels it: TIMA keeps the new
+	// TMA instead of the one the overflow had already latched.
+	if (tima_reload_ != TimaReload::Running)
+		tima_ = value;
 }
 
 void Timer::write_tac(u8 value)
@@ -118,4 +155,27 @@ void Timer::write_tac(u8 value)
 		clock_tima();
 }
 
+void Timer::save(StateBuffer &buf) const
+{
+	buf.write(div_counter_);
+	buf.write(tima_);
+	buf.write(tma_);
+	buf.write(tac_);
+	buf.write(static_cast<u8>(tima_reload_));
+	buf.write(div_frozen_);
+	buf.write(double_speed_);
+}
+
+void Timer::load(StateBuffer &buf)
+{
+	buf.read(div_counter_);
+	buf.read(tima_);
+	buf.read(tma_);
+	buf.read(tac_);
+	u8 reload = 0;
+	buf.read(reload);
+	tima_reload_ = static_cast<TimaReload>(reload);
+	buf.read(div_frozen_);
+	buf.read(double_speed_);
+}
 } // namespace gb

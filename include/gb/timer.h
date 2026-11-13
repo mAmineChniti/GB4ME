@@ -1,5 +1,6 @@
 #pragma once
 
+#include "state.h"
 #include "types.h"
 
 namespace gb
@@ -41,6 +42,13 @@ class Timer
 	void write_tma(u8 value);
 	void write_tac(u8 value);
 
+	// Savestate: the divider's internal 16-bit counter is not visible
+	// through any register (DIV only exposes its high byte), so without it
+	// a reloaded state would restart DIV from a different sub-phase and
+	// drift forever.
+	void save(StateBuffer &buf) const;
+	void load(StateBuffer &buf);
+
 	// CGB speed-switch freeze (Pan Docs KEY1): DIV does not tick while the
 	// CPU is stopped for 2050 M-cycles after STOP (TIMA frozen with it).
 	void set_div_frozen(bool frozen)
@@ -57,6 +65,18 @@ class Timer
 	u8 tac_ = 0;
 	bool div_frozen_ = false;   // Set during the STOP speed-switch stall.
 	bool double_speed_ = false; // CGB KEY1: divider runs at 2x wall rate.
+
+	// TIMA overflow is a three-phase reload, not an instant one (Pan Docs
+	// "Timer": "TIMA becomes 00 for 4 cycles, the interrupt is requested, then
+	// TMA is loaded"). SameBoy models the same thing as a state machine stepped
+	// once per M-cycle (Core/timing.c advance_tima_state_machine):
+	//   Running   - normal
+	//   Reloading - the register already holds TMA but reads return 0 and no
+	//               interrupt has been raised yet
+	//   Reloaded  - the interrupt has been raised, and a TIMA write is ignored
+	enum class TimaReload : u8 { Running, Reloading, Reloaded };
+	TimaReload tima_reload_ = TimaReload::Running;
+	void advance_tima_reload();
 
 	void clock_tima();
 };

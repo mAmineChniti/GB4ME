@@ -7,6 +7,7 @@ namespace gba
 
 class GbaBus;
 class GbaIrq;
+class GbaScheduler;
 
 // GBA DMA channels 0-3 (Phase 5). Immediate transfers run synchronously on
 // the enable edge; VBlank/HBlank/FIFO transfers fire via trigger() from the
@@ -51,12 +52,29 @@ class GbaDma
 	{
 		irq_ = irq;
 	}
+	// Scheduler wiring: the transfer's bus moves happen at trigger time
+	// (as before), but completion - enable clear, repeat reload, IRQ - is a
+	// scheduler event after the transfer's bus latency, so timer/PPU events
+	// landing mid-transfer fire before completion instead of after it.
+	// Events are guarded by a per-channel generation counter (no cancel):
+	// a manual stop or re-enable invalidates the pending one.
+	void setScheduler(GbaScheduler *scheduler)
+	{
+		scheduler_ = scheduler;
+	}
+	// Re-arm from restored state; the queue itself is not serialized.
+	void rearmEvents();
+	// True while a completion event is scheduled (tests / diagnostics).
+	bool completion_pending(unsigned ch) const
+	{
+		return ch < kChannels && pending_[ch];
+	}
 
 	// Save state serialization.
 	void save(StateBuffer &out) const;
 	void load(const StateBuffer &in);
 
-	u16 read(u32 addr) const;
+	u16 read(u32 addr);
 	void write(u32 addr, u16 value);
 
 	// PPU/audio triggers. Fires armed channels whose timing matches.
@@ -88,8 +106,15 @@ class GbaDma
 
 	GbaBus *bus_ = nullptr;
 	GbaIrq *irq_ = nullptr;
+	GbaScheduler *scheduler_ = nullptr;
 	Channel channels_[kChannels]{};
 	u64 pending_cycles_ = 0;
+	// Per-channel completion state: `gen_` invalidates a pending event when
+	// the channel is stopped or reprogrammed under it; `deadline_` is the
+	// absolute tick the completion fires at (serialized for save states).
+	bool pending_[kChannels]{};
+	u64 deadline_[kChannels]{};
+	u32 gen_[kChannels]{};
 
 	static unsigned maxCount(unsigned ch)
 	{
@@ -100,6 +125,9 @@ class GbaDma
 	void latch(unsigned ch);
 	void transfer(unsigned ch, bool fifo);
 	void finish(unsigned ch);
+	void scheduleCompletion(unsigned ch, u64 latency);
+	void onCompletion(unsigned ch, u32 gen);
+	void cancelPending(unsigned ch);
 };
 
 } // namespace gba

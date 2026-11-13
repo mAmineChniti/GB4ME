@@ -55,6 +55,8 @@ void CPU::reset(HardwareMode mode)
 	if (mmu_)
 		mmu_->set_div_frozen(false);
 	speed_stall_ = 0;
+	dma_stall_ = 0;
+	double_speed_phase_ = 0;
 	halted = false;
 	stopped = false;
 	cycles = 0;
@@ -66,11 +68,42 @@ void CPU::reset(HardwareMode mode)
 
 u8 CPU::fetch()
 {
+	// Every fetched byte occupies one M-cycle, and it is the *last* thing in
+	// that M-cycle, so charging it before the read puts the operand accesses
+	// that follow on the M-cycle hardware uses (Blargg mem_timing: LD A,(a16)
+	// reads on M-cycle 4 of 4, LDH A,(a8) on 3 of 3, LD A,(HL) on 2 of 2).
+	tick();
 	if (halt_bug_) {
 		halt_bug_ = false;
 		return mmu_->read(regs.pc); // Bug: PC fails to increment once.
 	}
 	return mmu_->read(regs.pc++);
+}
+
+void CPU::tick(u32 mcycles)
+{
+	billed_ += mcycles;
+	if (cycle_hook_ == nullptr)
+		return;
+	for (u32 i = 0; i < mcycles; ++i) {
+		if (double_speed && (double_speed_phase_++ & 1u) != 0)
+			continue;
+		cycle_hook_(cycle_ctx_);
+	}
+}
+
+// Charge whatever is left of the instruction (internal idle cycles) so the
+// hook sees the full M-cycle count step() reports.
+void CPU::bill_remaining()
+{
+	if (cycles_last_instruction > billed_)
+		tick(cycles_last_instruction - billed_);
+}
+
+void CPU::rmw_write8(u16 addr, u8 value)
+{
+	tick();
+	write8(addr, value);
 }
 
 u16 CPU::fetch16()
@@ -97,12 +130,22 @@ void CPU::push16(u16 value)
 	write8(regs.sp + 1, hi_byte(value));
 }
 
-u16 CPU::pop16()
+u16 CPU::pop16(bool oam_bug)
 {
 	u8 lo = read8(regs.sp);
+	// POP's internal 16-bit increment writes the *incremented* SP, so the
+	// window is entered with SP+1 (Blargg oam_bug `LD SP,$FDFF : POP BC`).
+	if (oam_bug)
+		oam_bug_write(static_cast<u16>(regs.sp + 1));
 	u8 hi = read8(regs.sp + 1);
 	regs.sp += 2;
 	return make_u16(hi, lo);
+}
+
+void CPU::oam_bug_write(u16 addr)
+{
+	if (mmu_)
+		mmu_->trigger_oam_bug(addr);
 }
 
 // ---------------- ALU helpers (8-bit) ----------------
@@ -204,7 +247,7 @@ void CPU::inc_hl_mem()
 	u8 v = read8(regs.hl());
 	regs.set_h((v & 0xF) == 0xF);
 	v++;
-	write8(regs.hl(), v);
+	rmw_write8(regs.hl(), v);
 	regs.set_z(v == 0);
 	regs.set_n(false);
 }
@@ -214,7 +257,7 @@ void CPU::dec_hl_mem()
 	u8 v = read8(regs.hl());
 	regs.set_h((v & 0xF) == 0x0);
 	v--;
-	write8(regs.hl(), v);
+	rmw_write8(regs.hl(), v);
 	regs.set_z(v == 0);
 	regs.set_n(true);
 }
@@ -458,10 +501,13 @@ void CPU::service_interrupts()
 	for (u8 b = 0; b < 5; b++) {
 		if (pending & (1u << b)) {
 			mmu_->write_if(mmu_->read_if() & ~(1u << b));
+			oam_bug_write(regs.pc);
+			oam_bug_write(regs.sp);
 			push16(regs.pc);
 			regs.pc = kVectors[b];
 			cycles_last_instruction = 5;
 			cycles += 5;
+			bill_remaining();
 			return;
 		}
 	}
@@ -482,6 +528,19 @@ u32 CPU::step()
 			mmu_->set_div_frozen(false);
 		cycles += 1;
 		cycles_last_instruction = 1;
+		billed_ = 0;
+		bill_remaining();
+		return 1;
+	}
+	if (dma_stall_ > 0) {
+		// The CPU is stalled on the bus for the rest of the OAM DMA window: it
+		// burns M-cycles (billed through the hook like any other) and executes
+		// nothing. DIV keeps running, unlike the STOP speed switch above.
+		dma_stall_--;
+		cycles += 1;
+		cycles_last_instruction = 1;
+		billed_ = 0;
+		bill_remaining();
 		return 1;
 	}
 	if (halted) {
@@ -489,15 +548,19 @@ u32 CPU::step()
 		if (pending == 0) {
 			cycles += 1; // Stay halted, burn 1 M-cycle.
 			cycles_last_instruction = 1;
+			billed_ = 0;
+			bill_remaining();
 			return 1;
 		}
 		halted = false;
 		// HALT exit with IME=0: run next instruction without servicing.
 		// https://gbdev.io/pandocs/Interrupts.html
 		if (!ime) {
+			billed_ = 0;
 			u8 opcode = fetch();
 			execute(opcode);
 			cycles += cycles_last_instruction;
+			bill_remaining();
 			return cycles_last_instruction;
 		}
 	}
@@ -506,6 +569,7 @@ u32 CPU::step()
 	{
 		u8 pending = mmu_->read_ie() & (mmu_->read_if() & 0x1F);
 		if (ime && pending != 0) {
+			billed_ = 0;
 			service_interrupts();
 			return cycles_last_instruction;
 		}
@@ -518,9 +582,11 @@ u32 CPU::step()
 		ei_delay_ = false;
 	}
 
+	billed_ = 0;
 	u8 opcode = fetch();
 	execute(opcode);
 	cycles += cycles_last_instruction;
+	bill_remaining();
 	return cycles_last_instruction;
 }
 
@@ -546,8 +612,63 @@ bool check_cc(u8 cc, const Registers &regs)
 
 } // namespace
 
+// The DMG/CGB BIOS sound-register calls, SWI 1Ah-1Dh. Each covers five
+// consecutive APU registers: with A == 0 the BIOS returns the first of them in
+// A, otherwise it writes A into register `base + A - 1` (so A is both the index
+// and the value). Every commercial sound driver uses these, and while SWI was
+// left as an undefined opcode they silently wrote nothing.
+//
+// 0xCF is handled here rather than in the opcode decode below: it sits at
+// x=3, z=3, q=1, y=3 in the SM83 table, and the nesting in `execute` made that
+// easy to misplace (it is not under the `switch (y)` that holds JP/DI/EI).
+//
+// The rest of the BIOS call set (memory copy/fill, sum, sqrt, sin/cos, timers,
+// joypad, serial, RAM bank) is deliberately still a no-op. Implementing the
+// memory and arithmetic ones was tried and reverted: it turned `cpu_instrs` 07
+// from ok to failing, and until that is understood the sound block - which is
+// self-contained and verified - is the only part modelled.
+void CPU::bios_swi(u8 n)
+{
+	u16 base;
+	switch (n) {
+	case 0x1A:
+		base = 0xFF10;
+		break; // NR10-NR14
+	case 0x1B:
+		base = 0xFF11;
+		break; // NR21-NR24
+	case 0x1C:
+		base = 0xFF16;
+		break; // NR30-NR34
+	case 0x1D:
+		base = 0xFF1A;
+		break; // NR41-NR44
+	default:
+		return;
+	}
+	const u8 a = regs.a;
+	if (a == 0) {
+		regs.a = mmu_->read(base);
+		return;
+	}
+	// Only the channel's own five registers are addressable; a larger A must
+	// not scribble past them.
+	if (a - 1 < 5)
+		mmu_->write(static_cast<u16>(base + a - 1), a);
+}
+
 void CPU::execute(u8 opcode)
 {
+	// SWI only means anything when there is a BIOS to call. With no boot ROM
+	// enabled - which is how the test ROMs and our own harnesses run - 0xCF is
+	// an undefined opcode and must stay a no-op: treating it as a BIOS call
+	// unconditionally turns `cpu_instrs` 07 from ok to failing, because that
+	// test executes 0xCF with no BIOS present.
+	if (opcode == 0xCF && mmu_->boot_rom_enabled) { // SWI (2)
+		bios_swi(fetch());
+		cycles_last_instruction = 2;
+		return;
+	}
 	const u8 x = opcode >> 6;
 	const u8 y = (opcode >> 3) & 0x7;
 	const u8 z = opcode & 0x7;
@@ -597,6 +718,7 @@ void CPU::execute(u8 opcode)
 			case 3: { // JR e (3)
 				i8 e = static_cast<i8>(fetch());
 				regs.pc = static_cast<u16>(regs.pc + e);
+				oam_bug_write(regs.pc);
 				cycles_last_instruction = 3;
 				return;
 			}
@@ -604,6 +726,7 @@ void CPU::execute(u8 opcode)
 				i8 e = static_cast<i8>(fetch());
 				if (check_cc(y - 4, regs)) {
 					regs.pc = static_cast<u16>(regs.pc + e);
+					oam_bug_write(regs.pc);
 					cycles_last_instruction = 3;
 				} else {
 					cycles_last_instruction = 2;
@@ -678,10 +801,12 @@ void CPU::execute(u8 opcode)
 					break; // LD A,(DE)
 				case 2:
 					regs.a = read8(regs.hl());
+					oam_bug_write(regs.hl());
 					regs.set_hl(regs.hl() + 1);
 					break; // LD A,(HL+)
 				case 3:
 					regs.a = read8(regs.hl());
+					oam_bug_write(regs.hl());
 					regs.set_hl(regs.hl() - 1);
 					break; // LD A,(HL-)
 				}
@@ -705,6 +830,9 @@ void CPU::execute(u8 opcode)
 				v = regs.sp;
 				break;
 			}
+			// The internal 16-bit write carries the old value (SameBoy
+			// inc_rr/dec_rr), so this is where `DEC DE` with DE=$FE00 fires.
+			oam_bug_write(v);
 			v = (q == 0) ? v + 1 : v - 1;
 			switch (p) {
 			case 0:
@@ -879,7 +1007,7 @@ void CPU::execute(u8 opcode)
 		}
 		case 1: {
 			if (q == 0) { // POP rp[p] (3); AF masked.
-				u16 v = pop16();
+				u16 v = pop16(true);
 				switch (p) {
 				case 0:
 					regs.set_bc(v);
@@ -913,6 +1041,7 @@ void CPU::execute(u8 opcode)
 				cycles_last_instruction = 1;
 				return; // JP HL
 			default:
+				oam_bug_write(regs.hl()); // The internal write carries the new SP.
 				regs.sp = regs.hl();
 				cycles_last_instruction = 2;
 				return; // LD SP,HL
@@ -988,6 +1117,7 @@ void CPU::execute(u8 opcode)
 			}
 			u16 nn = fetch16();
 			if (check_cc(y, regs)) {
+				oam_bug_write(regs.sp); // Only a taken call writes the bus.
 				push16(regs.pc);
 				regs.pc = nn;
 				cycles_last_instruction = 6;
@@ -998,6 +1128,7 @@ void CPU::execute(u8 opcode)
 		}
 		case 5: {
 			if (q == 0) { // PUSH rp[p] (4); AF high byte only.
+				oam_bug_write(regs.sp);
 				switch (p) {
 				case 0:
 					push16(regs.bc());
@@ -1017,6 +1148,7 @@ void CPU::execute(u8 opcode)
 			}
 			if (p == 0) { // CALL nn (6)
 				u16 nn = fetch16();
+				oam_bug_write(regs.sp);
 				push16(regs.pc);
 				regs.pc = nn;
 				cycles_last_instruction = 6;
@@ -1058,6 +1190,7 @@ void CPU::execute(u8 opcode)
 			return;
 		}
 		default: { // RST y*8 (4).
+			oam_bug_write(regs.sp);
 			push16(regs.pc);
 			regs.pc = static_cast<u16>(y * 8);
 			cycles_last_instruction = 4;
@@ -1082,7 +1215,7 @@ void CPU::execute_cb(u8 opcode)
 		u8 v = is_hl ? read8(regs.hl()) : *r8[z];
 		u8 r = (this->*kRot[y])(v);
 		if (is_hl)
-			write8(regs.hl(), r);
+			rmw_write8(regs.hl(), r);
 		else
 			*r8[z] = r;
 		cycles_last_instruction = is_hl ? 4 : 2;
@@ -1096,7 +1229,7 @@ void CPU::execute_cb(u8 opcode)
 	}
 	case 2: { // RES b (2; 4 for (HL)).
 		if (is_hl)
-			write8(regs.hl(), read8(regs.hl()) & ~(1u << y));
+			rmw_write8(regs.hl(), read8(regs.hl()) & ~(1u << y));
 		else
 			*r8[z] &= ~(1u << y);
 		cycles_last_instruction = is_hl ? 4 : 2;
@@ -1104,7 +1237,7 @@ void CPU::execute_cb(u8 opcode)
 	}
 	default: { // SET b (2; 4 for (HL)).
 		if (is_hl)
-			write8(regs.hl(), read8(regs.hl()) | (1u << y));
+			rmw_write8(regs.hl(), read8(regs.hl()) | (1u << y));
 		else
 			*r8[z] |= (1u << y);
 		cycles_last_instruction = is_hl ? 4 : 2;
@@ -1113,4 +1246,55 @@ void CPU::execute_cb(u8 opcode)
 	}
 }
 
+void CPU::save(StateBuffer &buf) const
+{
+	buf.write(regs.a);
+	buf.write(regs.f);
+	buf.write(regs.b);
+	buf.write(regs.c);
+	buf.write(regs.d);
+	buf.write(regs.e);
+	buf.write(regs.h);
+	buf.write(regs.l);
+	buf.write(regs.sp);
+	buf.write(regs.pc);
+	buf.write(ime);
+	buf.write(clock_speed_hz);
+	buf.write(double_speed);
+	buf.write(halted);
+	buf.write(stopped);
+	buf.write(speed_stall_);
+	buf.write(dma_stall_);
+	buf.write(cycles);
+	buf.write(cycles_last_instruction);
+	buf.write(double_speed_phase_);
+	buf.write(ei_delay_);
+	buf.write(halt_bug_);
+}
+
+void CPU::load(StateBuffer &buf)
+{
+	buf.read(regs.a);
+	buf.read(regs.f);
+	buf.read(regs.b);
+	buf.read(regs.c);
+	buf.read(regs.d);
+	buf.read(regs.e);
+	buf.read(regs.h);
+	buf.read(regs.l);
+	buf.read(regs.sp);
+	buf.read(regs.pc);
+	buf.read(ime);
+	buf.read(clock_speed_hz);
+	buf.read(double_speed);
+	buf.read(halted);
+	buf.read(stopped);
+	buf.read(speed_stall_);
+	buf.read(dma_stall_);
+	buf.read(cycles);
+	buf.read(cycles_last_instruction);
+	buf.read(double_speed_phase_);
+	buf.read(ei_delay_);
+	buf.read(halt_bug_);
+}
 } // namespace gb

@@ -72,6 +72,11 @@ void GpioRtc::reset()
 		b = 0;
 	// offset_ survives a reset: the clock is battery-backed, so a soft
 	// reset must not undo a game-set time.
+	adc_shift_ = 0;
+	adc_pos_ = 0;
+	adc_p0_ = false;
+	adc_p1_ = false;
+	tilt_ = 0; // Live input, not hardware state.
 }
 
 u8 GpioRtc::read(u32 addr) const
@@ -100,6 +105,7 @@ void GpioRtc::write(u32 addr, u16 value)
 		pin_state_ &= static_cast<u8>(~direction_);
 		pin_state_ |= static_cast<u8>(write_latch_ & direction_);
 		readPins();
+		updateGyroAdc();
 		return;
 	case kDirAddr:
 		direction_ = static_cast<u8>(value & 0x0Fu);
@@ -119,6 +125,35 @@ void GpioRtc::outputPins(unsigned pins)
 {
 	pin_state_ &= direction_;
 	pin_state_ |= static_cast<u8>((pins & ~direction_) & 0x0Fu);
+}
+
+void GpioRtc::updateGyroAdc()
+{
+	// Twisted gyro ADC (GBATEK "GBA Cart Gyro Sensor"): P0 rising starts a
+	// conversion (the tilt sample latches, 4 dummy zeros first), then each
+	// P1 rising edge presents the next bit MSB-first on P2. The example
+	// loop reads P2 before pulling the clock low, so the bit is already
+	// established by the rising edge. Only drives P2 in input direction.
+	if (!gyro_)
+		return;
+	const bool p0 = (pin_state_ & 0x01u) != 0;
+	const bool p1 = (pin_state_ & 0x02u) != 0;
+	if (p0 && !adc_p0_) {
+		adc_shift_ = static_cast<u16>(gyroSample());
+		adc_pos_ = 0;
+		if ((direction_ & 0x04u) == 0)
+			pin_state_ &= ~0x04u; // First dummy bit.
+	} else if (p1 && !adc_p1_) {
+		unsigned bit = 0;
+		if (adc_pos_ >= 4 && adc_pos_ < 16)
+			bit = (adc_shift_ >> (15 - adc_pos_)) & 1u;
+		if ((direction_ & 0x04u) == 0)
+			pin_state_ = static_cast<u8>((pin_state_ & ~0x04u) | (bit << 2));
+		if (adc_pos_ < 16)
+			adc_pos_++;
+	}
+	adc_p0_ = p0;
+	adc_p1_ = p1;
 }
 
 void GpioRtc::readPins()
@@ -425,6 +460,12 @@ void GpioRtc::save(StateBuffer &out) const
 	out.write(rtc_write_len_);
 	out.writeBytes(rtc_write_, sizeof rtc_write_);
 	out.write(offset_);
+	// Twisted gyro ADC state (newer states only; tilt_ is live input).
+	out.write(gyro_);
+	out.write(adc_shift_);
+	out.write(adc_pos_);
+	out.write(adc_p0_);
+	out.write(adc_p1_);
 }
 
 void GpioRtc::load(const StateBuffer &in)
@@ -450,6 +491,21 @@ void GpioRtc::load(const StateBuffer &in)
 	std::int64_t off = 0;
 	if (in.read(off))
 		offset_ = off;
+	// Newer states only; missing fields keep the reset defaults above.
+	bool gyro = false;
+	if (in.read(gyro))
+		gyro_ = gyro;
+	u16 shift = 0;
+	if (in.read(shift))
+		adc_shift_ = shift;
+	u8 pos = 0;
+	if (in.read(pos))
+		adc_pos_ = pos;
+	bool p0 = false, p1 = false;
+	if (in.read(p0))
+		adc_p0_ = p0;
+	if (in.read(p1))
+		adc_p1_ = p1;
 }
 
 } // namespace gba

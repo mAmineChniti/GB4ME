@@ -16,6 +16,7 @@ class GbaPpu;
 class GbaAudio;
 class GbaKeypad;
 class Cartridge;
+class Cheats;
 
 // GBA memory bus (Phase 1 skeleton: map + RAM + protection, no devices yet).
 // https://problemkaputt.de/gbatek.htm#gbamemorymap
@@ -27,6 +28,10 @@ class GbaBus
   public:
 	// Region bases/sizes (GBATEK "GBA Memory Map").
 	static constexpr u32 kBiosBase = 0x00000000, kBiosSize = 0x4000;
+	// Open-bus value for locked BIOS reads: mGBA's biosPrefetch reset value
+	// (its HLE equivalent never leaves it, since no real BIOS executes).
+	// Sliced per access width/address exactly like mGBA's Load8/16/32.
+	static constexpr u32 kBiosOpenBus = 0xE3A02004u;
 	static constexpr u32 kEwramBase = 0x02000000, kEwramSize = 0x40000; // 256K
 	static constexpr u32 kIwramBase = 0x03000000, kIwramSize = 0x8000;  // 32K
 	static constexpr u32 kIoBase = 0x04000000, kIoSize = 0x400;
@@ -92,6 +97,10 @@ class GbaBus
 	{
 		cartridge_ = cart;
 	}
+	void setCheats(Cheats *c)
+	{
+		cheats_ = c;
+	}
 
 	// Save state serialization.
 	void save(StateBuffer &out) const;
@@ -148,6 +157,24 @@ class GbaBus
 	// reads answer "idle" and writes are dropped (see bus.cpp).
 	u16 readSerialIdle(u32 addr) const;
 	void noteSerialUse(u32 addr) const;
+	// mGBA debug channel (mgba-emu/suite reporting, NOT SIO): string buffer
+	// at 0x04FFF600-0x04FFF6FF, flags at 0x04FFF700, enable at 0x04FFF780.
+	// A flags store with bit 8 set publishes the buffered string (level =
+	// low 3 bits, informational only; the guest always stores halfwords so
+	// the high byte decides exactly once). The enable register reads
+	// 0x1DEA after a 0xC0DE write, which is how guest code detects the
+	// channel. Headless-safe; the --gba-suite runner parses debug_log.
+	static bool isMgbaDebug(u32 addr)
+	{
+		return addr >= 0x04FFF600u && addr < 0x04FFF800u;
+	}
+	static constexpr u32 kMgbaDbgString = 0x04FFF600u;
+	static constexpr u32 kMgbaDbgFlags = 0x04FFF700u;
+	static constexpr u32 kMgbaDbgEnable = 0x04FFF780u;
+	static constexpr u32 kMgbaDbgSize = 0x100u;
+	static constexpr u16 kMgbaDbgMagic = 0xC0DEu;
+	static constexpr u16 kMgbaDbgAck = 0x1DEAu;
+	std::string debug_log;
 
 	// WAITCNT (0x04000204) backing. Reset default 0x0000; Phase 5 routes
 	// the I/O write here. Tables below follow GBATEK "Address Bus Width
@@ -166,7 +193,30 @@ class GbaBus
 	// half of a split 32-bit access is always sequential). Used for both
 	// code fetches and data accesses (Phase 3); the CPU accumulates these
 	// on top of its fixed per-instruction overhead.
-	u32 accessCycles(u32 addr, unsigned width_bytes, bool sequential) const;
+	//
+	// With tick-clocking enabled (GameBoyAdvance::step turns it on around
+	// each instruction), the cost also advances the scheduler clock right
+	// away, so armed events fire mid-instruction at their exact ticks
+	// instead of at the next instruction boundary. Off by default, so unit
+	// probes and GbaMachine runs keep bulk timing.
+	u32 accessCycles(u32 addr, unsigned width_bytes, bool sequential);
+	void setTickClock(bool tick)
+	{
+		tick_clock_ = tick;
+	}
+	// Opcode-fetch cost with the WAITCNT game-pak prefetch buffer (GBATEK
+	// "System Control" bit 14). Data accesses and DMA use accessCycles and
+	// never touch the buffer. With prefetch off this is exactly
+	// accessCycles; with it on, a non-sequential fetch inside the buffered
+	// 16-byte window (mGBA's 8-halfword overlap) costs S instead of N, which
+	// is what makes tight ROM loops cheap. Everything else - including the
+	// first-event arming slack documented in GameBoyAdvance::step() - is
+	// unchanged.
+	u32 fetchCycles(u32 addr, unsigned width_bytes, bool sequential);
+	bool prefetchEnabled() const
+	{
+		return (waitcnt_ & 0x4000u) != 0;
+	}
 
 	static Region decode(u32 addr);
 
@@ -201,6 +251,11 @@ class GbaBus
 	size_t rom_size_ = 0;
 	bool bios_active_ = false;
 	u16 waitcnt_ = 0;
+	// Game-pak prefetch buffer (see fetchCycles): the 16-byte block of the
+	// last ROM fetch while WAITCNT bit 14 is set. Serialized (a load must
+	// continue with the same timing the save had).
+	bool prefetch_valid_ = false;
+	u32 prefetch_base_ = 0;
 	// Re-entrancy guard for the 8-bit I/O merge path (write8 -> write16 ->
 	// write8 fallback). Without it an unhandled register would recurse.
 	bool io_merge_active_ = false;
@@ -210,10 +265,32 @@ class GbaBus
 	GbaPpu *ppu_ = nullptr;
 	GbaKeypad *keypad_ = nullptr;
 	GbaAudio *audio_ = nullptr;
+	Cheats *cheats_ = nullptr;
 	GbaScheduler *scheduler_ = nullptr;
+	// Per-cycle clock advancement (see accessCycles). Owned by whoever
+	// drives execution; never serialized (a unit of work always ends at an
+	// instruction boundary, where the clock is whole).
+	bool tick_clock_ = false;
+	void tickClock(unsigned cost);
+	u32 accessCyclesUnticked(u32 addr, unsigned width_bytes, bool sequential) const;
+	// mGBA debug channel state (see isMgbaDebug): enable latch, string
+	// staging buffer, last flags. Serialized (a load continues the same
+	// session); debug_log is runner output and is not (serial_log precedent).
+	// mgba_enable_word_ is intra-store scratch for byte-wise assembly (like
+	// io_merge_active_) and is deliberately not serialized.
+	bool mgba_debug_on_ = false;
+	std::array<u8, 0x100> mgba_dbg_{};
+	u16 mgba_flags_ = 0;
+	u16 mgba_enable_word_ = 0;
+	void writeMgbaDebug(u32 addr, u8 value);
+	u8 readMgbaDebug(u32 addr) const;
+	void commitMgbaDebug();
 	mutable bool serial_warned_ = false;
 	Cartridge *cartridge_ = nullptr;
 
+	u8 read8_raw(u32 addr);
+	u16 read16_raw(u32 addr);
+	u32 read32_raw(u32 addr);
 	u8 readRom(u32 addr) const;
 	// Region-relative SRAM/Flash offset with the GBATEK mirror masking
 	// applied (32MB window + chip-size repeat).

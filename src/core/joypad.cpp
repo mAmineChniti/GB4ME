@@ -58,9 +58,35 @@ u8 Joypad::read_p1() const
 
 void Joypad::write_p1(u8 value)
 {
+	// The joypad interrupt is a high->low transition on any of P10-P13, and
+	// those lines are multiplexed by the two select bits - so *switching* a
+	// group on while a button in it is held (or off while it is not) drops a
+	// line low and interrupts (Pan Docs "Joypad Input"). Software that polls
+	// the pad by flipping the selects every scanline therefore sees these.
+	const u8 before = read_p1() & 0x0F;
 	p1_ = value;
 	select_buttons_ = (value & 0x20) == 0;
 	select_dpad_ = (value & 0x10) == 0;
+	if (mmu_ && (before & ~read_p1() & 0x0F) != 0)
+		mmu_->request_interrupt(4);
 }
 
+void Joypad::save(StateBuffer &buf) const
+{
+	buf.write(p1_);
+	buf.write(select_buttons_);
+	buf.write(select_dpad_);
+	buf.write(key_state_);
+}
+
+void Joypad::load(StateBuffer &buf)
+{
+	// The P1 select lines and the live key state are both readable
+	// behaviour, not just bookkeeping: a game polling P1 after a load must
+	// see the same lines it left behind.
+	buf.read(p1_);
+	buf.read(select_buttons_);
+	buf.read(select_dpad_);
+	buf.read(key_state_);
+}
 } // namespace gb

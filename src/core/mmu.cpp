@@ -6,12 +6,16 @@
 // GBC: each stub will activate real behavior (WRAM/VRAM banking, HDMA, palettes).
 
 #include "gb/mmu.h"
+
 #include "gb/apu.h"
 #include "gb/cartridge.h"
+#include "gb/cheats.h"
 #include "gb/cpu.h"
 #include "gb/joypad.h"
 #include "gb/ppu.h"
 #include "gb/timer.h"
+#include <cstdio>
+#include <cstdlib>
 
 namespace gb
 {
@@ -31,6 +35,9 @@ void MMU::reset()
 	if_register_ = 0;
 	serial_sb = 0x00;
 	serial_sc = 0x7E;
+	serial_count_ = 0;
+	serial_master_clock_ = false;
+	serial_mask_ = 0x80;
 	serial_log.clear();
 	boot_rom_enabled = true;
 	wram_bank_ = 1;
@@ -53,6 +60,8 @@ void MMU::set_hardware_mode(HardwareMode m)
 		wram_bank_ = 1;
 	if (ppu_)
 		ppu_->set_hardware_mode(m);
+	if (apu_)
+		apu_->set_hardware_mode(m);
 }
 
 void MMU::set_div_frozen(bool frozen)
@@ -177,25 +186,50 @@ void MMU::hdma_step_hblank()
 	}
 }
 
+void MMU::serial_clock_edge()
+{
+	// The internal clock toggles every time the selected divider bit falls;
+	// one bit is shifted per *full* period, i.e. on every other edge.
+	// https://gbdev.io/pandocs/Serial_Data_Transfer_Link_Cable.html
+	serial_master_clock_ = !serial_master_clock_;
+	if (serial_master_clock_ || (serial_sc & 0x81) != 0x81)
+		return;
+	if (++serial_count_ < 8)
+		return;
+	serial_count_ = 0;
+	serial_sc &= ~0x80; // Transfer finished: the start bit clears itself.
+	// A completed transfer raises the serial interrupt (Pan Docs: requested on
+	// the 1->0 edge of the transfer-complete bit). Serial = IF bit 3.
+	request_interrupt(3);
+	// SB is shifted left per bit, with the cable's incoming bit shifted in at
+	// the bottom. Nothing is plugged into the other end here, so every incoming
+	// bit reads 1 - exactly what SameBoy does without a link partner - and the
+	// byte that went out is what the headless runner logs.
+	const u8 sent = serial_sb;
+	serial_sb = static_cast<u8>((sent << 1) | 0x01);
+	// Bounded ring: a test ROM that loops printing would otherwise grow this
+	// string until the process OOMs. Keeps the most recent 64KiB, which is far
+	// more than any Blargg result line needs.
+	if (serial_log.size() >= 65536)
+		serial_log.erase(0, 32768);
+	serial_log.push_back(static_cast<char>(sent));
+}
+
 u8 MMU::read(u16 addr)
 {
+	u8 v = 0xFF;
 	if (boot_rom_enabled && addr < 0x100)
-		return boot_rom_[addr];
-
-	if (addr < 0x8000) {
-		return cartridge_ ? cartridge_->read_rom(addr) : 0xFF;
-	}
-	if (addr < 0xA000) {
+		v = boot_rom_[addr];
+	else if (addr < 0x8000) {
+		v = cartridge_ ? cartridge_->read_rom(addr) : 0xFF;
+	} else if (addr < 0xA000) {
 		// VRAM via PPU only (Rule 2: no direct array access).
-		return ppu_ ? ppu_->read_vram(addr - 0x8000) : 0xFF;
-	}
-	if (addr < 0xC000) {
-		return cartridge_ ? cartridge_->read_ram(addr - 0xA000) : 0xFF;
-	}
-	if (addr < 0xD000) {
-		return wram_banks_[0][addr - 0xC000];
-	}
-	if (addr < 0xE000) {
+		v = ppu_ ? ppu_->read_vram(addr - 0x8000) : 0xFF;
+	} else if (addr < 0xC000) {
+		v = cartridge_ ? cartridge_->read_ram(addr - 0xA000) : 0xFF;
+	} else if (addr < 0xD000) {
+		v = wram_banks_[0][addr - 0xC000];
+	} else if (addr < 0xE000) {
 		if (is_cgb()) {
 			// GBC: D000-DFFF maps to selectable bank 1-7 via SVBK (0xFF70).
 			// SVBK=0 is forced to 1.
@@ -203,26 +237,28 @@ u8 MMU::read(u16 addr)
 			u8 bank = wram_bank_ & 0x07;
 			if (bank == 0)
 				bank = 1;
-			return wram_banks_[bank][addr - 0xD000];
+			v = wram_banks_[bank][addr - 0xD000];
+		} else {
+			v = wram_banks_[1][addr - 0xD000];
 		}
-		return wram_banks_[1][addr - 0xD000];
+	} else if (addr < 0xFE00) {
+		v = read(addr - 0x2000); // Echo RAM mirror.
+	} else if (addr < 0xFEA0) {
+		v = ppu_ ? ppu_->read_oam(addr - 0xFE00) : 0xFF;
+	} else if (addr < 0xFF00) {
+		v = 0xFF; // Unusable memory.
+	} else if (addr < 0xFF80) {
+		return read_io(addr); // IO registers never take cheats.
+	} else if (addr == 0xFFFF) {
+		v = read_ie();
+	} else {
+		v = hram_[addr - 0xFF80];
 	}
-	if (addr < 0xFE00) {
-		return read(addr - 0x2000); // Echo RAM mirror.
-	}
-	if (addr < 0xFEA0) {
-		return ppu_ ? ppu_->read_oam(addr - 0xFE00) : 0xFF;
-	}
-	if (addr < 0xFF00) {
-		return 0xFF; // Unusable memory.
-	}
-	if (addr < 0xFF80) {
-		return read_io(addr);
-	}
-	if (addr == 0xFFFF) {
-		return ie_register_;
-	}
-	return hram_[addr - 0xFF80];
+	// Cheats patch bus reads (ROM/RAM/WRAM/HRAM); IO is excluded above so
+	// timer/serial/PPU registers can never be overridden by a typo.
+	if (cheats_ != nullptr)
+		v = cheats_->apply(addr, v);
+	return v;
 }
 
 void MMU::write(u16 addr, u8 value)
@@ -264,6 +300,12 @@ void MMU::write(u16 addr, u8 value)
 	} else {
 		hram_[addr - 0xFF80] = value;
 	}
+}
+
+void MMU::trigger_oam_bug(u16 addr)
+{
+	if (ppu_)
+		ppu_->trigger_oam_bug(addr);
 }
 
 u8 MMU::read_io(u16 addr)
@@ -401,22 +443,18 @@ void MMU::write_io(u16 addr, u8 value)
 		serial_sb = value;
 		return;
 	case 0xFF02:
-		serial_sc = value;
-		// Blargg ROMs print via serial: SC=0x81 starts a transfer of SB.
+		// Blargg ROMs print via serial: SC=0x81 starts a transfer of SB, which
+		// now actually takes 8192 T-cycles (fast mode 128) instead of
+		// completing in the same write.
 		// https://gbdev.io/pandocs/Serial_Data_Transfer_Link_Cable.html
-		if ((value & 0x81) == 0x81) {
-			// Bounded ring: a test ROM that loops printing would otherwise
-			// grow this string until the process OOMs. Keeps the most recent
-			// 64KiB, which is far more than any Blargg result line needs.
-			if (serial_log.size() >= 65536)
-				serial_log.erase(0, 32768);
-			serial_log.push_back(static_cast<char>(serial_sb));
-			serial_sc &= ~0x80; // Transfer completes instantly; clear start bit.
-			// A completed transfer raises the serial interrupt (Pan Docs:
-			// requested on the 8->1 edge of the transfer-complete bit).
-			// Serial = IF bit 3.
-			request_interrupt(3);
-		}
+		serial_count_ = 0;
+		// Bits 2-6 are unused and read back as 1 (SameBoy writes
+		// `value | ~0x83`); bit 1 selects the CGB fast clock.
+		serial_sc = value | 0x7C;
+		serial_mask_ = (is_cgb() && (value & 0x02)) ? 0x0004 : 0x0080;
+		// An SC write during an externally-clocked transfer shifts a bit.
+		if (serial_master_clock_)
+			serial_clock_edge();
 		return;
 	case 0xFF04:
 		if (timer_)
@@ -464,6 +502,13 @@ void MMU::write_io(u16 addr, u8 value)
 	case 0xFF46:
 		if (ppu_)
 			ppu_->write_dma(value);
+		// The copy itself is instant (it bypasses the PPU's mode blocking, DMA
+		// has its own bus), but the CPU really is off the bus for 160
+		// M-cycles afterwards - 160 reads at 4 T-cycles each, per Pan Docs
+		// "OAM DMA Transfer". Every sprite-using game pays this once a frame,
+		// so not charging it made the whole machine run fast.
+		if (cpu_)
+			cpu_->add_dma_stall(160);
 		return;
 	case 0xFF47:
 		if (ppu_)
@@ -577,6 +622,74 @@ void MMU::write_io(u16 addr, u8 value)
 		(void) addr;
 		return;
 	}
+}
+
+void MMU::save(StateBuffer &buf) const
+{
+	buf.writeArray2(wram_banks_);
+	buf.writeArray(hram_);
+	buf.write(wram_bank_);
+	buf.write(static_cast<u8>(hardware_mode_));
+	buf.write(key1_);
+	buf.write(hdma1_);
+	buf.write(hdma2_);
+	buf.write(hdma3_);
+	buf.write(hdma4_);
+	buf.write(hdma5_);
+	buf.write(hdma_active_);
+	buf.write(hdma_src_);
+	buf.write(hdma_dst_);
+	buf.write(hdma_len_);
+	buf.write(hdma_mode_hblank_);
+	buf.write(ff72_);
+	buf.write(ff73_);
+	buf.write(ff74_);
+	buf.write(ff75_);
+	buf.write(ie_register_);
+	buf.write(if_register_);
+	buf.write(serial_sb);
+	buf.write(serial_sc);
+	buf.write(serial_count_);
+	buf.write(serial_master_clock_);
+	buf.write(serial_mask_);
+	buf.write(boot_rom_enabled);
+}
+
+void MMU::load(StateBuffer &buf)
+{
+	buf.readArray2(wram_banks_);
+	buf.readArray(hram_);
+	buf.read(wram_bank_);
+	u8 mode = 0;
+	buf.read(mode);
+	hardware_mode_ = static_cast<HardwareMode>(mode);
+	buf.read(key1_);
+	buf.read(hdma1_);
+	buf.read(hdma2_);
+	buf.read(hdma3_);
+	buf.read(hdma4_);
+	buf.read(hdma5_);
+	buf.read(hdma_active_);
+	buf.read(hdma_src_);
+	buf.read(hdma_dst_);
+	buf.read(hdma_len_);
+	buf.read(hdma_mode_hblank_);
+	buf.read(ff72_);
+	buf.read(ff73_);
+	buf.read(ff74_);
+	buf.read(ff75_);
+	buf.read(ie_register_);
+	buf.read(if_register_);
+	buf.read(serial_sb);
+	buf.read(serial_sc);
+	buf.read(serial_count_);
+	buf.read(serial_master_clock_);
+	buf.read(serial_mask_);
+	buf.read(boot_rom_enabled);
+	// The boot ROM image itself is immutable once loaded (load_boot_rom),
+	// and the PPU/APU/cartridge keep their own memory, so nothing else has
+	// to be re-pointed here - the component pointers are set once in the
+	// GameBoy constructor and are unaffected by a state load.
 }
 
 } // namespace gb

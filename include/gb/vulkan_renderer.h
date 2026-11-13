@@ -7,6 +7,7 @@
 #include <array>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <vulkan/vulkan.h>
 
@@ -37,7 +38,15 @@ class VulkanRenderer
 
 	bool initialize(SDL_Window *window);
 	void shutdown();
-	void render(const PPU::FrameData &frame);
+	// Body-photo asset file under assets/ (default "gbc_body.png"). Set
+	// before initialize(); unknown files fall back to the GBC photo.
+	void set_body_asset(const std::string &asset)
+	{
+		body_asset_ = asset.empty() ? "gbc_body.png" : asset;
+	}
+	// Full-window game (no console): the GUI overlay rebuilds OSD-only, so
+	// stale chrome (shoulders, gear, menu text) can never linger on the game.
+	void render(const PPU::FrameData &frame, const GUIConsole &gui);
 	// Upscaling filter applied when the frame is stretched to the window.
 	void setVideoFilter(VideoFilter f)
 	{
@@ -47,9 +56,27 @@ class VulkanRenderer
 	{
 		lcd_grid_ = depth < 0.0f ? 0.0f : (depth > 1.0f ? 1.0f : depth);
 	}
+	// LCD ghosting (frame persistence): 0 = off. Applied on the CPU before
+	// upload (blend with the previous frame), so no pipeline change is needed
+	// and the menu/thumbnail paths are unaffected.
+	void setGhosting(f32 amount)
+	{
+		ghosting_ = amount < 0.0f ? 0.0f : (amount > 1.0f ? 1.0f : amount);
+		if (ghosting_ <= 0.0f)
+			ghost_prev_.clear();
+	}
+	void resetGhosting()
+	{
+		ghost_prev_.clear();
+	}
+	// One blended pixel (0xAARRGGBB bytes): prev*amt + curr*(1-amt) per
+	// channel in gamma space, alpha kept opaque. Pure so the selftest can
+	// verify the persistence math without a Vulkan device.
+	static u32 ghostBlend(u32 prev, u32 curr, f32 amt);
 	// GBA present path: raw RGBA8 pixels of any size (240x160). The game
 	// texture is recreated when the size changes (rare: core switches).
-	void render_gba(const u32 *pixels, u32 w, u32 h);
+	// Full-window variant takes the console for the OSD-only rebuild (above).
+	void render_gba(const u32 *pixels, u32 w, u32 h, const GUIConsole &gui);
 	void render_gba_with_gui(const u32 *pixels, u32 w, u32 h, const GUIConsole &gui);
 	void render_with_gui(const PPU::FrameData &frame, const GUIConsole &gui);
 	void render_menu(const GUIConsole &gui);
@@ -61,6 +88,9 @@ class VulkanRenderer
 	// until it succeeds. The overlay window is display-only (NoInputs), so
 	// it never captures game input.
 	bool init_imgui();
+	// Switches the debug overlay between ImGui's dark and light styles.
+	// Safe no-op until init_imgui() succeeds (headless selftest safe).
+	void apply_imgui_theme(bool light);
 	void set_imgui_visible(bool v);
 	void toggle_imgui();
 	bool imgui_visible() const
@@ -69,6 +99,32 @@ class VulkanRenderer
 	}
 	void imgui_event(const SDL_Event &ev);
 	bool imgui_captures_keyboard() const;
+	bool imgui_captures_mouse() const;
+	// Interactive debug controls: buttons in the overlay push actions here;
+	// the frontend drains and applies them (1 frame of lag is fine, same as
+	// the stats). Pure queue logic, headless-safe.
+	enum class ImguiAction : u8 {
+		None = 0,
+		VolDown,
+		VolUp,
+		FilterNext,
+		GridNext,
+		GhostNext,
+		TurboToggle,
+		PauseToggle,
+		PaletteNext,
+		HwModeNext,
+		ConsoleNext,
+		SkinNext,
+		ThemeNext,
+		FolderBrowse,
+	};
+	std::vector<ImguiAction> drain_imgui_actions()
+	{
+		std::vector<ImguiAction> out;
+		out.swap(imgui_actions_);
+		return out;
+	}
 	// Per-frame readout pushed by the frontend (1 frame of lag is fine).
 	struct ImguiStats {
 		u64 frame = 0;
@@ -76,7 +132,30 @@ class VulkanRenderer
 		std::string core;
 		float volume = 1.0f;
 		int filter = 0;
+		int grid = 0;
+		int ghost = 0;
+		int palette = 0;
+		int hwmode = 0; // 0 Auto, 1 DMG, 2 CGB.
+		int console = 0;
+		std::string skin; // resolved body-skin display value.
+		int theme = 0;    // 0 Dark, 1 Light.
+		// CPU debugger section: live registers for the running core plus
+		// the newest-first trace-ring slice (hex, no disassembly yet).
+		bool gba_core = false;
+		u16 gb_af = 0, gb_bc = 0, gb_de = 0, gb_hl = 0, gb_sp = 0, gb_pc = 0;
+		u32 gba_regs[16] = {};
+		u32 gba_cpsr = 0;
+		struct TraceLine {
+			u32 addr = 0;
+			u32 instr = 0;
+			bool thumb = false;
+		};
+		static constexpr int kTraceLines = 12;
+		TraceLine trace[kTraceLines] = {};
+		std::string folder;
 		bool ff = false;
+		bool turbo = false;
+		bool paused = false;
 		// Emulation load: how much of the hardware clock the last second
 		// actually achieved (100% = real time) and the same number in
 		// emulated MHz, plus audio health.
@@ -89,6 +168,11 @@ class VulkanRenderer
 		float resample_pct = 0.0f;
 	};
 	void set_imgui_stats(const ImguiStats &s);
+	// Snapshot of the last pushed stats (headless selftest seam).
+	const ImguiStats &imgui_stats() const
+	{
+		return imgui_stats_;
+	}
 
 	// Volume OSD: transient pill flashed by set_volume(), drawn above all
 	// overlay UI while active. Pure clock logic (no upkeep, headless-safe).
@@ -105,6 +189,18 @@ class VulkanRenderer
 	bool volume_osd_active() const
 	{
 		return SDL_GetTicks() / 1000.0 < osd_until_;
+	}
+	// Status OSD: the same transient pill for one-line confirmations
+	// ("Saved slot 3", "No state in slot 3"). Same clock-only logic as the
+	// volume pill, so it stays headless-safe.
+	void flash_status(const std::string &msg)
+	{
+		osd_text_ = msg;
+		osd_text_until_ = SDL_GetTicks() / 1000.0 + 1.5;
+	}
+	bool status_osd_active() const
+	{
+		return !osd_text_.empty() && SDL_GetTicks() / 1000.0 < osd_text_until_;
 	}
 
 	u32 get_framebuffer_width() const
@@ -175,6 +271,14 @@ class VulkanRenderer
 	};
 	VideoFilter video_filter_ = VideoFilter::Nearest;
 	f32 lcd_grid_ = 0.0f;
+	// LCD ghosting state (see setGhosting): the previous RAW frame for the
+	// IIR persistence blend. Sized to tex_w_*tex_h_; a size mismatch means
+	// a new timeline (resize/ROM switch without reset) and uploads unblended.
+	f32 ghosting_ = 0.0f;
+	std::vector<u32> ghost_prev_;
+	// Blends src with the history (when enabled) into the mapped staging
+	// buffer and advances the history. All four game upload paths use this.
+	void upload_frame(void *dst, const u32 *src);
 	// Letterboxes a draw rect to the source aspect ratio (the layout the
 	// renderer has always used; not an integer/whole-multiple scale).
 	struct PixelRect {
@@ -197,12 +301,42 @@ class VulkanRenderer
 	VkSampler body_sampler = VK_NULL_HANDLE;
 	// True when the photo shell texture loaded (best-effort).
 	bool body_photo_ok_ = false;
+	// Body-photo asset file under assets/, resolved from the skin setting
+	// before initialize() (unknown files fall back to the GBC photo).
+	std::string body_asset_ = "gbc_body.png";
 	VkDescriptorSetLayout body_descriptor_set_layout = VK_NULL_HANDLE;
 	std::vector<VkDescriptorSet> body_descriptor_sets;
 	VkDescriptorPool body_descriptor_pool = VK_NULL_HANDLE;
 	VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
 	VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
 	std::vector<VkDescriptorSet> descriptor_sets;
+	// Menu tile thumbnails (src/vulkan/vulkan_renderer_thumbs.cpp): an LRU
+	// of decoded `<rom>.png` / `.thumb.ppm` / slot shots, drawn as textured
+	// quads over the menu cart icon. Empty path = cart icon as before.
+	static constexpr size_t kThumbCacheMax = 12;
+	static constexpr u32 kThumbMaxDim = 512; // larger sources are skipped
+	struct ThumbTex {
+		std::string path;
+		u64 mtime_ns = 0;
+		u32 w = 0, h = 0;
+		VkImage image = VK_NULL_HANDLE;
+		VkDeviceMemory memory = VK_NULL_HANDLE;
+		VkImageView view = VK_NULL_HANDLE;
+		VkDescriptorSet set = VK_NULL_HANDLE;
+		u64 last_frame = 0;
+	};
+	// Tile draws for the current menu frame (window-px rect + texture set),
+	// rebuilt in update_gui_buffers; consumed by record_command_buffer_menu.
+	struct ThumbDraw {
+		GUIConsole::Rect rect{};
+		VkDescriptorSet set = VK_NULL_HANDLE;
+	};
+	std::vector<ThumbTex> thumb_cache_;
+	std::vector<ThumbDraw> thumb_draws_;
+	std::unordered_set<std::string> thumbs_ready_;
+	VkDescriptorPool thumb_descriptor_pool_ = VK_NULL_HANDLE;
+	VkSampler thumb_sampler_ = VK_NULL_HANDLE;
+	u64 thumb_frame_ = 0;
 
 	struct Vertex {
 		Vec2 pos;
@@ -265,6 +399,14 @@ class VulkanRenderer
 	bool create_body_photo_descriptors();
 	bool create_descriptor_sets();
 	bool create_uniform_buffers();
+	// Menu thumbnails: resolve the visible tiles' images into the LRU (call
+	// from render_menu before update_gui_buffers), look one up by path.
+	void resolve_thumbs(const GUIConsole &gui);
+	const ThumbTex *find_thumb(const std::string &path) const;
+	bool ensure_thumb_pool();
+	bool load_thumb(const std::string &path, u64 mtime_ns);
+	void evict_thumb(size_t index);
+	void destroy_thumbs();
 
 	void recreate_swapchain();
 	bool ensure_gui_buffers(u32 verts, u32 indices);
@@ -334,12 +476,17 @@ class VulkanRenderer
 	// ImGui overlay internals (src/vulkan/vulkan_renderer_imgui.cpp).
 	bool imgui_ok_ = false;
 	bool imgui_visible_ = false;
+	bool imgui_settings_open_ = false;
 	ImguiStats imgui_stats_;
+	std::vector<ImguiAction> imgui_actions_;
 	double imgui_last_t_ = 0.0;
 	double imgui_fps_ = 60.0;
 	// Volume OSD state (clock-driven; see flash_volume above).
 	float osd_volume_ = 1.0f;
 	double osd_until_ = 0.0;
+	// Status OSD text (see flash_status above).
+	std::string osd_text_;
+	double osd_text_until_ = 0.0;
 	void prepare_imgui(); // NewFrame + build + Render (call before recording).
 	void draw_imgui(VkCommandBuffer command_buffer); // Record draw data (inside render pass).
 	void shutdown_imgui();

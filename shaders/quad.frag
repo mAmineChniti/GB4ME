@@ -211,6 +211,40 @@ vec4 xbrz_pixel(vec2 uv, ivec2 i, vec2 f)
 	return mix(top, bottom, ty);
 }
 
+// NTSC composite approximation (single pass, deliberately fake - see the
+// roadmap note on "how fake a composite simulation may be"). Real NTSC
+// encodes chroma on a ~3.58MHz subcarrier in gamma space with multi-line
+// comb filtering; this does three cheap things in linear light instead:
+// (1) a 3-tap horizontal bandwidth limit (composite luma/chroma share one
+// wire, so sharp horizontal detail cannot survive), (2) sharp luma from the
+// centre tap mixed with blurred chroma (composite keeps brightness detail
+// better than colour detail), (3) a dot-crawl rainbow on high-contrast
+// vertical edges whose phase alternates per source column. The LCD grid
+// still applies on top via apply_grid().
+vec4 ntsc(vec2 uv)
+{
+	ivec2 s = src_size();
+	vec2 t = 1.0 / vec2(s);
+	// Bandwidth limit: centre-weighted horizontal blur of the upscaled image.
+	vec4 c = bilinear(uv, false);
+	vec4 l = bilinear(uv - vec2(t.x, 0.0), false);
+	vec4 r = bilinear(uv + vec2(t.x, 0.0), false);
+	vec4 blur = (l + c * 2.0 + r) * 0.25;
+	// Luma stays sharp (centre tap), chroma comes from the blur.
+	const vec3 kLuma = vec3(0.299, 0.587, 0.114);
+	float luma = dot(c.rgb, kLuma);
+	vec3 chroma = blur.rgb - vec3(dot(blur.rgb, kLuma));
+	// Edge rainbow: amplitude follows the local horizontal gradient, phase
+	// alternates per source texel column (the subcarrier flips every pixel).
+	ivec2 i;
+	vec2 f;
+	pixel_coord(uv, i, f);
+	float edge = clamp(distance(l, r) * 2.0, 0.0, 1.0);
+	float phase = float(i.x & 1) * 2.0 - 1.0;
+	vec3 rainbow = vec3(phase * 0.06, -phase * 0.06, phase * 0.03) * edge;
+	return vec4(vec3(luma) + chroma + rainbow, c.a);
+}
+
 // LCD grid (SameBoy MonoLCD.fsh): darken a fixed-width border on all four
 // sides of every source pixel. The border is 1/6 of a pixel, as in SameBoy's
 // six-cell LCD construction, so it scales with the window instead of being a
@@ -282,6 +316,9 @@ void main()
 			// strength 0 -> the untouched colour, 1 -> full triads.
 			c = vec4(mix(c.rgb, grille(c, f), strength), c.a);
 		}
+		break;
+	case 7u: // NTSC: single-pass composite approximation (see ntsc()).
+		c = ntsc(frag_uv);
 		break;
 	default: // Nearest: a single fetch at the sampled coordinate.
 		c = texture(gb_tex, frag_uv);

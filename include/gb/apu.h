@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audio_dsp.h"
+#include "state.h"
 #include "types.h"
 #include <SDL3/SDL_audio.h>
 #include <algorithm>
@@ -37,6 +38,14 @@ class APU
 		mmu_ = mmu;
 	}
 	void step(u32 mcycles);
+	// DMG vs CGB. The wave RAM's bus conflict with the DAC is a DMG artefact
+	// (GBATEK "Wave Pattern RAM"), so the CGB needs the mode to keep the wave
+	// RAM readable while the channel plays. Wired from MMU::set_hardware_mode,
+	// like the PPU's.
+	void set_hardware_mode(HardwareMode mode)
+	{
+		hardware_mode_ = mode;
+	}
 
 	// SDL audio output. Non-fatal: if no device, the core still runs silent.
 	bool open_audio();
@@ -61,6 +70,18 @@ class APU
 	{
 		return frames_emitted_;
 	}
+	// Output frames per second the PSG stage renders at.
+	static constexpr u32 sample_rate()
+	{
+		return kSampleRate;
+	}
+	// Stereo samples (2 per frame) waiting to be handed to the device. This is
+	// the audio latency: it is bounded by the flush threshold, which is why
+	// that threshold is one video frame and not something larger.
+	size_t buffered_samples() const
+	{
+		return sample_buffer_.size();
+	}
 	// Audio batches dropped because the device fell behind (SDL's queued
 	// backlog overran). A non-zero value is the audible-crackle signal the
 	// debug overlay reports.
@@ -81,6 +102,13 @@ class APU
 
 	void write_wave_ram(u16 addr, u8 value);
 	u8 read_wave_ram(u16 addr) const;
+
+	// Savestate: all four channels, the frame sequencer, the register
+	// shadows and the output stage. The pending sample buffer rides along
+	// too - dropping it would swallow up to a few ms of already-mixed audio
+	// at the moment of the load. The SDL stream handle is not saved.
+	void save(StateBuffer &buf) const;
+	void load(StateBuffer &buf);
 
   private:
 	MMU *mmu_ = nullptr;
@@ -164,7 +192,12 @@ class APU
 
 	u8 frame_step_ = 0;   // 0-7 frame sequencer position.
 	u32 frame_clock_ = 0; // T-cycles into the current 8192-cycle step.
-	u32 mix_phase_ = 0;   // 16.16 T-cycles since the last mix sample.
+	// True when the last APU step ended exactly on a wave-channel sample
+	// fetch - the one cycle a CPU wave-RAM access reaches the played byte
+	// (SameBoy's wave_form_just_read). Serialized with the channel state.
+	bool wave_just_read_ = false;
+	HardwareMode hardware_mode_ = HardwareMode::DMG; // Set from the MMU, not state.
+	u32 mix_phase_ = 0;                              // 16.16 T-cycles since the last mix sample.
 
 	// Band-limited output: 8x oversampled mix -> FIR decimate -> DC
 	// blocker -> volume -> s16. Its kernel/ring own the rate constants.
@@ -199,7 +232,9 @@ class APU
 	u8 wave_level();
 	u8 noise_level();
 	void generate_sample();
-	// True while the wave DAC owns the wave RAM bus (imminent fetch).
+	// True on the cycle the wave DAC fetched a sample, i.e. the only cycle a
+	// CPU access to the wave RAM lands on the played byte (SameBoy's
+	// `wave_form_just_read`).
 	bool wave_bus_busy() const;
 	void flush_samples();
 	void power_off_channels();

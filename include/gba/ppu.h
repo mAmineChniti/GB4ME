@@ -2,6 +2,7 @@
 
 #include "gba/state.h"
 #include <array>
+#include <vector>
 
 namespace gba
 {
@@ -156,6 +157,10 @@ class GbaPpu
 	// 0x06010000-0x06017FFF.
 	static u32 mirrorVram(u32 off);
 	friend void renderScanline(GbaPpu &ppu, unsigned y);
+	// Segmented-replay helpers (ppu_render.cpp): full-line render without
+	// green swap, and the green swap itself.
+	friend void renderLineInto(GbaPpu &ppu, unsigned y, u32 *line);
+	friend void greenSwapLine(GbaPpu &ppu, u32 *line);
 
 	GbaIrq *irq_ = nullptr;
 	GbaDma *dma_ = nullptr;
@@ -185,6 +190,35 @@ class GbaPpu
 	unsigned line_ = 0;   // VCOUNT 0-227.
 	u32 line_cycles_ = 0; // Dots into the current line (0-1231).
 	bool hblank_ = false;
+	// Mid-scanline scroll (per-dot slice 1): every BGHOFS/BGVOFS write is
+	// logged with its dot, so renderScanline can replay the line in
+	// segments instead of rendering everything with end-of-line values.
+	// Only scroll offsets are covered (BGxCNT, affine origins, palette and
+	// windows still apply per-line); dots past the 960 drawing cycles never
+	// affect pixels. Cleared at every line start with a snapshot of the
+	// line-start values.
+	struct ScrollWrite {
+		u32 dot = 0;   // Dots into the line (4 dots per pixel).
+		u8 reg = 0;    // 0-3 BGHOFS 0-3, 4-7 BGVOFS 0-3.
+		u16 value = 0; // Already masked to 9 bits.
+	};
+	std::vector<ScrollWrite> scroll_log_;
+	u16 scroll_snap_h_[4]{};
+	u16 scroll_snap_v_[4]{};
+	u64 line_start_ = 0; // Scheduler tick of the current line's dot 0.
+	// The line clock is exact only once a line boundary has stamped it
+	// (endLine); before the first one - fresh reset, pre-clock states -
+	// logging and replay stay off and rendering uses live registers.
+	bool has_line_clock_ = false;
+	// Sticky once the per-line log overflows: the rest of the line renders
+	// live (today's behavior) instead of replaying a partial log. Cleared
+	// every line; never serialized (a restored log is complete, an absent
+	// one replays live either way).
+	bool scroll_overflow_ = false;
+	// Live dot within the line (scheduler clock minus line start; 0
+	// without a scheduler, where every write lands in one segment).
+	u32 liveDot() const;
+	void logScroll(u8 reg, u16 value);
 	FrameData frame_{};
 	bool frame_ready_ = false;
 

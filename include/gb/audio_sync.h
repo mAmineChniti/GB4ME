@@ -75,8 +75,7 @@ class AudioSync
 		if (++window_frames_ >= 60) {
 			const f64 made = static_cast<f64>(produced_window_);
 			if (made > 0.0) {
-				const f64 drift = (static_cast<f64>(level) -
-								   static_cast<f64>(level_start_)) /
+				const f64 drift = (static_cast<f64>(level) - static_cast<f64>(level_start_)) /
 								  made; // signed, per produced frame
 				// Clamp the per-update step so a stall cannot slam the ratio.
 				const f64 adj = std::clamp(-drift * 0.5, -0.002, 0.002);
@@ -94,8 +93,8 @@ class AudioSync
 			// Convert the excess into seconds of playback, but never sleep
 			// for a whole frame: the next frame's own audio is the finer
 			// unit, and a long sleep here is what starves the device.
-			const f64 excess = (static_cast<f64>(level) - static_cast<f64>(target_)) /
-							  static_cast<f64>(rate_);
+			const f64 excess =
+				(static_cast<f64>(level) - static_cast<f64>(target_)) / static_cast<f64>(rate_);
 			const f64 frame = 1.0 / 60.0;
 			return std::min(excess, frame);
 		}

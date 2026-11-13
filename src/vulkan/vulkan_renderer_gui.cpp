@@ -95,6 +95,9 @@ bool VulkanRenderer::ensure_gui_buffers(u32 verts, u32 indices)
 
 void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole::Rect *game_rect)
 {
+	// Tile draws are rebuilt every frame from the visible ROMs (see menu grid
+	// below); clear first so a shrinking list cannot leave stale draws behind.
+	thumb_draws_.clear();
 	// Build vertex/index data for GUI rects (body, bezel, buttons, etc.)
 	// Indices are 32-bit: long ROM lists generate tens of thousands of
 	// vertices, and 16-bit indices would wrap and silently drop the tail
@@ -104,12 +107,11 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 	std::vector<TextVertex> text_verts;
 	std::vector<u32> text_indices;
 	auto push_rect = [&](float x, float y, float w, float h, u32 rgba, float rounding) {
-		// Rounded rectangle: for now, just axis-aligned rect (rounding ignored, but keep param for
-		// future). Convert to NDC. Layout rects live in WINDOW coordinates (same space as
-		// mouse events; see handle_events), so NDC must use the window size — NOT the
-		// swapchain (physical pixel) size, which differs on HiDPI/fractional-scale
-		// displays. (NDC is viewport-relative, so window units are correct here; the
-		// record functions separately scale the photo/game viewports to pixels.)
+		// Rounded rectangles are emitted as a small triangle fan: four
+		// quarter-circle arcs joined by straight edges. Layout rects live in
+		// WINDOW coordinates (same space as mouse events; see handle_events),
+		// so NDC must use the window size — NOT the swapchain (physical pixel)
+		// size, which differs on HiDPI/fractional-scale displays.
 		float win_w = static_cast<float>(gui.window_w());
 		float win_h = static_cast<float>(gui.window_h());
 		auto to_ndc = [&](float px, float py) -> Vec2 {
@@ -118,25 +120,44 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 			// which rendered the whole GUI upside down).
 			return {(px / win_w) * 2.0f - 1.0f, (py / win_h) * 2.0f - 1.0f};
 		};
-		(void) rounding;
-		Vec2 p0 = to_ndc(x, y);
-		Vec2 p1 = to_ndc(x + w, y);
-		Vec2 p2 = to_ndc(x + w, y + h);
-		Vec2 p3 = to_ndc(x, y + h);
+		if (w <= 0.0f || h <= 0.0f)
+			return;
 		Vec4 col = {((rgba >> 16) & 0xFF) / 255.0f, ((rgba >> 8) & 0xFF) / 255.0f,
 					(rgba & 0xFF) / 255.0f, ((rgba >> 24) & 0xFF) / 255.0f};
-		// Reorder to match shader's RGBA order? Our Vec4 is x,y,z,w as r,g,b,a.
-		u32 base = static_cast<u32>(verts.size());
-		verts.push_back({p0, {col.x, col.y, col.z, col.w}});
-		verts.push_back({p1, {col.x, col.y, col.z, col.w}});
-		verts.push_back({p2, {col.x, col.y, col.z, col.w}});
-		verts.push_back({p3, {col.x, col.y, col.z, col.w}});
-		indices.push_back(base + 0);
-		indices.push_back(base + 1);
-		indices.push_back(base + 2);
-		indices.push_back(base + 2);
-		indices.push_back(base + 3);
-		indices.push_back(base + 0);
+		const float r = std::min({rounding, w * 0.5f, h * 0.5f});
+		const u32 base = static_cast<u32>(verts.size());
+		verts.push_back({to_ndc(x + w * 0.5f, y + h * 0.5f), {col.x, col.y, col.z, col.w}});
+		if (r < 0.5f) {
+			verts.push_back({to_ndc(x, y), {col.x, col.y, col.z, col.w}});
+			verts.push_back({to_ndc(x + w, y), {col.x, col.y, col.z, col.w}});
+			verts.push_back({to_ndc(x + w, y + h), {col.x, col.y, col.z, col.w}});
+			verts.push_back({to_ndc(x, y + h), {col.x, col.y, col.z, col.w}});
+			for (u32 i = 0; i < 4; i++) {
+				indices.push_back(base);
+				indices.push_back(base + 1 + i);
+				indices.push_back(base + 1 + ((i + 1) % 4));
+			}
+			return;
+		}
+		constexpr int kArcSegments = 4;
+		const auto arc = [&](float cx, float cy, float a0, float a1) {
+			for (int i = 0; i < kArcSegments; i++) {
+				const float t = static_cast<float>(i) / static_cast<float>(kArcSegments);
+				const float a = a0 + (a1 - a0) * t;
+				verts.push_back({to_ndc(cx + std::cos(a) * r, cy + std::sin(a) * r),
+								 {col.x, col.y, col.z, col.w}});
+			}
+		};
+		arc(x + r, y + r, 3.14159265f, 4.71238898f);     // top-left
+		arc(x + w - r, y + r, 4.71238898f, 6.28318531f); // top-right
+		arc(x + w - r, y + h - r, 0.0f, 1.57079633f);    // bottom-right
+		arc(x + r, y + h - r, 1.57079633f, 3.14159265f); // bottom-left
+		const u32 count = static_cast<u32>(kArcSegments) * 4;
+		for (u32 i = 0; i < count; i++) {
+			indices.push_back(base);
+			indices.push_back(base + 1 + i);
+			indices.push_back(base + 1 + ((i + 1) % count));
+		}
 	};
 
 	auto push_circle = [&](float cx, float cy, float r, u32 rgba) {
@@ -193,6 +214,10 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 		}
 	};
 	// (procedural shell removed: photo body is drawn textured)
+	// Fullscreen game: no console chrome at all (shoulders, highlights,
+	// menu, open/gear, settings, modals). Only the transient OSD pills
+	// below survive, so stale overlay text can never linger on the game.
+	const bool chrome = !gui.fullscreen_game();
 	// Photo shell: the GBC body photo (assets/gbc_body.png, Evan-Amos public
 	// domain) is drawn as a textured quad in record_command_buffer_with_gui
 	// before the game. All printed artwork (Nintendo / GAME BOY COLOR /
@@ -225,6 +250,8 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 	// They sit on the top body corners, clear of the menu grid and game.
 	{
 		for (const auto &s : gui.shoulders()) {
+			if (!chrome)
+				break;
 			if (s.r.w <= 0)
 				continue;
 			const bool pressed = gui.is_gba_pressed(s.key);
@@ -237,6 +264,8 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 	}
 	// Press highlights over the photo buttons.
 	for (const auto &b : gui.buttons()) {
+		if (!chrome)
+			break;
 		if (b.w <= 0)
 			continue;
 		if (!gui.is_pressed(b.key))
@@ -248,9 +277,10 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 		}
 	}
 	// ROM menu on the game screen (no ROM loaded): ROM list from rom_folder.
-	if (gui.menu_active()) {
+	if (chrome && gui.menu_active()) {
+		const gb::UiTheme &th = gui.ui_theme();
 		auto scr = gui.screen_rect();
-		push_rect(scr.x, scr.y, scr.w, scr.h, 0xFF101418, 0);
+		push_rect(scr.x, scr.y, scr.w, scr.h, th.menu_bg, 0);
 		// Menu chrome text scales with the window (reference: ~240px wide
 		// screen at scale 1.0) so headers/footers stay legible instead of a
 		// fixed 8px that is tiny on large windows and cramped on small ones.
@@ -267,7 +297,7 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 		// Footer hint keeps its classic two lines; the quick-launch hint
 		// lives in the subtitle instead so a long footer never shrinks the
 		// whole menu's text scale.
-		const std::string f2 = "O:OPEN FILE S:SETTINGS R:RESCAN";
+		const std::string f2 = "O:OPEN FILE S:SETTINGS R:RESCAN /:FILTER";
 		ui_scale = std::min(ui_scale, scr.w / ((f2.size() + 1.0f) * 8.0f)); // f2 width
 		const float footer_h = std::max(26.0f, scr.h * 0.14f);
 		ui_scale = std::min(ui_scale, (footer_h - 7.0f) / 16.0f); // 4+8s+3+8s block
@@ -275,16 +305,23 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 		const float list_pad = scr.w * 0.045f; // mirrors menu_list_rect
 		ui_scale = std::min(ui_scale, (title_h + list_pad - 6.0f) / 20.0f);
 		ui_scale = std::max(ui_scale, 0.50f);
-		const auto &roms = gui.rom_list();
+		const auto &roms_full = gui.rom_list();
+		const auto &filt = gui.filtered_indices();
 		const float cx = scr.x + scr.w * 0.5f;
 		push_text(cx - measure_text("GB4ME", ui_scale) * 0.5f, scr.y + 6, "GB4ME", ui_scale,
-				  0xFFFFFFFF);
-		const std::string base_sub = "SELECT ROM (" + std::to_string(roms.size()) + ")";
+				  th.menu_text);
+		std::string base_sub = "SELECT ROM (" + std::to_string(filt.size());
+		if (gui.menu_filter_active() && !gui.menu_filter().empty())
+			base_sub += "/" + gui.menu_filter();
+		base_sub += ")";
+		if (gui.menu_filter_active()) {
+			base_sub += " FILTER:/... ESC:CLEAR";
+		}
 		const std::string sub =
 			n_recent > 0 ? base_sub + " - 1-" + std::to_string(n_recent) + " PLAYS RECENT"
 						 : base_sub;
 		push_text(cx - measure_text(sub, ui_scale) * 0.5f, scr.y + 6 + 12.0f * ui_scale, sub,
-				  ui_scale, 0xFFAAAAAA);
+				  ui_scale, th.menu_hint);
 		const auto list = gui.menu_list_rect();
 		const int cols = gui.menu_grid_cols();
 		const float cw = gui.menu_cell_w();
@@ -296,7 +333,7 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 		const float badge_h = 10.0f;
 		for (int vi = 0; vi < vis; vi++) {
 			const int i = first + vi;
-			if (i < 0 || i >= static_cast<int>(roms.size()))
+			if (i < 0 || i >= static_cast<int>(filt.size()))
 				break;
 			const int col = vi % cols;
 			const int row = vi / cols;
@@ -307,35 +344,58 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 				continue;
 			const bool sel = (i == gui.menu_selected());
 			// Cell background
-			push_rect(cx, cy, cw, ch, sel ? 0xFF3A3A8F : 0xFF22252B, 3.0f);
+			push_rect(cx, cy, cw, ch, sel ? th.menu_row_sel : th.menu_row, 3.0f);
 			if (sel)
-				push_rect(cx + 1, cy + 1, cw - 2, ch - 2, 0xFF2E3190, 3.0f);
+				push_rect(cx + 1, cy + 1, cw - 2, ch - 2, th.menu_row_sel_edge, 3.0f);
 			// System badge — top-right inside cell
-			const auto &rom = roms[static_cast<size_t>(i)];
+			const auto &rom = roms_full[static_cast<size_t>(filt[static_cast<size_t>(i)])];
 			const std::string badge = rom.gba ? "GBA" : (rom.cgb ? "CGB" : "DMG");
 			const u32 bcol = rom.gba ? 0xFF4F7FFF : (rom.cgb ? 0xFF3FA06B : 0xFF5A5A5A);
 			const float bx = cx + cw - badge_w - 4;
 			const float by = cy + 4;
 			push_rect(bx - 2, by, badge_w, badge_h, bcol, 2.0f);
 			push_text(bx, by + 1, badge, 1.0f, 0xFFFFFFFF);
+			// Save-slot badge — green S<n> when states exist, dim T when an
+			// auto-thumbnail (<rom>.thumb.ppm, written on eject) exists.
+			if (rom.save_slots > 0) {
+				char sbuf[16];
+				std::snprintf(sbuf, sizeof(sbuf), "S%d", rom.save_slots);
+				push_text(cx + 4, by + 1, sbuf, 1.0f, th.ok);
+			} else if (rom.has_thumb) {
+				push_text(cx + 4, by + 1, "T", 1.0f, th.text_mute);
+			}
+			// Tile image (boxart / auto-shot / slot shot) over the cart icon
+			// area, aspect-kept; the drawn cart below is the fallback when
+			// there is no image or it failed to decode/upload.
+			const ThumbTex *tile = nullptr;
+			if (!rom.thumb_path.empty() && thumbs_ready_.count(rom.thumb_path) != 0) {
+				const ThumbTex *t = find_thumb(rom.thumb_path);
+				if (t != nullptr && t->w > 0 && t->h > 0 && t->set != VK_NULL_HANDLE)
+					tile = t;
+			}
 			// Large cartridge icon — centered top of cell
 			const float icon_w = std::clamp(cw * 0.38f, 28.0f, 42.0f);
 			const float icon_h = icon_w * 0.92f;
 			const float ix = cx + (cw - icon_w) * 0.5f;
 			const float iy = cy + 8;
-			const u32 cart_body = sel ? 0xFFD6D6D6 : 0xFFB0B0B0;
-			const u32 cart_top = sel ? 0xFF9A9A9A : 0xFF6E6E6E;
-			const u32 label_bg = sel ? 0xFF1A1A1A : 0xFF252525;
-			push_rect(ix, iy + 4, icon_w, icon_h, cart_body, 2.0f);
-			push_rect(ix + icon_w * 0.22f, iy, icon_w * 0.56f, 5.0f, cart_top, 2.0f);
-			// notch
-			push_rect(ix + icon_w * 0.42f, iy + 5, icon_w * 0.16f, 2.0f, cart_top, 0);
-			push_rect(ix + 3, iy + 10, icon_w - 6, icon_h - 12, label_bg, 1.0f);
-			// GB emboss on label
-			const float lbx = ix + (icon_w - 16) * 0.5f;
-			push_rect(lbx, iy + 13, 16, 1, sel ? 0xFF4A4A4A : 0xFF3A3A3A, 0);
+			if (tile != nullptr) {
+				const PixelRectF fit = fit_aspect_rect(ix, iy, icon_w, icon_h, tile->w, tile->h);
+				thumb_draws_.push_back({GUIConsole::Rect{fit.x, fit.y, fit.w, fit.h}, tile->set});
+			} else {
+				const u32 cart_body = sel ? 0xFFD6D6D6 : 0xFFB0B0B0;
+				const u32 cart_top = sel ? 0xFF9A9A9A : 0xFF6E6E6E;
+				const u32 label_bg = sel ? 0xFF1A1A1A : 0xFF252525;
+				push_rect(ix, iy + 4, icon_w, icon_h, cart_body, 2.0f);
+				push_rect(ix + icon_w * 0.22f, iy, icon_w * 0.56f, 5.0f, cart_top, 2.0f);
+				// notch
+				push_rect(ix + icon_w * 0.42f, iy + 5, icon_w * 0.16f, 2.0f, cart_top, 0);
+				push_rect(ix + 3, iy + 10, icon_w - 6, icon_h - 12, label_bg, 1.0f);
+				// GB emboss on label
+				const float lbx = ix + (icon_w - 16) * 0.5f;
+				push_rect(lbx, iy + 13, 16, 1, sel ? 0xFF4A4A4A : 0xFF3A3A3A, 0);
+			}
 			// Title — centered below icon, wrapped to 2 lines max
-			std::string title = roms[static_cast<size_t>(i)].title;
+			std::string title = roms_full[static_cast<size_t>(filt[static_cast<size_t>(i)])].title;
 			// Split " - " suffix (region) from stem to keep main title larger:
 			// keep full title but allow wrapping; word-aware.
 			const float text_max_w = cw - 10.0f;
@@ -401,33 +461,34 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 				const float ty = title_y0 + li * 9.0f;
 				if (ty + 8 > cy + ch - 4)
 					break;
-				push_text(tx, ty, shown, tscale, sel ? 0xFFFFFFFF : 0xFFD8D8D8);
+				push_text(tx, ty, shown, tscale, sel ? th.menu_text : th.menu_text_dim);
 			}
 		}
-		if (roms.empty()) {
-			const std::string e1 = "NO ROMS IN FOLDER";
+		if (filt.empty()) {
+			const std::string e1 =
+				gui.menu_filter_active() ? "NO MATCHES FOR FILTER" : "NO ROMS IN FOLDER";
 			push_text(cx - measure_text(e1, ui_scale) * 0.5f, list.y + 10, e1, ui_scale,
-					  0xFFAAAAAA);
+					  th.menu_hint);
 			std::string folder = gui.settings() ? gui.settings()->rom_folder : ".";
 			if (folder.size() > 24)
 				folder = "..." + folder.substr(folder.size() - 21);
 			push_text(cx - measure_text(folder, ui_scale) * 0.5f, list.y + 10 + 14.0f * ui_scale,
-					  folder, ui_scale, 0xFF999999);
+					  folder, ui_scale, th.menu_hint);
 		}
 		// scroll indicators — grid scrolls by row, show track + arrows
 		if (first > 0)
-			push_text(list.x + list.w - 12, list.y - 10, "^", ui_scale, 0xFFAAAAAA);
-		if (first + vis < static_cast<int>(roms.size())) {
-			push_text(list.x + list.w - 12, list.y + list.h + 2, "v", ui_scale, 0xFFAAAAAA);
+			push_text(list.x + list.w - 12, list.y - 10, "^", ui_scale, th.menu_hint);
+		if (first + vis < static_cast<int>(filt.size())) {
+			push_text(list.x + list.w - 12, list.y + list.h + 2, "v", ui_scale, th.menu_hint);
 		}
 		// vertical scrollbar for large libraries (50+ games)
-		if (static_cast<int>(roms.size()) > vis) {
+		if (static_cast<int>(filt.size()) > vis) {
 			const float track_x = list.x + list.w - 4;
 			const float track_y = list.y;
 			const float track_h = list.h;
 			push_rect(track_x, track_y, 3.0f, track_h, 0xFF1E2025, 1.0f);
-			const float frac_vis = static_cast<float>(vis) / roms.size();
-			const float frac_first = static_cast<float>(first) / roms.size();
+			const float frac_vis = static_cast<float>(vis) / filt.size();
+			const float frac_first = static_cast<float>(first) / filt.size();
 			const float thumb_h = std::clamp(track_h * frac_vis, 12.0f, track_h);
 			const float thumb_y = track_y + frac_first * track_h;
 			const float clamped_thumb_y = std::min(thumb_y, track_y + track_h - thumb_h);
@@ -435,15 +496,16 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 		}
 		// footer hints — grid navigation (scaled with the window; anchored
 		// to the bottom so the two lines never overlap each other).
-		const std::string f1 = "ARROWS:MOVE ENTER:PLAY";
+		const std::string f1 = "ARROWS:MOVE ENTER:PLAY T:TURBO";
 		const float f2_y = scr.y + scr.h - 4.0f - 8.0f * ui_scale;
 		const float f1_y = f2_y - 8.0f * ui_scale - 3.0f;
-		push_text(cx - measure_text(f1, ui_scale) * 0.5f, f1_y, f1, ui_scale, 0xFFAAAAAA);
-		push_text(cx - measure_text(f2, ui_scale) * 0.5f, f2_y, f2, ui_scale, 0xFFAAAAAA);
+		push_text(cx - measure_text(f1, ui_scale) * 0.5f, f1_y, f1, ui_scale, th.menu_hint);
+		push_text(cx - measure_text(f2, ui_scale) * 0.5f, f2_y, f2, ui_scale, th.menu_hint);
 	}
 	// OPEN button (file dialog, top-left) + settings gear (top-right).
 	// The photo has neither; both stay clickable (also O / S keys).
-	{
+	// Hidden in fullscreen (like all chrome).
+	if (chrome) {
 		auto openr = gui.open_button_rect();
 		const float ocx = openr.x + openr.w * 0.5f, ocy = openr.y + openr.h * 0.5f;
 		push_circle(ocx, ocy, openr.w * 0.5f, 0xFF5A5A5A);
@@ -454,82 +516,111 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 		push_rect(ocx - 5 * fs, ocy - 1 * fs, 10 * fs, 2 * fs, 0xFF5A5A5A, 0);
 	}
 	// Settings gear (photo has none; kept clickable, also toggled by S key)
-	{
+	// Hidden in fullscreen (like all chrome).
+	if (chrome) {
 		auto setr = gui.settings_button_rect();
-		push_circle(setr.x + setr.w * 0.5f, setr.y + setr.h * 0.5f, setr.w * 0.5f, 0xFF5A5A5A);
-		// Glyph sized to the button with its ink centered (an em-box center
-		// would sit high: '*' has no descender).
-		const float gs = setr.w / 14.0f;
-		float tx = 0, ty = 0;
-		center_glyph('*', gs, setr, tx, ty);
-		push_text(tx, ty, "*", gs, 0xFFFFFFFF);
+		const float ccx = setr.x + setr.w * 0.5f, ccy = setr.y + setr.h * 0.5f;
+		const float rr = setr.w * 0.5f;
+		push_circle(ccx, ccy, rr, 0xFF5A5A5A);
+		// Vector gear (replaces the '*' text hack): 8 teeth + ring + hub
+		// hole, all white on the button disc. Sized like the old glyph
+		// (~0.57 button widths across the teeth tips).
+		constexpr u32 kGearBg = 0xFF5A5A5A;
+		constexpr u32 kGearInk = 0xFFFFFFFF;
+		const float tooth_r = rr * 0.44f, tooth_half = rr * 0.11f;
+		for (int k = 0; k < 8; k++) {
+			const float a = (k / 8.0f) * 2.0f * 3.1415926f;
+			const float px = ccx + std::cos(a) * tooth_r, py = ccy + std::sin(a) * tooth_r;
+			push_rect(px - tooth_half, py - tooth_half, tooth_half * 2.0f, tooth_half * 2.0f,
+					  kGearInk, 0);
+		}
+		push_circle(ccx, ccy, rr * 0.46f, kGearInk);
+		push_circle(ccx, ccy, rr * 0.30f, kGearBg);
+		push_circle(ccx, ccy, rr * 0.14f, kGearInk);
 	}
 	// Settings panel
-	if (gui.show_settings()) {
-		// Darken background
+	if (chrome && gui.show_settings()) {
+		// Dim the game underneath so the panel reads as a focused surface.
 		push_rect(0, 0, static_cast<float>(swapchain_extent.width),
-				  static_cast<float>(swapchain_extent.height), 0xAA000000, 0);
-		// ---- Settings panel ----
-		// One accent (the console purple), a neutral ramp and a semantic
-		// green, kept local so the page reads as a single design.
-		constexpr u32 kPanelOuter = 0xFF2A2A33;
-		constexpr u32 kPanelInner = 0xFF16161C;
-		constexpr u32 kAccent = 0xFF6B3FA0;
-		constexpr u32 kAccentDim = 0xFF4A3266;
-		constexpr u32 kRowBg = 0xFF23232D;
-		constexpr u32 kPillBg = 0xFF32323F;
-		constexpr u32 kText = 0xFFECECF2;
-		// Values and navigation read at full brightness; only captions and
-		// placeholders stay dimmed (still >= 3:1 on the panel fills).
-		constexpr u32 kTextMute = 0xFF8E8EA3;
-		constexpr u32 kOk = 0xFF4FB477;
+				  static_cast<float>(swapchain_extent.height), 0xB4000000, 0);
 
-		// The panel height depends on the active tab, so take the rect from
-		// the console rather than recomputing it.
+		const gb::UiTheme &thm = gui.ui_theme();
+		const bool light = gui.settings() != nullptr && gui.settings()->theme == 1;
+		const u32 kAccent = GUIConsole::color_for_console(gui.console_color());
+		const u32 kAccentDim = GUIConsole::color_for_console_dim(gui.console_color());
+		const u32 kPanelInner = thm.panel_inner;
+		const u32 kPanelEdge = light ? 0xFFC4C4D2 : 0xFF3C3C4C;
+		const u32 kRowBg = thm.row_bg;
+		const u32 kPillBg = thm.pill_bg;
+		const u32 kText = thm.text;
+		const u32 kTextMute = thm.text_mute;
+		const u32 kOk = thm.ok;
+		const u32 kHover = light ? 0x16000000 : 0x1CFFFFFF;
+		const u32 kFooterBg = light ? 0xFFE4E4EC : 0xFF1A1A22;
+
 		const auto panel_rect = gui.settings_panel_rect();
 		const float panel_w = panel_rect.w, panel_h = panel_rect.h;
 		const float panel_x = panel_rect.x, panel_y = panel_rect.y;
-		push_rect(panel_x, panel_y, panel_w, panel_h, kPanelOuter, 6.0f);
-		push_rect(panel_x + 2, panel_y + 2, panel_w - 4, panel_h - 4, kPanelInner, 6.0f);
 
-		const float tscale = body.w > 420.0f ? 1.0f : 0.6f;
-		const float tchar = 8.0f * tscale;
+		// Soft drop shadow, an edge, then the inner fill. Radii are real now
+		// (push_rect builds rounded corners), which makes the panel feel like
+		// a surface instead of a stack of flat boxes.
+		push_rect(panel_x + 6, panel_y + 8, panel_w, panel_h, 0x50000000, 14.0f);
+		push_rect(panel_x, panel_y, panel_w, panel_h, kPanelEdge, 12.0f);
+		push_rect(panel_x + 2, panel_y + 2, panel_w - 4, panel_h - 4, kPanelInner, 10.0f);
+
+		const float tscale = gui.settings_text_scale();
 		const float th = 8.0f * tscale;
-		const auto fit = [&](const std::string &s, float w) {
-			size_t maxc = w > tchar + 6.0f ? static_cast<size_t>((w - 6.0f) / tchar) : 1;
+		const auto clip = [&](const std::string &s, float width, float scale) {
+			const float cw = 8.0f * scale;
+			if (width <= cw + 4.0f)
+				return std::string();
+			const size_t maxc = static_cast<size_t>((width - 4.0f) / cw);
 			if (s.size() <= maxc)
 				return s;
 			if (maxc <= 3)
 				return s.substr(0, maxc);
-			return std::string("...") + s.substr(s.size() - (maxc - 3));
+			return s.substr(0, maxc - 3) + "...";
+		};
+		float mouse_x = 0.0f, mouse_y = 0.0f;
+		SDL_GetMouseState(&mouse_x, &mouse_y);
+		const auto hovering = [&](const GUIConsole::Rect &r) {
+			return mouse_x >= r.x && mouse_x < r.x + r.w && mouse_y >= r.y && mouse_y < r.y + r.h;
 		};
 		const auto text_y = [&](const GUIConsole::Rect &r, float ts) {
 			return r.y + (r.h - 8.0f * ts) * 0.5f;
 		};
 
-		// Title bar + close button.
+		// ---- title bar ----
+		const float title_h = std::clamp(panel_h * 0.075f, 18.0f, 30.0f);
+		const float bar_top = panel_y + 4.0f;
+		push_rect(panel_x + 4, bar_top, panel_w - 8, title_h, kAccent, 8.0f);
+		push_rect(panel_x + 4, bar_top, panel_w - 8, std::max(2.0f, title_h * 0.16f), 0x22FFFFFF,
+				  8.0f);
+		const float title_scale = std::clamp(tscale * 1.18f, 1.0f, 1.35f);
+		push_text(panel_x + 16, bar_top + (title_h - 8.0f * title_scale) * 0.5f, "SETTINGS",
+				  title_scale, 0xFFFFFFFF);
 		{
-			const float bar_h = body.h * 0.042f;
-			push_rect(panel_x + 4, panel_y + 5, panel_w - 8, bar_h, kAccent, 3.0f);
-			push_text(panel_x + 10, panel_y + 7, "SETTINGS", 1.0f, 0xFFFFFFFF);
 			const auto sr = gui.settings_close_rect();
-			push_rect(sr.x, sr.y, sr.w, sr.h, 0xFF5A2430, 2.0f);
+			const bool hot = hovering(sr);
+			push_rect(sr.x, sr.y, sr.w, sr.h, hot ? 0xFFD05064 : 0xA0302030, 5.0f);
 			float tx = 0, ty = 0;
 			center_glyph('X', 1.0f, sr, tx, ty);
-			push_text(tx, ty, "X", 1.0f, 0xFFE8A0B0);
+			push_text(tx, ty, "X", 1.0f, hot ? 0xFFFFFFFF : 0xFFE8C0C8);
 		}
 
-		// Tabs, with an underline for the active one.
+		// ---- tabs ----
 		{
 			auto draw_tab = [&](GUIConsole::SettingsTab t, const std::string &name) {
 				const auto r = gui.settings_tab_rect(t);
 				const bool active = gui.settings_tab() == t;
-				push_rect(r.x, r.y, r.w, r.h, active ? kAccentDim : kRowBg, 2.0f);
-				if (active)
-					push_rect(r.x + 1, r.y + r.h - 2, r.w - 2, 2, kAccent, 0);
-				float ts = 1.0f;
-				while (ts > 0.5f && name.size() * 8.0f * ts > r.w - 6.0f)
-					ts -= 0.1f;
+				const bool hot = hovering(r);
+				push_rect(r.x, r.y, r.w, r.h, active ? kAccent : kRowBg, r.h * 0.5f);
+				if (!active && hot)
+					push_rect(r.x, r.y, r.w, r.h, kHover, r.h * 0.5f);
+				float ts = tscale;
+				while (ts > 0.70f && name.size() * 8.0f * ts > r.w - 12.0f)
+					ts -= 0.05f;
 				const float tw = measure_text(name, ts);
 				push_text(r.x + (r.w - tw) * 0.5f, r.y + (r.h - 8.0f * ts) * 0.5f, name, ts,
 						  active ? 0xFFFFFFFF : kText);
@@ -538,62 +629,93 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 			draw_tab(GUIConsole::SettingsTab::Inputs, "INPUTS");
 		}
 
-		// Rows: a label field plus an inset value "pill", so the value reads
-		// as a control rather than a second column of text.
+		// ---- General page ----
 		const auto rows = gui.settings_rows();
 		if (gui.settings_tab() == GUIConsole::SettingsTab::General) {
 			for (const auto &row : rows) {
 				using Style = GUIConsole::RowStyle;
+				const GUIConsole::Rect &lr = row.label_rect;
 				if (row.style == Style::Header) {
-					push_text(row.label_rect.x + 2, text_y(row.label_rect, tscale), row.label,
-							  tscale, kTextMute);
+					const float hts = std::max(0.78f, tscale * 0.90f);
+					const float hy = text_y(lr, hts);
+					push_rect(lr.x + 1, hy + 1, 2.5f, 8.0f * hts - 2.0f, kAccent, 1.25f);
+					const std::string shown = clip(row.label, lr.w - 20.0f, hts);
+					push_text(lr.x + 9, hy, shown, hts, kTextMute);
+					const float line_x = lr.x + 9.0f + measure_text(shown, hts) + 10.0f;
+					if (line_x < lr.x + lr.w - 4.0f)
+						push_rect(line_x, hy + 8.0f * hts * 0.5f, lr.x + lr.w - line_x, 1.0f,
+								  kRowBg, 0);
 					continue;
 				}
-				const bool is_action = row.style == Style::Action;
-				const u32 row_bg = row.selected ? kAccentDim : (is_action ? 0xFF1E1E28 : kRowBg);
-				push_rect(row.label_rect.x, row.label_rect.y, row.label_rect.w, row.label_rect.h,
-						  row_bg, 2.0f);
+				const bool hot = hovering(lr) || hovering(row.value_rect);
+				push_rect(lr.x, lr.y, lr.w, lr.h, row.selected ? kAccentDim : kRowBg, 5.0f);
+				if (hot)
+					push_rect(lr.x, lr.y, lr.w, lr.h, kHover, 5.0f);
+				if (row.selected)
+					push_rect(lr.x, lr.y, 3.0f, lr.h, kAccent, 1.5f);
+
 				const GUIConsole::Rect v = row.value_rect;
-				const GUIConsole::Rect vp{v.x + 2.0f, v.y + 2.0f, v.w - 4.0f, v.h - 4.0f};
-				if (vp.w > 2.0f && vp.h > 2.0f)
-					push_rect(vp.x, vp.y, vp.w, vp.h, row.selected ? kAccent : kPillBg, 2.0f);
+				if (v.w > 2.0f && v.h > 2.0f) {
+					push_rect(v.x - 1.0f, v.y - 1.0f, v.w + 2.0f, v.h + 2.0f, kPanelEdge, 5.0f);
+					push_rect(v.x, v.y, v.w, v.h, row.selected ? kAccent : kPillBg, 4.0f);
+				}
 				if (row.id == "volume") {
 					const float vol = gui.settings() ? gui.settings()->volume : 1.0f;
+					const float inner_w = std::max(0.0f, v.w - 4.0f);
 					if (vol > 0.0f)
-						push_rect(vp.x, vp.y, vp.w * vol, vp.h, kOk, 2.0f);
-					push_rect(vp.x + vp.w * vol - 1.5f, vp.y, 3, vp.h, 0xFFFFFFFF, 0);
+						push_rect(v.x + 2.0f, v.y + 2.0f, inner_w * vol, v.h - 4.0f, kOk, 3.0f);
+					const float mark_x = v.x + 2.0f + inner_w * vol - 1.0f;
+					push_rect(mark_x, v.y + 2.0f, 2.0f, v.h - 4.0f, 0xFFFFFFFF, 1.0f);
 				}
-				push_text(row.label_rect.x + 5, text_y(row.label_rect, tscale),
-						  fit(row.label, row.label_rect.w), tscale,
+
+				// A cramped row (very small windows) shrinks its own text instead
+				// of drawing glyphs taller than the pill that contains them.
+				const float title_ts =
+					std::clamp(std::min(tscale, (lr.h - 4.0f) / 8.0f), 0.70f, tscale);
+				const bool show_desc = !row.description.empty() && lr.h >= th * 2.65f;
+				const float ty = show_desc ? lr.y + 4.0f : text_y(lr, title_ts);
+				const float label_w = std::max(12.0f, v.x - lr.x - 12.0f);
+				push_text(lr.x + 8.0f, ty, clip(row.label, label_w, title_ts), title_ts,
 						  row.selected ? 0xFFFFFFFF : kText);
-				if (!row.value.empty()) {
-					u32 vc = kText;
-					if (row.selected)
-						vc = 0xFFFFFFFF;
-					else if (row.unbound)
-						vc = kTextMute;
-					push_text(vp.x + 4, vp.y + (vp.h - th) * 0.5f, fit(row.value, vp.w), tscale,
-							  vc);
+				if (show_desc) {
+					const float dts = std::max(0.76f, tscale * 0.82f);
+					push_text(lr.x + 8.0f, ty + th + 2.0f, clip(row.description, lr.w - 16.0f, dts),
+							  dts, kTextMute);
+				}
+				if (!row.value.empty() && v.w > 4.0f) {
+					const u32 vc = row.selected ? 0xFFFFFFFF : (row.unbound ? kTextMute : kText);
+					float vts = std::clamp(std::min(tscale, (v.h - 2.0f) / 8.0f), 0.70f, tscale);
+					const float avail = v.w - 8.0f;
+					// Keep values legible: shrink a little for long labels, then
+					// ellipsize instead of collapsing to an unreadable size.
+					while (vts > 0.85f && measure_text(row.value, vts) > avail)
+						vts -= 0.05f;
+					const std::string shown = clip(row.value, avail, vts);
+					const float vw = measure_text(shown, vts);
+					push_text(v.x + std::max(2.0f, (v.w - vw) * 0.5f),
+							  v.y + (v.h - 8.0f * vts) * 0.5f, shown, vts, vc);
 				}
 			}
 		} else {
 			// ---- Inputs page ----
 			const auto &pad = gui.gbaPad();
-			// Widget helper: a boxed control with an optional right-hand caret.
 			const auto widget = [&](const GUIConsole::Rect &r, const std::string &label, u32 bg,
 									u32 fg, bool caret, bool enabled) {
-				push_rect(r.x, r.y, r.w, r.h, bg, 2.0f);
+				const bool hot = enabled && hovering(r);
+				push_rect(r.x, r.y, r.w, r.h, bg, 5.0f);
+				if (hot)
+					push_rect(r.x, r.y, r.w, r.h, kHover, 5.0f);
 				if (!enabled)
-					push_rect(r.x, r.y, r.w, r.h, 0x30000000, 0);
-				const float pad_l = 4.0f;
-				const float avail = r.w - pad_l * 2.0f - (caret ? 10.0f : 0.0f);
-				push_text(r.x + pad_l, r.y + (r.h - th) * 0.5f, fit(label, avail), tscale, fg);
+					push_rect(r.x, r.y, r.w, r.h, light ? 0x30FFFFFF : 0x30000000, 5.0f);
+				const float pad_l = 6.0f;
+				const float avail = r.w - pad_l * 2.0f - (caret ? 12.0f : 0.0f);
+				push_text(r.x + pad_l, r.y + (r.h - th) * 0.5f, clip(label, avail, tscale), tscale,
+						  fg);
 				if (caret) {
-					// Small down triangle, so the field reads as a combo box.
-					const float cx = r.x + r.w - 8.0f;
+					const float cx = r.x + r.w - 9.0f;
 					const float cy = r.y + r.h * 0.5f;
-					push_rect(cx - 4, cy - 1, 8, 2, fg, 0);
-					push_rect(cx - 2, cy + 1, 4, 2, fg, 0);
+					push_rect(cx - 4.0f, cy - 1.0f, 8.0f, 2.0f, fg, 1.0f);
+					push_rect(cx - 2.0f, cy + 1.0f, 4.0f, 2.0f, fg, 1.0f);
 				}
 			};
 			const auto dropdown = [&](const GUIConsole::Dropdown &dd, const std::string &value,
@@ -603,8 +725,8 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 			};
 
 			// Profile row.
-			push_text(pad.label_profile.x + 2, text_y(pad.label_profile, tscale), "Profile", tscale,
-					  kText);
+			push_text(pad.label_profile.x, text_y(pad.label_profile, tscale * 0.9f), "Profile",
+					  tscale * 0.9f, kTextMute);
 			dropdown(gui.profile_box(),
 					 gui.settings() ? gui.settings()->profileName(gui.settings()->active_profile)
 									: std::string(),
@@ -613,11 +735,10 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 			widget(gui.btn_save(), "Save", kPillBg, kText, false, true);
 
 			// Device row.
-			push_text(pad.label_device.x + 2, text_y(pad.label_device, tscale), "Device", tscale,
-					  kText);
+			push_text(pad.label_device.x, text_y(pad.label_device, tscale * 0.9f), "Device",
+					  tscale * 0.9f, kTextMute);
 			dropdown(gui.device_box(), gui.deviceName(), true);
 
-			// Auto-map, only while a controller is the selected source.
 			if (gui.automapVisible()) {
 				const auto &b = gui.btn_automap();
 				const std::string st = gui.controllerStatus();
@@ -627,43 +748,56 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 					   0xFFFFFFFF, false, true);
 			}
 
-			// Open drop-down lists overlay everything drawn so far.
-			const auto draw_list = [&](const GUIConsole::Dropdown &dd) {
-				if (!dd.open)
-					return;
-				const bool profile_list = &dd == &gui.profile_box();
-				for (size_t i = 0; i < dd.items.size(); i++) {
-					const auto &r = dd.items[i];
-					const bool sel = static_cast<int>(i) == dd.selected;
-					const int idx = static_cast<int>(i);
-					// Unavailable commands are dimmed so it is obvious they
-					// need a user profile selected first.
-					const bool avail = !profile_list || gui.profileMenuEnabled(idx);
-					push_rect(r.x, r.y, r.w, r.h, sel ? kAccent : 0xFF262630, 2.0f);
-					const std::string &t = i < dd.options.size() ? dd.options[i] : std::string();
-					const u32 fg = !avail ? kTextMute : (sel ? 0xFFFFFFFF : kText);
-					push_text(r.x + 4, r.y + (r.h - th) * 0.5f, fit(t, r.w - 8.0f), tscale, fg);
+			// Clickable binding list: the compact, unambiguous companion to
+			// the GBA drawing (and the only remap surface on narrow panels).
+			const auto binds = gui.binding_rows();
+			if (!binds.empty()) {
+				const float hts = std::max(0.78f, tscale * 0.88f);
+				const float list_top = binds.front().rect.y;
+				push_text(binds.front().rect.x + 2.0f, list_top - 13.0f, "BUTTON BINDINGS", hts,
+						  kTextMute);
+				for (const auto &b : binds) {
+					const bool hot = hovering(b.rect);
+					push_rect(b.rect.x, b.rect.y, b.rect.w, b.rect.h,
+							  b.selected ? kAccentDim : kRowBg, 4.0f);
+					if (hot)
+						push_rect(b.rect.x, b.rect.y, b.rect.w, b.rect.h, kHover, 4.0f);
+					if (b.selected)
+						push_rect(b.rect.x, b.rect.y, 2.5f, b.rect.h, kAccent, 1.25f);
+					const float rhs_w = std::max(34.0f, b.rect.w * 0.46f);
+					const float rhs_x = b.rect.x + b.rect.w - rhs_w - 2.0f;
+					push_text(b.rect.x + 6.0f, b.rect.y + (b.rect.h - th) * 0.5f,
+							  clip(b.label, rhs_x - b.rect.x - 10.0f, tscale), tscale,
+							  b.selected ? 0xFFFFFFFF : kText);
+					push_rect(rhs_x, b.rect.y + 1.5f, rhs_w, b.rect.h - 3.0f,
+							  b.selected ? kAccent : kPillBg, 3.0f);
+					float vts = std::max(0.82f, tscale * 0.92f);
+					while (vts > 0.80f && measure_text(b.value, vts) > rhs_w - 8.0f)
+						vts -= 0.05f;
+					const std::string bshown = clip(b.value, rhs_w - 8.0f, vts);
+					const float vw = measure_text(bshown, vts);
+					push_text(rhs_x + std::max(2.0f, (rhs_w - vw) * 0.5f),
+							  b.rect.y + (b.rect.h - 8.0f * vts) * 0.5f, bshown, vts,
+							  b.selected ? 0xFFFFFFFF : (b.unbound ? kTextMute : kText));
 				}
-			};
-			draw_list(gui.profile_box());
-			draw_list(gui.device_box());
+			}
 
-			// ---- GBA outline ----
-			// Drawn only when no list is open: a drop-down overlays
-			// everything, so a diagram behind it would just show through.
-			if (!gui.anyDropdownOpen()) {
+			// GBA outline.
+			if (gui.inputs_diagram_visible() && !gui.anyDropdownOpen()) {
 				const auto &g = pad;
 				const float bw = g.body.w, bh = g.body.h;
 				const auto PX = [&](float xmm) {
 					return xmm / 144.5f * bw; // AGB-001 is 144.5 x 82 mm
 				};
 				const auto PY = [&](float ymm) { return ymm / 82.0f * bh; };
+				push_text(g.body.x + 2.0f, g.body.y - 13.0f, "GBA CONTROLS",
+						  std::max(0.78f, tscale * 0.88f), kTextMute);
 
 				// Shell: a bezel line over a darker face, plus the wider
 				// lower "chin" the AGB has below the control row.
-				push_rect(g.body.x, g.body.y, bw, bh, 0xFF474758, 3.0f);
+				push_rect(g.body.x, g.body.y, bw, bh, 0xFF474758, 5.0f);
 				push_rect(g.body.x + PX(1.6f), g.body.y + PY(1.6f), bw - PX(3.2f), bh - PY(3.2f),
-						  0xFF1D1D26, 3.0f);
+						  0xFF1D1D26, 4.0f);
 
 				// Cartridge slot along the top edge, and the power switch.
 				push_rect(g.body.x + PX(44.0f), g.body.y + PY(0.8f), PX(30.0f), PY(2.6f),
@@ -672,7 +806,7 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 						  1.0f);
 
 				// Screen: a recessed panel with a lit inner area.
-				push_rect(g.screen.x, g.screen.y, g.screen.w, g.screen.h, 0xFF0E0E14, 2.0f);
+				push_rect(g.screen.x, g.screen.y, g.screen.w, g.screen.h, 0xFF0E0E14, 3.0f);
 				push_rect(g.screen.x + PX(1.4f), g.screen.y + PY(1.4f), g.screen.w - PX(2.8f),
 						  g.screen.h - PY(2.8f), 0xFF1E2C3E, 2.0f);
 				push_rect(g.screen.x + PX(1.4f), g.screen.y + PY(1.4f), g.screen.w - PX(2.8f),
@@ -688,8 +822,8 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 				face(g.btn_b, 0xFF55566A);
 
 				// D-pad: a cross with a rounded hub.
-				push_rect(g.dpad_h.x, g.dpad_h.y, g.dpad_h.w, g.dpad_h.h, 0xFF55566A, 2.0f);
-				push_rect(g.dpad_v.x, g.dpad_v.y, g.dpad_v.w, g.dpad_v.h, 0xFF55566A, 2.0f);
+				push_rect(g.dpad_h.x, g.dpad_h.y, g.dpad_h.w, g.dpad_h.h, 0xFF55566A, 3.0f);
+				push_rect(g.dpad_v.x, g.dpad_v.y, g.dpad_v.w, g.dpad_v.h, 0xFF55566A, 3.0f);
 				push_circle(g.dpad_h.x + g.dpad_h.w * 0.5f, g.dpad_h.y + g.dpad_h.h * 0.5f,
 							g.dpad_h.h * 0.55f, 0xFF55566A);
 				push_circle(g.dpad_h.x + g.dpad_h.w * 0.5f, g.dpad_h.y + g.dpad_h.h * 0.5f,
@@ -697,12 +831,12 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 
 				// START / SELECT: the two angled pills under the screen.
 				push_rect(g.btn_select.x, g.btn_select.y, g.btn_select.w, g.btn_select.h,
-						  0xFF55566A, 2.0f);
+						  0xFF55566A, 3.0f);
 				push_rect(g.btn_start.x, g.btn_start.y, g.btn_start.w, g.btn_start.h, 0xFF55566A,
-						  2.0f);
+						  3.0f);
 				// L / R shoulder tabs.
-				push_rect(g.btn_l.x, g.btn_l.y, g.btn_l.w, g.btn_l.h, 0xFF55566A, 2.0f);
-				push_rect(g.btn_r.x, g.btn_r.y, g.btn_r.w, g.btn_r.h, 0xFF55566A, 2.0f);
+				push_rect(g.btn_l.x, g.btn_l.y, g.btn_l.w, g.btn_l.h, 0xFF55566A, 3.0f);
+				push_rect(g.btn_r.x, g.btn_r.y, g.btn_r.w, g.btn_r.h, 0xFF55566A, 3.0f);
 
 				// Speaker: six holes on a diagonal, as on the real shell.
 				for (int i = 0; i < 6; i++) {
@@ -716,28 +850,27 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 					const float tw = measure_text(t, tscale);
 					push_text(r.x + (r.w - tw) * 0.5f, r.y + (r.h - th) * 0.5f, t, tscale, kText);
 				};
+				// SELECT/START are only a few millimetres wide here; their
+				// names are already in the binding list, so drawing them on
+				// the pills only produced overlapping text.
 				tag(g.btn_a, "A");
 				tag(g.btn_b, "B");
-				tag(g.btn_start, "START");
-				tag(g.btn_select, "SELECT");
 				tag(g.btn_l, "L");
 				tag(g.btn_r, "R");
-				// The screen gets a caption instead of a binding.
 				{
 					const float tw = measure_text("SCREEN", tscale);
 					push_text(g.screen.x + (g.screen.w - tw) * 0.5f,
 							  g.screen.y + (g.screen.h - th) * 0.5f, "SCREEN", tscale, kTextMute);
 				}
 
-				// Highlight the armed button so the user can see what they are
-				// about to rebind.
+				// Highlight the armed button.
 				if (gui.awaiting_input()) {
 					const u32 hl = kAccent;
 					const auto ring = [&](const GUIConsole::Rect &r, bool circle) {
 						if (circle)
 							push_circle(r.x + r.w * 0.5f, r.y + r.h * 0.5f, r.w * 0.5f + 2.0f, hl);
 						else
-							push_rect(r.x - 2.0f, r.y - 2.0f, r.w + 4.0f, r.h + 4.0f, hl, 1.0f);
+							push_rect(r.x - 2.0f, r.y - 2.0f, r.w + 4.0f, r.h + 4.0f, hl, 3.0f);
 					};
 					switch (gui.pending_pad()) {
 					case gb::PadButton::A:
@@ -758,44 +891,81 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 					case gb::PadButton::R:
 						ring(g.btn_r, false);
 						break;
-					// Only the pressed ARM lights up, so the user can see
-					// which direction they just bound.
 					case gb::PadButton::Up:
 						push_rect(g.dpad_v.x - 2.0f, g.dpad_v.y - 2.0f, g.dpad_v.w + 4.0f,
-								  g.dpad_v.h * 0.5f + 2.0f, hl, 1.0f);
+								  g.dpad_v.h * 0.5f + 2.0f, hl, 2.0f);
 						break;
 					case gb::PadButton::Down:
 						push_rect(g.dpad_v.x - 2.0f, g.dpad_v.y + g.dpad_v.h * 0.5f - 2.0f,
-								  g.dpad_v.w + 4.0f, g.dpad_v.h * 0.5f + 2.0f, hl, 1.0f);
+								  g.dpad_v.w + 4.0f, g.dpad_v.h * 0.5f + 2.0f, hl, 2.0f);
 						break;
 					case gb::PadButton::Left:
 						push_rect(g.dpad_h.x - 2.0f, g.dpad_h.y - 2.0f, g.dpad_h.w * 0.5f + 2.0f,
-								  g.dpad_h.h + 4.0f, hl, 1.0f);
+								  g.dpad_h.h + 4.0f, hl, 2.0f);
 						break;
 					case gb::PadButton::Right:
 						push_rect(g.dpad_h.x + g.dpad_h.w * 0.5f - 2.0f, g.dpad_h.y - 2.0f,
-								  g.dpad_h.w * 0.5f + 2.0f, g.dpad_h.h + 4.0f, hl, 1.0f);
+								  g.dpad_h.w * 0.5f + 2.0f, g.dpad_h.h + 4.0f, hl, 2.0f);
 						break;
 					default:
 						break;
 					}
 				}
 			}
+
+			// Drop-down lists overlay all page content.
+			const auto draw_list = [&](const GUIConsole::Dropdown &dd) {
+				if (!dd.open)
+					return;
+				const bool profile_list = &dd == &gui.profile_box();
+				for (size_t i = 0; i < dd.items.size(); i++) {
+					const auto &r = dd.items[i];
+					const bool sel = static_cast<int>(i) == dd.selected;
+					const int idx = static_cast<int>(i);
+					const bool avail = !profile_list || gui.profileMenuEnabled(idx);
+					const bool hot = hovering(r);
+					push_rect(r.x, r.y, r.w, r.h, sel ? kAccent : kPillBg, 3.0f);
+					if (hot && !sel)
+						push_rect(r.x, r.y, r.w, r.h, kHover, 3.0f);
+					const std::string &t = i < dd.options.size() ? dd.options[i] : std::string();
+					const u32 fg = !avail ? kTextMute : (sel ? 0xFFFFFFFF : kText);
+					push_text(r.x + 6, r.y + (r.h - th) * 0.5f, clip(t, r.w - 12.0f, tscale),
+							  tscale, fg);
+				}
+			};
+			draw_list(gui.profile_box());
+			draw_list(gui.device_box());
 		}
-		// Footer hint, worded for the page you are on.
+
+		// ---- footer hint ----
 		{
 			const bool inputs = gui.settings_tab() == GUIConsole::SettingsTab::Inputs;
-			const char *hint = inputs ? "CLICK A GBA BUTTON TO REBIND - ESC CLOSES"
-									  : "CLICK A ROW - DRAG VOLUME - S/ESC CLOSES";
-			const float fh = std::min(16.0f, panel_h * 0.09f);
-			const float fy = panel_y + panel_h - fh - 4.0f;
-			push_rect(panel_x + 6, fy, panel_w - 12, fh, 0xFF1B1B23, 2.0f);
-			push_text(panel_x + 10, fy + (fh - 5.0f) * 0.5f, hint, 0.6f, kTextMute);
+			const char *full =
+				inputs ? "CLICK A BINDING, THEN PRESS A KEY OR PAD BUTTON  -  ESC CLOSES"
+					   : "CLICK A ROW TO CHANGE IT  -  DRAG VOLUME  -  S/ESC CLOSES";
+			const char *medium = inputs ? "CLICK A BINDING, PRESS A KEY OR BUTTON - ESC CLOSES"
+										: "CLICK A ROW TO CHANGE - ESC CLOSES";
+			const char *brief = inputs ? "CLICK BINDING - ESC CLOSES" : "CLICK ROW - ESC CLOSES";
+			const float footer_h = std::clamp(panel_h * 0.06f, 12.0f, 20.0f);
+			const float fy = panel_y + panel_h - footer_h - 4.0f;
+			push_rect(panel_x + 8, fy, panel_w - 16, footer_h, kFooterBg, 4.0f);
+			const float fts = std::max(0.72f, tscale * 0.82f);
+			const float avail = panel_w - 28.0f;
+			// Prefer the complete hint, but step down instead of cutting the
+			// closing "ESC CLOSES" off at narrow window sizes.
+			const char *hint = full;
+			if (measure_text(hint, fts) > avail)
+				hint = medium;
+			if (measure_text(hint, fts) > avail)
+				hint = brief;
+			push_text(panel_x + 14, fy + (footer_h - 8.0f * fts) * 0.5f, clip(hint, avail, fts),
+					  fts, kTextMute);
 		}
 	}
 	// Profile-naming prompt. Mutually exclusive with the remap modal above, so
 	// it can reuse the same box shape and centre on the body.
-	if (gui.text_entry_active()) {
+	// Hidden in fullscreen (like all chrome).
+	if (chrome && gui.text_entry_active()) {
 		push_rect(0, 0, static_cast<float>(swapchain_extent.width),
 				  static_cast<float>(swapchain_extent.height), 0xAA000000, 0);
 		const float modal_w = body.w * 0.6f, modal_h = body.h * 0.12f;
@@ -812,6 +982,20 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 		push_text(cx - measure_text(line1, 1.0f) * 0.5f, cy - 20, line1, 1.0f, 0xFFAAAAAA);
 		push_text(cx - measure_text(typed, 1.0f) * 0.5f, cy - 4, typed, 1.0f, 0xFFFFFFFF);
 		push_text(cx - measure_text(hint, 1.0f) * 0.5f, cy + 12, hint, 1.0f, 0xFFAAAAAA);
+	}
+	// Status OSD: one-line confirmation above the volume pill's spot (offset
+	// up while the volume pill is also visible, so the two never overlap).
+	if (status_osd_active()) {
+		const float ww = static_cast<float>(gui.window_w());
+		const float wh = static_cast<float>(gui.window_h());
+		const float pw = measure_text(osd_text_.c_str(), 1.0f) + 32.0f, ph = 30.0f;
+		const float px = (ww - pw) * 0.5f;
+		float py = wh - ph - 16.0f;
+		if (volume_osd_active())
+			py -= 46.0f;
+		push_rect(px, py, pw, ph, 0xCC101418, 6.0f);
+		push_text(px + (pw - measure_text(osd_text_.c_str(), 1.0f)) * 0.5f, py + 5,
+				  osd_text_.c_str(), 1.0f, 0xFFFFFFFF);
 	}
 	// Volume OSD: transient pill after -/=, above everything else (even the
 	// settings panel, whose own slider already shows the live value).
@@ -834,7 +1018,8 @@ void VulkanRenderer::update_gui_buffers(const GUIConsole &gui, const GUIConsole:
 	// overlay size so overflow can be diagnosed without a display.
 #ifndef GB4ME_RELEASE
 	if (std::getenv("GB4ME_GUI_COUNT") != nullptr) {
-		std::fprintf(stderr, "gui-overlay verts=%zu indices=%zu\n", verts.size(), indices.size());
+		std::fprintf(stderr, "gui-overlay verts=%zu indices=%zu text_verts=%zu text_indices=%zu\n",
+					 verts.size(), indices.size(), text_verts.size(), text_indices.size());
 		return;
 	}
 #endif

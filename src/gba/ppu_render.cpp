@@ -53,10 +53,14 @@ u16 oam16(const GbaPpu &p, u32 off)
 
 } // namespace
 
-void renderScanline(GbaPpu &ppu, unsigned y)
+void renderScanline(GbaPpu &ppu, unsigned y);
+
+// Full-line render into `line` (no green swap, no frame write): BG layers,
+// sprites, windows, compose + blend. Split out so the mid-scanline scroll
+// replay below can run it per segment with overridden scroll registers.
+void renderLineInto(GbaPpu &ppu, unsigned y, u32 *line)
 {
 	const u16 dispcnt = ppu.dispcnt_;
-	u32 *line = &ppu.frame_.pixels[y * GbaPpu::kWidth];
 	const u8 *const vram = ppu.vramData();
 	// Direct VRAM read that still applies the 96K/128K mirror. The backing
 	// array is 0x18000 bytes, so masking with 0x1FFFF alone would read out
@@ -654,8 +658,11 @@ void renderScanline(GbaPpu &ppu, unsigned y)
 		}
 		line[x] = out;
 	}
+}
 
-	// Green swap (final output effect).
+// Green swap (final output effect), applied once per assembled line.
+void greenSwapLine(GbaPpu &ppu, u32 *line)
+{
 	if ((ppu.greenswap_ & 1u) != 0) {
 		for (unsigned x = 0; x + 1 < GbaPpu::kWidth; x += 2) {
 			const u32 a = line[x], b = line[x + 1];
@@ -664,6 +671,64 @@ void renderScanline(GbaPpu &ppu, unsigned y)
 			line[x + 1] = (b & 0xFFFF00FFu) | (ga << 8);
 		}
 	}
+}
+
+void renderScanline(GbaPpu &ppu, unsigned y)
+{
+	u32 *line = &ppu.frame_.pixels[y * GbaPpu::kWidth];
+	// Fast path: no scroll writes this line (or the log overflowed), so
+	// one render with the live registers is today's behavior exactly.
+	if (ppu.scroll_log_.empty() || ppu.scroll_overflow_) {
+		renderLineInto(ppu, y, line);
+		greenSwapLine(ppu, line);
+		return;
+	}
+	// Segmented replay: line-start snapshot plus the ordered writes that
+	// landed while pixels were still drawing (4 dots per pixel; writes at
+	// dot >= 960 drew nothing). Static lines never reach here, so their
+	// pixels cannot change.
+	u16 h[4], v[4], save_h[4], save_v[4];
+	for (int i = 0; i < 4; i++) {
+		h[i] = ppu.scroll_snap_h_[i];
+		v[i] = ppu.scroll_snap_v_[i];
+		save_h[i] = ppu.bghofs_[i];
+		save_v[i] = ppu.bgvofs_[i];
+	}
+	auto applyRegs = [&] {
+		for (int i = 0; i < 4; i++) {
+			ppu.bghofs_[i] = h[i];
+			ppu.bgvofs_[i] = v[i];
+		}
+	};
+	u32 tmp[GbaPpu::kWidth];
+	unsigned x0 = 0;
+	for (const auto &e : ppu.scroll_log_) {
+		unsigned x1 = e.dot / 4;
+		if (x1 > GbaPpu::kWidth)
+			x1 = GbaPpu::kWidth;
+		if (x1 > x0) {
+			applyRegs();
+			renderLineInto(ppu, y, tmp);
+			for (unsigned x = x0; x < x1; x++)
+				line[x] = tmp[x];
+			x0 = x1;
+		}
+		if (e.reg < 4)
+			h[e.reg] = e.value;
+		else if (e.reg < 8)
+			v[e.reg - 4] = e.value;
+	}
+	if (x0 < GbaPpu::kWidth) {
+		applyRegs();
+		renderLineInto(ppu, y, tmp);
+		for (unsigned x = x0; x < GbaPpu::kWidth; x++)
+			line[x] = tmp[x];
+	}
+	for (int i = 0; i < 4; i++) {
+		ppu.bghofs_[i] = save_h[i];
+		ppu.bgvofs_[i] = save_v[i];
+	}
+	greenSwapLine(ppu, line);
 }
 
 } // namespace gba

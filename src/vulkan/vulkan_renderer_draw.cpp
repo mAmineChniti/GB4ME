@@ -94,13 +94,32 @@ void VulkanRenderer::record_command_buffer(VkCommandBuffer cmd, u32 image_index)
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1,
 							&descriptor_sets[current_frame], 0, nullptr);
 	vkCmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
+	// GUI overlay full-window (OSD pills only in fullscreen; chrome is
+	// skipped by update_gui_buffers when the console is fullscreen).
+	VkViewport vp_gui{};
+	vp_gui.x = 0;
+	vp_gui.y = 0;
+	vp_gui.width = static_cast<float>(swapchain_extent.width);
+	vp_gui.height = static_cast<float>(swapchain_extent.height);
+	vp_gui.minDepth = 0;
+	vp_gui.maxDepth = 1;
+	vkCmdSetViewport(cmd, 0, 1, &vp_gui);
+	VkRect2D sc_gui{};
+	sc_gui.extent = swapchain_extent;
+	vkCmdSetScissor(cmd, 0, 1, &sc_gui);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gui_pipeline);
+	VkBuffer gvbs[1] = {gui_vertex_buffer};
+	VkDeviceSize goffs[1] = {0};
+	vkCmdBindVertexBuffers(cmd, 0, 1, gvbs, goffs);
+	vkCmdBindIndexBuffer(cmd, gui_index_buffer, 0, VK_INDEX_TYPE_UINT32);
+	vkCmdDrawIndexed(cmd, gui_index_count, 1, 0, 0, 0);
 	draw_imgui(cmd);
 	draw_text(cmd);
 	vkCmdEndRenderPass(cmd);
 	vkEndCommandBuffer(cmd);
 }
 
-void VulkanRenderer::render(const PPU::FrameData &frame)
+void VulkanRenderer::render(const PPU::FrameData &frame, const GUIConsole &gui)
 {
 	prepare_imgui();
 	if (!ensure_texture(kTexWidth, kTexHeight))
@@ -117,20 +136,22 @@ void VulkanRenderer::render(const PPU::FrameData &frame)
 	}
 	vkResetFences(device, 1, &in_flight_fences[current_frame]);
 
-	// PPU framebuffer is 0xAARRGGBB, matching B8G8R8A8 byte order: direct copy.
+	// PPU framebuffer is 0xAARRGGBB, matching B8G8R8A8 byte order.
+	// upload_frame() blends LCD ghosting when enabled, else direct copy.
 	void *dst = nullptr;
 	vkMapMemory(device, texture_buffer_memory, 0, static_cast<VkDeviceSize>(tex_w_) * tex_h_ * 4, 0,
 				&dst);
-	std::memcpy(dst, frame.pixels.data(), static_cast<size_t>(tex_w_) * tex_h_ * 4);
+	upload_frame(dst, frame.pixels.data());
 	vkUnmapMemory(device, texture_buffer_memory);
 
 	update_uniform_buffer(current_frame);
+	update_gui_buffers(gui);
 	vkResetCommandBuffer(command_buffers[current_frame], 0);
 	record_command_buffer(command_buffers[current_frame], image_index);
 	present_frame(image_index);
 }
 
-void VulkanRenderer::render_gba(const u32 *pixels, u32 w, u32 h)
+void VulkanRenderer::render_gba(const u32 *pixels, u32 w, u32 h, const GUIConsole &gui)
 {
 	prepare_imgui();
 	if (pixels == nullptr || w == 0 || h == 0)
@@ -149,14 +170,15 @@ void VulkanRenderer::render_gba(const u32 *pixels, u32 w, u32 h)
 	}
 	vkResetFences(device, 1, &in_flight_fences[current_frame]);
 
-	// GBA framebuffer is 0xAARRGGBB like the GB one: direct copy.
+	// GBA framebuffer is 0xAARRGGBB like the GB one (see upload_frame()).
 	void *dst = nullptr;
 	vkMapMemory(device, texture_buffer_memory, 0, static_cast<VkDeviceSize>(tex_w_) * tex_h_ * 4, 0,
 				&dst);
-	std::memcpy(dst, pixels, static_cast<size_t>(tex_w_) * tex_h_ * 4);
+	upload_frame(dst, pixels);
 	vkUnmapMemory(device, texture_buffer_memory);
 
 	update_uniform_buffer(current_frame);
+	update_gui_buffers(gui);
 	vkResetCommandBuffer(command_buffers[current_frame], 0);
 	record_command_buffer(command_buffers[current_frame], image_index);
 	present_frame(image_index);
@@ -384,7 +406,7 @@ void VulkanRenderer::render_with_gui(const PPU::FrameData &frame, const GUIConso
 	void *dst = nullptr;
 	vkMapMemory(device, texture_buffer_memory, 0, static_cast<VkDeviceSize>(tex_w_) * tex_h_ * 4, 0,
 				&dst);
-	std::memcpy(dst, frame.pixels.data(), static_cast<size_t>(tex_w_) * tex_h_ * 4);
+	upload_frame(dst, frame.pixels.data());
 	vkUnmapMemory(device, texture_buffer_memory);
 	update_uniform_buffer(current_frame);
 	const GUIConsole::Rect gb_rect = gui.screen_rect();
@@ -436,11 +458,11 @@ void VulkanRenderer::render_gba_with_gui(const u32 *pixels, u32 w, u32 h, const 
 	}
 	vkResetFences(device, 1, &in_flight_fences[current_frame]);
 
-	// GBA framebuffer is 0xAARRGGBB like the GB one: direct copy.
+	// GBA framebuffer is 0xAARRGGBB like the GB one (see upload_frame()).
 	void *dst = nullptr;
 	vkMapMemory(device, texture_buffer_memory, 0, static_cast<VkDeviceSize>(tex_w_) * tex_h_ * 4, 0,
 				&dst);
-	std::memcpy(dst, pixels, static_cast<size_t>(tex_w_) * tex_h_ * 4);
+	upload_frame(dst, pixels);
 	vkUnmapMemory(device, texture_buffer_memory);
 
 	update_uniform_buffer(current_frame);
@@ -538,6 +560,44 @@ void VulkanRenderer::record_command_buffer_menu(VkCommandBuffer cmd, u32 image_i
 	vkCmdBindVertexBuffers(cmd, 0, 1, gvbs, goffs);
 	vkCmdBindIndexBuffer(cmd, gui_index_buffer, 0, VK_INDEX_TYPE_UINT32);
 	vkCmdDrawIndexed(cmd, gui_index_count, 1, 0, 0, 0);
+	// 3) Menu tile thumbnails: textured quads over the cart icons (populated
+	// by update_gui_buffers from the LRU in resolve_thumbs). Same fullscreen
+	// quad + viewport trick as the body photo, neutral filter so shots show
+	// exactly as saved. Restores the full viewport/scissor after, since the
+	// text pass uses NDC and would otherwise be clipped to the last tile.
+	if (!thumb_draws_.empty()) {
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline);
+		VkBuffer tvbs[1] = {vertex_buffer};
+		VkDeviceSize toffs[1] = {0};
+		vkCmdBindVertexBuffers(cmd, 0, 1, tvbs, toffs);
+		vkCmdBindIndexBuffer(cmd, index_buffer, 0, VK_INDEX_TYPE_UINT16);
+		push_neutral_video_constants(cmd);
+		for (const auto &td : thumb_draws_) {
+			if (td.set == VK_NULL_HANDLE || td.rect.w <= 0 || td.rect.h <= 0)
+				continue;
+			VkViewport vp{};
+			vp.x = td.rect.x * scale_x;
+			vp.y = td.rect.y * scale_y;
+			vp.width = td.rect.w * scale_x;
+			vp.height = td.rect.h * scale_y;
+			vp.minDepth = 0;
+			vp.maxDepth = 1;
+			if (vp.width <= 0 || vp.height <= 0)
+				continue;
+			vkCmdSetViewport(cmd, 0, 1, &vp);
+			VkRect2D sc{};
+			sc.offset = {static_cast<i32>(std::floor(vp.x)), static_cast<i32>(std::floor(vp.y))};
+			sc.extent = {
+				static_cast<u32>(std::ceil(vp.x + vp.width)) - static_cast<u32>(std::floor(vp.x)),
+				static_cast<u32>(std::ceil(vp.y + vp.height)) - static_cast<u32>(std::floor(vp.y))};
+			vkCmdSetScissor(cmd, 0, 1, &sc);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1,
+									&td.set, 0, nullptr);
+			vkCmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
+		}
+		vkCmdSetViewport(cmd, 0, 1, &vp_full);
+		vkCmdSetScissor(cmd, 0, 1, &sc_full);
+	}
 	draw_imgui(cmd);
 	draw_text(cmd);
 	vkCmdEndRenderPass(cmd);
@@ -559,6 +619,7 @@ void VulkanRenderer::render_menu(const GUIConsole &gui)
 	}
 	vkResetFences(device, 1, &in_flight_fences[current_frame]);
 	update_uniform_buffer(current_frame);
+	resolve_thumbs(gui);
 	update_gui_buffers(gui);
 	vkResetCommandBuffer(command_buffers[current_frame], 0);
 	record_command_buffer_menu(command_buffers[current_frame], image_index, gui);

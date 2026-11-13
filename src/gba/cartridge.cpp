@@ -49,6 +49,7 @@ bool Cartridge::loadFromBytes(const std::vector<u8> &data)
 		gpio_.clearOffset(); // New cart: new battery (offset comes from its sidecar).
 		gpio_.reset();
 		gpio_.setPresent(detectGpio());
+		gpio_.setGyro(detectGyro());
 	}
 	return loaded_;
 }
@@ -98,13 +99,15 @@ void Cartridge::reset()
 	if (save_)
 		save_->reset();
 	const bool present = gpio_.present();
+	const bool gyro = gpio_.gyro();
 	gpio_.reset();
 	gpio_.setPresent(present);
+	gpio_.setGyro(gyro);
 }
 
 // RTC-fitted cartridges, by 3-letter game-code prefix (mGBA overrides:
 // BPE/AXV/AXP = Pokemon R/S/E, U3I/U32 = Boktai 1/2 + solar, BLJ/BLV =
-// Rockman EXE 4.5). Only the RTC is modelled (solar/gyro/rumble are not).
+// Rockman EXE 4.5). Only the RTC is modelled (solar/rumble are not).
 bool Cartridge::detectGpio() const
 {
 	const std::string code = gameCode();
@@ -112,7 +115,15 @@ bool Cartridge::detectGpio() const
 		return false;
 	const std::string prefix = code.substr(0, 3);
 	return prefix == "BPE" || prefix == "AXV" || prefix == "AXP" || prefix == "U3I" ||
-		   prefix == "U32" || prefix == "BLJ" || prefix == "BLV";
+		   prefix == "U32" || prefix == "BLJ" || prefix == "BLV" || prefix == "RZW";
+}
+
+// WarioWare Twisted (Z-axis gyro + rumble via GPIO). Rumble (GPIO3) is not
+// modelled; the gyro ADC is.
+bool Cartridge::detectGyro() const
+{
+	const std::string code = gameCode();
+	return code.size() >= 3 && code.substr(0, 3) == "RZW";
 }
 
 bool Cartridge::isGbaImage(const std::vector<u8> &data)
@@ -441,6 +452,7 @@ void Cartridge::load(const StateBuffer &in)
 	// reset below (failed reads are ignored, not fatal).
 	gpio_.reset();
 	gpio_.setPresent(detectGpio());
+	gpio_.setGyro(detectGyro());
 	gpio_.load(in);
 }
 

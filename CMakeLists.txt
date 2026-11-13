@@ -88,6 +88,9 @@ option(GB4ME_KEEP_SELFTEST "Keep the selftest in a release build (verification)"
 # way). Pair with the `dev-asan` CMake preset; the selftest is the intended
 # workload. See .github/workflows/ci.yml `sanitizers`.
 option(GB4ME_SANITIZE "Build with ASan + UBSan (verification)" OFF)
+# Optional Tracy profiling (off by default, no new dependency when off).
+# When ON, include/gb/tracy.h uses <tracy/Tracy.hpp> if present, else no-ops.
+option(GB4ME_TRACY "Enable Tracy profiling zones (optional client)" OFF)
 
 file(GLOB_RECURSE SOURCES "src/*.cpp" "src/**/*.cpp")
 file(GLOB_RECURSE HEADERS "include/*.h" "include/**/*.h" "src/*.h" "src/**/*.h")
@@ -106,6 +109,9 @@ if(GB4ME_RELEASE)
 endif()
 if(GB4ME_KEEP_SELFTEST)
     target_compile_definitions(${PROJECT_NAME} PRIVATE GB4ME_KEEP_SELFTEST=1)
+endif()
+if(GB4ME_TRACY)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE GB4ME_TRACY=1)
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -143,8 +149,20 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/selftest.cpp")
     add_test(NAME selftest COMMAND $<TARGET_FILE:${PROJECT_NAME}> --selftest)
 endif()
 
-# Installation — only binary; desktop/icon/shaders/assets handled by PKGBUILD
+# Installation — binary + shaders + desktop/icon/font so `cmake --install`
+# yields a runnable tree; packagers (PKGBUILD/flatpak) reuse the same layout.
 install(TARGETS ${PROJECT_NAME} DESTINATION bin)
+install(DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders/"
+	DESTINATION share/GB4ME/shaders
+	FILES_MATCHING
+	PATTERN "*.spv")
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/GB4ME.desktop" DESTINATION share/applications)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/GB4ME.png"
+	DESTINATION share/icons/hicolor/512x512/apps)
+# The photo body skin is loaded relative to the binary/install prefix; without
+# it an installed build falls back to the flat console drawing.
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/gbc_body.png"
+	DESTINATION share/GB4ME/assets)
 
 # Compile GLSL shaders to SPIR-V with glslc.
 # REQUIRED: the renderer loads these .spv files at startup, so a build that

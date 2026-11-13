@@ -1,5 +1,6 @@
 #pragma once
 
+#include "state.h"
 #include "types.h"
 #include <array>
 
@@ -41,6 +42,7 @@ class PPU
 		return hardware_mode_;
 	}
 	void step(u32 cycles);
+
 	const FrameData &frame() const
 	{
 		return frame_buffer_;
@@ -59,6 +61,9 @@ class PPU
 	// and tile attributes through this same method (swappable renderer).
 	// GBC: tile attributes in VRAM bank 1 will change this path.
 	void render_scanline(u8 y);
+	// Re-evaluate the STAT interrupt line and fire on a low->high edge while
+	// IE's STAT bit is set (see the definition for the blocking rule).
+	void update_stat_line();
 
 	// VRAM/OAM access for the Bus ONLY (Rule 2: no direct array access).
 	u8 read_vram(u16 addr) const;
@@ -83,17 +88,32 @@ class PPU
 	u8 read_oam(u16 addr) const;
 	void write_oam(u16 addr, u8 value);
 
+	// ---- DMG OAM corruption bug ----------------------------------------
+	// While the PPU scans OAM at the top of a visible line it walks an
+	// internal row pointer; a write that lands in that window with an address
+	// in $FE00-$FEFF is swallowed *and* shuffles OAM (Blargg "oam_bug",
+	// SameBoy `GB_trigger_oam_bug` in Core/memory.c). `oam_bug_row()` is that
+	// pointer: a multiple of 4 that is >= 8 inside the window, 0 before the
+	// first row is reached and 0xFF outside the window entirely (LCD off, a
+	// VBlank line, or CGB - the CGB has no bug at all).
+	u8 oam_bug_row() const;
+	// Applies the corruption for a write to $FE00-$FEFF that the DMG OAM
+	// block swallowed. The caller drops the write.
+	void trigger_oam_bug(u16 addr);
+
 	// DMG LCD registers (https://gbdev.io/pandocs/LCDC.html).
-	void write_lcdc(u8 value)
-	{
-		lcdc_ = value;
-	}
+	// Enabling the LCD synchronises to the start of the first visible line
+	// (Blargg oam_bug 1-lcd_sync): LY, the dot counter and the mode all restart
+	// immediately, so OAM is blocked from the first cycle instead of from
+	// whenever the next step() happens to run.
+	void write_lcdc(u8 value);
 	void write_stat(u8 value)
 	{
 		// Only bits 3-6 (the STAT IRQ enables) and bit 7 are writable; the
 		// mode/coincidence bits 0-2 are read-only. Bit 7 reads back as 1
 		// (mGBA masks with 0x78, so bit 7 is not stored).
 		stat_ = (stat_ & 0x07) | (value & 0x78) | 0x80;
+		update_stat_line();
 	}
 	void write_scy(u8 value)
 	{
@@ -187,6 +207,17 @@ class PPU
 		return wx_;
 	}
 
+	// Blargg's test ROMs that report only on screen (halt_bug,
+	// interrupt_time) draw their console with the font loaded so that a BG
+	// tile index *is* the ASCII code, so the text can be read straight out of
+	// the tile map. True when `word` appears as a whole word in the visible
+	// background text. The window layer is not searched (Blargg's console does
+	// not use it).
+	bool console_shows(const char *word) const;
+	// The same text as newlines between the 18 visible rows, for diagnostics
+	// (which subtest failed, etc.).
+	std::string console_text() const;
+
 	// ---- CGB registers ----
 	// https://gbdev.io/pandocs/CGB_Registers.html
 	u8 read_vbk() const
@@ -227,6 +258,15 @@ class PPU
 	{
 		return dmg_palette_;
 	}
+
+	// Savestate. Everything the scanline loop owns is here, including the
+	// two timing counters (line_cycles_/dot_) and the rendered frame: a
+	// reload in mid-frame has to resume at the same dot with the same
+	// picture already on screen, or the first frame after a load pops. The
+	// per-pixel CGB priority scratch is NOT saved - it is recomputed from
+	// scratch every line, so it carries no state.
+	void save(StateBuffer &buf) const;
+	void load(StateBuffer &buf);
 
   private:
 	MMU *mmu_ = nullptr;
@@ -273,16 +313,25 @@ class PPU
 	u8 wx_ = 0;
 
 	Mode current_mode_ = Mode::OAMScan;
+	// STAT interrupt line level, kept across the edge test so a source that is
+	// already high when IE is enabled cannot fire (Pan Docs "STAT
+	// Interrupts": the interrupt needs a rising edge *while* IE bit 1 is set;
+	// otherwise the edge is blocked until the line falls and rises again).
+	bool stat_line_ = false;
+
 	u32 line_cycles_ = 0;
 	// Running dot position in the frame; only used to time the HDMA bus
 	// block, so it is not kept in sync with LY/LYC.
 	u32 dot_ = 0;
+
 	u32 hdma_block_until_ = 0;
 	u16 window_line_ = 0; // Internal WY line counter (resets on VBlank/LCD-off).
 	FrameData frame_buffer_{};
 	bool frame_ready_flag_ = false;
 
 	void render_background(u8 y);
+	// BG tile index at screen tile (tx, ty), or 0 when the BG is off.
+	u8 console_tile(int tx, int ty) const;
 	void render_window(u8 y);
 	void render_sprites(u8 y);
 	// CGB rendering variants

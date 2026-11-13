@@ -1,5 +1,6 @@
 #pragma once
 
+#include "state.h"
 #include "types.h"
 
 namespace gb
@@ -44,6 +45,9 @@ class Joypad
 	{
 		return (key_state_ & static_cast<u8>(1u << static_cast<u8>(key))) != 0;
 	}
+
+	void save(StateBuffer &buf) const;
+	void load(StateBuffer &buf);
 
   private:
 	MMU *mmu_ = nullptr;

@@ -8,7 +8,10 @@
 // https://gbdev.io/pandocs/Palettes.html
 
 #include "gb/ppu.h"
+
 #include "gb/mmu.h"
+
+#include <cstring>
 
 namespace gb
 {
@@ -91,6 +94,57 @@ void PPU::write_vbk(u8 value)
 	if (!is_cgb_mode(hardware_mode_))
 		return; // DMG: ignore
 	vram_bank_ = value & 0x01;
+}
+
+u8 PPU::console_tile(int tx, int ty) const
+{
+	if ((lcdc_ & 0x01) == 0)
+		return 0;
+	const u16 map_base = (lcdc_ & 0x08) ? 0x1C00 : 0x1800;
+	// Same address math as render_scanline(): the visible pixel (x, y) comes
+	// from map[(y + SCY)/8][(x + SCX)/8], with the 32-row map wrapping.
+	const int mx = (tx * 8 + scx_) & 255;
+	const int my = (ty * 8 + scy_) & 255;
+	return vram_banks_[0][map_base + static_cast<u16>((my / 8) * 32 + (mx / 8))];
+}
+
+bool PPU::console_shows(const char *word) const
+{
+	const size_t len = std::strlen(word);
+	if (len == 0 || len > 20)
+		return false;
+	for (int ty = 0; ty < 18; ++ty) {
+		for (int tx = 0; tx + static_cast<int>(len) <= 20; ++tx) {
+			bool match = true;
+			for (size_t i = 0; i < len && match; ++i)
+				match = console_tile(tx + static_cast<int>(i), ty) == static_cast<u8>(word[i]);
+			if (!match)
+				continue;
+			// Whole word only: a blank (or the line edge) on both sides.
+			const u8 before = tx == 0 ? ' ' : console_tile(tx - 1, ty);
+			const u8 after = console_tile(tx + static_cast<int>(len), ty);
+			if ((before < 0x20 || before == ' ') && (after < 0x20 || after == ' '))
+				return true;
+		}
+	}
+	return false;
+}
+
+std::string PPU::console_text() const
+{
+	std::string out;
+	for (int ty = 0; ty < 18; ++ty) {
+		std::string row;
+		for (int tx = 0; tx < 20; ++tx) {
+			const u8 t = console_tile(tx, ty);
+			row.push_back((t >= 0x20 && t < 0x7F) ? static_cast<char>(t) : ' ');
+		}
+		while (!row.empty() && row.back() == ' ')
+			row.pop_back();
+		out += row;
+		out.push_back('\n');
+	}
+	return out;
 }
 
 u8 PPU::read_vram(u16 addr) const
@@ -261,8 +315,15 @@ void PPU::write_oam(u16 addr, u8 value)
 		return;
 	if (is_cgb_mode(hardware_mode_) && hdma_bus_busy())
 		return;
-	if ((lcdc_ & 0x80) && (current_mode_ == Mode::OAMScan || current_mode_ == Mode::Drawing))
+	if ((lcdc_ & 0x80) && (current_mode_ == Mode::OAMScan || current_mode_ == Mode::Drawing)) {
+		// DMG: the CPU cannot reach OAM in these modes, and the write is not
+		// simply dropped - if the OAM scan is walking its row pointer, the
+		// attempt corrupts OAM (Blargg "oam_bug", SameBoy
+		// GB_trigger_oam_bug). The CGB has no such bug. `addr` is OAM-relative
+		// here while trigger_oam_bug wants the CPU address.
+		trigger_oam_bug(static_cast<u16>(0xFE00 + addr));
 		return;
+	}
 	OAMEntry &e = oam_[addr / 4];
 	switch (addr % 4) {
 	case 0:
@@ -277,6 +338,110 @@ void PPU::write_oam(u16 addr, u8 value)
 	default:
 		e.flags = value;
 		break;
+	}
+}
+
+// ---- DMG OAM corruption ------------------------------------------------
+//
+// Blargg "oam_bug" readme: "Occurs when 16-bit increment/decrement is made of
+// value in range $FE00 to $FEFF, during around the first 20 cycles of a
+// visible scanline while LCD is on, where 114 cycles = 1 scanline." That is
+// the OAM scan at the top of the line: it walks one row every 2 T-cycles
+// across mode 2 (80 T = 40 steps, each row held for two steps), and the row
+// pointer decides both the shape of the corruption and whether there is one at
+// all: it is cleared once the scan is done, and it is already at row 8 on the
+// first dot (SameBoy's line-start 0 is an artifact of starting its scan a few
+// T-cycles into the line - Blargg pins the first row to dot 0 instead).
+// Pan Docs only says OAM is CPU-accessible in HBlank/VBlank; it does not
+// document the corruption, so Blargg's test plus SameBoy's model are the
+// references here.
+constexpr u32 kOamBugScanDots = 80;
+constexpr u32 kOamBugStepDots = 2;
+
+u8 PPU::oam_bug_row() const
+{
+	// No bug with the LCD off, in the 10 VBlank lines, or on the CGB.
+	if (is_cgb_mode(hardware_mode_) || (lcdc_ & 0x80) == 0 || ly_ >= kVBlankStart)
+		return 0xFF;
+	if (line_cycles_ >= kOamBugScanDots)
+		return 0xFF;
+	// (step & ~1) pairs the steps - each row is held for two of them - and the
+	// row is a byte offset into OAM. Row 8 is already live at dot 0: Blargg's
+	// "INC DE at first corruption" fires on the very first M-cycle of the line
+	// (4-scanline_timing), while one M-cycle earlier it must not.
+	const u32 step = line_cycles_ / kOamBugStepDots;
+	return static_cast<u8>((step & ~1u) * 4 + 8);
+}
+
+void PPU::trigger_oam_bug(u16 addr)
+{
+	// Only $FE00-$FEFF, and only once the scan has reached a real row.
+	if (addr < 0xFE00 || addr >= 0xFF00)
+		return;
+	const u8 row = oam_bug_row();
+	if (row < 8)
+		return;
+
+	// SameBoy works on a flat byte array, so do the same through a scratch
+	// copy: the entry layout is [Y, X, TILE, FLAGS], so the 16-bit word at
+	// `row` is (X,TILE) of this entry, and SameBoy's `base[-4]`/`base[-2]` are
+	// uint16_t steps - 8 and 4 *bytes* back, which land on the previous two
+	// entries.
+	u8 buf[0xA0];
+	for (u32 i = 0; i < 0xA0; ++i) {
+		const OAMEntry &e = oam_[i / 4];
+		switch (i % 4) {
+		case 0:
+			buf[i] = e.y;
+			break;
+		case 1:
+			buf[i] = e.x;
+			break;
+		case 2:
+			buf[i] = e.tile;
+			break;
+		default:
+			buf[i] = e.flags;
+			break;
+		}
+	}
+	const auto word = [&](u32 off) -> u16 {
+		return static_cast<u16>(buf[off] | (buf[off + 1] << 8));
+	};
+	// SameBoy's bitwise_glitch(a, b, c) = ((a ^ c) & (b ^ c)) ^ c. The last
+	// scan step lands on row $A0, where a 16-bit blend would run one word past
+	// the array (SameBoy reads and writes it anyway); clamp instead of
+	// reproducing the out-of-bounds access.
+	if (row + 1 < 0xA0) {
+		const u16 cur = word(row), b4 = word(row - 8), b2 = word(row - 4);
+		const u16 glitched = static_cast<u16>((((cur ^ b2) & (b4 ^ b2)) ^ b2) & 0xFFFF);
+		buf[row] = lo_byte(glitched);
+		buf[row + 1] = hi_byte(glitched);
+	}
+	// Then six bytes are copied up from the entry below. The source always
+	// starts below the destination, so this is safe in place.
+	for (u32 i = 2; i < 8; ++i) {
+		if (row + i < 0xA0)
+			buf[row + i] = buf[row - 8 + i];
+	}
+	// Write back only what the copy could have touched.
+	for (u32 off = static_cast<u32>(row) - 8; off < static_cast<u32>(row) + 8 && off < 0xA0;
+		 ++off) {
+		OAMEntry &e = oam_[off / 4];
+		switch (off % 4) {
+		case 0:
+			e.y = buf[off];
+			break;
+		case 1:
+			e.x = buf[off];
+			break;
+		case 2:
+			e.tile = buf[off];
+			break;
+		default:
+			e.flags = buf[off];
+			break;
+		}
 	}
 }
 
@@ -327,11 +492,62 @@ void PPU::request_stat_interrupt()
 		mmu_->request_interrupt(1);
 }
 
+void PPU::update_stat_line()
+{
+	// The STAT interrupt line is the OR of the enabled sources, and the CPU
+	// only sees a low->high edge that happens while IE bit 1 is set. An edge
+	// while IE is clear is *blocked*: the next request needs the line to fall
+	// and rise again, which is why a game that enables STAT mid-frame does not
+	// get a stale HBlank/OAM interrupt for a mode it already passed.
+	// https://gbdev.io/pandocs/STAT.html#stat-interrupts
+	u8 line = 0;
+	if ((stat_ & 0x40) && ly_ == lyc_)
+		line |= 0x01; // LYC = LY
+	if ((stat_ & 0x10) && current_mode_ == Mode::VBlank)
+		line |= 0x02; // Mode 1
+	if ((stat_ & 0x20) && current_mode_ == Mode::OAMScan)
+		line |= 0x04; // Mode 2
+	if ((stat_ & 0x08) && current_mode_ == Mode::HBlank)
+		line |= 0x08; // Mode 0 (HBlank on DMG)
+	const bool high = line != 0;
+	if (high && !stat_line_ && mmu_ && (mmu_->read_ie() & 0x02) != 0)
+		request_stat_interrupt();
+	stat_line_ = high;
+}
+
+void PPU::write_lcdc(u8 value)
+{
+	const bool was_on = (lcdc_ & 0x80) != 0;
+	lcdc_ = value;
+	if ((lcdc_ & 0x80) == 0 || was_on)
+		return;
+	// Blargg oam_bug 1-lcd_sync: "With LCD off, turning it on synchronizes to
+	// beginning of first visible scanline." The counters restart here rather
+	// than in step(), so the mode (and therefore the OAM block) is right for
+	// the very first cycle of the new frame - a CPU that writes OAM before the
+	// PPU has been stepped once must still hit the block.
+	ly_ = 0;
+	line_cycles_ = 0;
+	dot_ = 0;
+	line_cycles_ = 0;
+	dot_ = 0;
+	hdma_block_until_ = 0;
+	window_line_ = 0;
+	current_mode_ = Mode::OAMScan;
+	stat_ = (stat_ & 0xFC) | 0x02;
+	stat_ |= 0x04; // LY 0 coincides with an LYC of 0.
+	update_stat_line();
+}
+
 void PPU::step(u32 mcycles)
 {
 	// GBC: dot rate scales with double_speed; M-cycle counts are unchanged.
 	if ((lcdc_ & 0x80) == 0) {
-		// LCD off: LY stuck at 0, VRAM freely accessible.
+		// LCD off: LY stuck at 0, VRAM freely accessible. The dot counter
+		// restarts with it: switching the LCD back on starts line 0 at dot 0
+		// (Blargg oam_bug readme: "With LCD off, turning it on synchronizes
+		// to beginning of first visible scanline"). 1-lcd_sync measures the
+		// alternative (resuming mid-line) and is tracked in agents.md.
 		ly_ = 0;
 		line_cycles_ = 0;
 		dot_ = 0;
@@ -340,6 +556,9 @@ void PPU::step(u32 mcycles)
 		window_line_ = 0;
 		stat_ = (stat_ & 0xFC) | 0x00;
 		stat_ &= ~0x04;
+		// Mode 0 with the LCD off is not a source on DMG; dropping the line
+		// level here also means switching the LCD on cannot fire a stale edge.
+		stat_line_ = false;
 		return;
 	}
 
@@ -356,24 +575,20 @@ void PPU::step(u32 mcycles)
 			current_mode_ = Mode::VBlank;
 			frame_ready_flag_ = true;
 			request_vblank_interrupt();
-			if (stat_ & 0x10)
-				request_stat_interrupt(); // Mode-1 STAT source.
 		} else if (ly_ >= kLinesPerFrame) {
 			ly_ = 0;
 			window_line_ = 0;
 		}
 		// LYC coincidence update.
-		if (ly_ == lyc_) {
+		if (ly_ == lyc_)
 			stat_ |= 0x04;
-			if (stat_ & 0x40)
-				request_stat_interrupt();
-		} else {
+		else
 			stat_ &= ~0x04;
-		}
 		// HBlank HDMA: one block per HBlank (lines 0-143)
 		if (is_cgb_mode(hardware_mode_) && mmu_ && ly_ < kVBlankStart) {
 			mmu_->hdma_step_hblank();
 		}
+		update_stat_line();
 	}
 
 	// Mode + STAT for the current dot (visible lines only).
@@ -383,19 +598,14 @@ void PPU::step(u32 mcycles)
 			m = Mode::HBlank;
 		else if (line_cycles_ >= kOamDots)
 			m = Mode::Drawing;
-		if (m != current_mode_) {
+		if (m != current_mode_)
 			current_mode_ = m;
-			if (m == Mode::HBlank && (stat_ & 0x08))
-				request_stat_interrupt();
-			if (m == Mode::OAMScan && (stat_ & 0x20))
-				request_stat_interrupt();
-			// Trigger HDMA on entering HBlank if needed (alternative hook)
-			// We already trigger per line above; also ensure first HBlank after drawing.
-		}
 		stat_ = (stat_ & 0xFC) | static_cast<u8>(current_mode_);
+		update_stat_line();
 	} else {
 		current_mode_ = Mode::VBlank;
 		stat_ = (stat_ & 0xFC) | 0x01;
+		update_stat_line();
 	}
 	(void) was_hblank;
 }
@@ -732,6 +942,95 @@ void PPU::render_sprites_cgb(u8 y)
 			frame_buffer_.pixels[y * SCREEN_WIDTH + x] = obj_palette_color(palette, color_id);
 		}
 	}
+}
+
+void PPU::save(StateBuffer &buf) const
+{
+	buf.writeArray2(vram_banks_);
+	buf.write(vram_bank_);
+	for (const OAMEntry &e : oam_) {
+		buf.write(e.y);
+		buf.write(e.x);
+		buf.write(e.tile);
+		buf.write(e.flags);
+	}
+	buf.writeArray(bgpd_ram_);
+	buf.writeArray(obpd_ram_);
+	buf.writeArray(bg_palette_cache_);
+	buf.writeArray(obj_palette_cache_);
+	buf.write(bgpi_);
+	buf.write(obpi_);
+	buf.write(opri_);
+	buf.write(lcdc_);
+	buf.write(stat_);
+	buf.write(scy_);
+	buf.write(scx_);
+	buf.write(ly_);
+	buf.write(lyc_);
+	buf.write(dma_);
+	buf.write(bgp_);
+	buf.write(obp0_);
+	buf.write(obp1_);
+	buf.write(wy_);
+	buf.write(wx_);
+	buf.write(static_cast<u8>(current_mode_));
+	buf.write(static_cast<u8>(stat_line_ ? 1 : 0));
+	buf.write(line_cycles_);
+	buf.write(dot_);
+	buf.write(hdma_block_until_);
+	buf.write(window_line_);
+	buf.writeArray(dmg_shades_);
+	buf.write(dmg_palette_);
+	buf.write(frame_ready_flag_);
+	buf.writeArray(frame_buffer_.pixels);
+}
+
+void PPU::load(StateBuffer &buf)
+{
+	buf.readArray2(vram_banks_);
+	buf.read(vram_bank_);
+	for (OAMEntry &e : oam_) {
+		buf.read(e.y);
+		buf.read(e.x);
+		buf.read(e.tile);
+		buf.read(e.flags);
+	}
+	buf.readArray(bgpd_ram_);
+	buf.readArray(obpd_ram_);
+	buf.readArray(bg_palette_cache_);
+	buf.readArray(obj_palette_cache_);
+	buf.read(bgpi_);
+	buf.read(obpi_);
+	buf.read(opri_);
+	buf.read(lcdc_);
+	buf.read(stat_);
+	buf.read(scy_);
+	buf.read(scx_);
+	buf.read(ly_);
+	buf.read(lyc_);
+	buf.read(dma_);
+	buf.read(bgp_);
+	buf.read(obp0_);
+	buf.read(obp1_);
+	buf.read(wy_);
+	buf.read(wx_);
+	u8 mode = 0;
+	buf.read(mode);
+	current_mode_ = static_cast<Mode>(mode);
+	u8 stat_line = 0;
+	buf.read(stat_line);
+	stat_line_ = stat_line != 0;
+	buf.read(line_cycles_);
+	buf.read(dot_);
+	buf.read(hdma_block_until_);
+	buf.read(window_line_);
+	buf.readArray(dmg_shades_);
+	buf.read(dmg_palette_);
+	buf.read(frame_ready_flag_);
+	buf.readArray(frame_buffer_.pixels);
+	// hardware_mode_ is set once at load time from the cartridge header, not
+	// by a register write, so it is deliberately not part of the state: a
+	// state is only ever loaded into the machine that wrote it.
 }
 
 } // namespace gb

@@ -6,14 +6,17 @@
 // otherwise mirrors ROM.
 
 #include "gba/bus.h"
+
 #include "gba/audio.h"
 #include "gba/cartridge.h"
+#include "gba/cheats.h"
 #include "gba/dma.h"
 #include "gba/irq.h"
 #include "gba/keypad.h"
 #include "gba/ppu.h"
 #include "gba/timers.h"
 #include <cstdio>
+#include <cstdlib>
 
 namespace gba
 {
@@ -48,8 +51,13 @@ void GbaBus::reset()
 	bios_.fill(0);
 	bios_active_ = false;
 	waitcnt_ = 0; // Reset default; Phase 5 routes the I/O write here.
-				  // ROM attachment survives reset (cartridge stays inserted).
-				  // Video memory resets with the PPU (core calls ppu.reset()).
+	// Fresh debug channel on reset (log keeps accumulating: it is the
+	// runner's output for the whole run, like a serial capture).
+	mgba_debug_on_ = false;
+	mgba_dbg_.fill(0);
+	mgba_flags_ = 0;
+	// ROM attachment survives reset (cartridge stays inserted).
+	// Video memory resets with the PPU (core calls ppu.reset()).
 }
 
 void GbaBus::attachRom(const u8 *data, size_t size)
@@ -130,21 +138,78 @@ void GbaBus::eepromDmaWrite(uint16_t value, uint32_t remaining)
 		cartridge_->eepromDmaWrite(value, remaining, cycle());
 }
 
-u8 GbaBus::read8(u32 addr)
+void GbaBus::commitMgbaDebug()
+{
+	// NUL-bounded like the guest's vsnprintf/strncpy pair always is.
+	size_t len = 0;
+	while (len < mgba_dbg_.size() && mgba_dbg_[len] != 0)
+		len++;
+	debug_log.append(reinterpret_cast<const char *>(mgba_dbg_.data()), len);
+}
+
+void GbaBus::writeMgbaDebug(u32 addr, u8 value)
+{
+	if (addr >= kMgbaDbgString && addr < kMgbaDbgString + kMgbaDbgSize) {
+		mgba_dbg_[addr - kMgbaDbgString] = value;
+		return;
+	}
+	if (addr == kMgbaDbgFlags || addr == kMgbaDbgFlags + 1) {
+		const unsigned shift = (addr - kMgbaDbgFlags) * 8u;
+		mgba_flags_ = static_cast<u16>((mgba_flags_ & ~(0xFFu << shift)) |
+									   (static_cast<u16>(value) << shift));
+		// A flags store with bit 8 set publishes the buffered string (the
+		// guest always stores full halfwords, so the high byte carries the
+		// decision exactly once per publish; byte writes to the low half
+		// can never set it).
+		if (addr == kMgbaDbgFlags + 1 && (value & 0x01u) != 0)
+			commitMgbaDebug();
+		return;
+	}
+	if (addr == kMgbaDbgEnable || addr == kMgbaDbgEnable + 1) {
+		// The guest detects the channel by writing the magic and reading
+		// back the ack; anything else (including mgba_close's 0) disables.
+		const unsigned shift = (addr - kMgbaDbgEnable) * 8u;
+		mgba_enable_word_ = static_cast<u16>((mgba_enable_word_ & ~(0xFFu << shift)) |
+											 (static_cast<u16>(value) << shift));
+		mgba_debug_on_ = (mgba_enable_word_ == kMgbaDbgMagic);
+		return;
+	}
+	// Elsewhere in the window: nothing mapped, writes dropped.
+}
+
+u8 GbaBus::readMgbaDebug(u32 addr) const
+{
+	if (addr >= kMgbaDbgString && addr < kMgbaDbgString + kMgbaDbgSize)
+		return mgba_dbg_[addr - kMgbaDbgString];
+	if (addr == kMgbaDbgFlags || addr == kMgbaDbgFlags + 1)
+		return static_cast<u8>((mgba_flags_ >> ((addr - kMgbaDbgFlags) * 8u)) & 0xFFu);
+	if (addr == kMgbaDbgEnable || addr == kMgbaDbgEnable + 1) {
+		const u16 ack = mgba_debug_on_ ? kMgbaDbgAck : 0;
+		return static_cast<u8>((ack >> ((addr - kMgbaDbgEnable) * 8u)) & 0xFFu);
+	}
+	return 0xFF;
+}
+
+u8 GbaBus::read8_raw(u32 addr)
 {
 	// EEPROM carts: 0x0D is the serial port, not a ROM mirror.
 	if (isEepromRegion(addr) && eepromActive())
 		return static_cast<u8>(eepromDmaRead() & 1u);
+	// mGBA debug channel (test-suite reporting, not SIO).
+	if (isMgbaDebug(addr))
+		return readMgbaDebug(addr);
 	// RTC carts: 0x080000C4-0x080000C9 are the GPIO registers (GBATEK),
 	// not ROM bytes.
 	if (isGpioRegion(addr) && gpioActive())
 		return cartridge_->gpio().read(addr);
 	switch (decode(addr)) {
 	case Region::Bios: {
-		// BIOS protection: locked reads are open-bus on hardware (last
-		// prefetch value); 0xFF bytes are a documented simplification.
+		// BIOS protection: locked reads return the last prefetched BIOS op
+		// (mGBA biosPrefetch), sliced per width/address by the 16/32-bit
+		// paths composing these bytes. Ours never leaves its reset value
+		// (no real BIOS executes under HLE).
 		if (!bios_active_)
-			return 0xFF;
+			return static_cast<u8>((kBiosOpenBus >> ((addr & 3u) * 8u)) & 0xFFu);
 		return bios_[addr & (kBiosSize - 1)];
 	}
 	case Region::Ewram:
@@ -252,7 +317,7 @@ u16 GbaBus::deviceByte16(u32 addr, bool *owned) const
 // 16-bit accesses ignore A0 on hardware (GBATEK "Memory Alignments");
 // masking here also keeps the device-register and video-memory paths from
 // composing bogus values out of two different registers.
-u16 GbaBus::read16(u32 addr)
+u16 GbaBus::read16_raw(u32 addr)
 {
 	// EEPROM serial read (CPU poll path; real streaming uses DMA3).
 	if (isEepromRegion(addr) && eepromActive())
@@ -307,12 +372,12 @@ u16 GbaBus::read16(u32 addr)
 		const u8 b = cartridge_->readSave(sramOffset(addr));
 		return static_cast<u16>(b * 0x0101u);
 	}
-	const u8 lo = read8(addr);
-	const u8 hi = read8(addr + 1);
+	const u8 lo = read8_raw(addr);
+	const u8 hi = read8_raw(addr + 1);
 	return static_cast<u16>(lo | (static_cast<u16>(hi) << 8));
 }
 
-u32 GbaBus::read32(u32 addr)
+u32 GbaBus::read32_raw(u32 addr)
 {
 	// 32-bit accesses ignore A1-0 (GBATEK "Memory Alignments"): the address
 	// is rounded down, and the CPU layer applies the LDR rotation.
@@ -355,15 +420,86 @@ u32 GbaBus::read32(u32 addr)
 	default:
 		break;
 	}
-	const u16 lo = read16(addr);
-	const u16 hi = read16(addr + 2);
+	const u16 lo = read16_raw(addr);
+	const u16 hi = read16_raw(addr + 2);
 	return lo | (static_cast<u32>(hi) << 16);
+}
+
+// Cheat wrappers: raw access above, width-matched patches here. IO, BIOS,
+// open-bus, EEPROM serial and GPIO registers never take cheats.
+u8 GbaBus::read8(u32 addr)
+{
+	const u8 v = read8_raw(addr);
+	if (cheats_ == nullptr)
+		return v;
+	if ((isEepromRegion(addr) && eepromActive()) || (isGpioRegion(addr) && gpioActive()))
+		return v;
+	switch (decode(addr)) {
+	case Region::Ewram:
+	case Region::Iwram:
+	case Region::Palette:
+	case Region::Vram:
+	case Region::Oam:
+	case Region::Rom:
+	case Region::Sram:
+		return cheats_->apply8(addr, v);
+	default:
+		return v;
+	}
+}
+
+u16 GbaBus::read16(u32 addr)
+{
+	const u16 v = read16_raw(addr);
+	if (cheats_ == nullptr)
+		return v;
+	const u32 a = addr & ~1u;
+	if ((isEepromRegion(a) && eepromActive()) || (isGpioRegion(a) && gpioActive()))
+		return v;
+	switch (decode(a)) {
+	case Region::Ewram:
+	case Region::Iwram:
+	case Region::Palette:
+	case Region::Vram:
+	case Region::Oam:
+	case Region::Rom:
+	case Region::Sram:
+		return cheats_->apply16(a, v);
+	default:
+		return v;
+	}
+}
+
+u32 GbaBus::read32(u32 addr)
+{
+	const u32 v = read32_raw(addr);
+	if (cheats_ == nullptr)
+		return v;
+	const u32 a = addr & ~3u;
+	if ((isEepromRegion(a) && eepromActive()) || (isGpioRegion(a) && gpioActive()))
+		return v;
+	switch (decode(a)) {
+	case Region::Ewram:
+	case Region::Iwram:
+	case Region::Palette:
+	case Region::Vram:
+	case Region::Oam:
+	case Region::Rom:
+	case Region::Sram:
+		return cheats_->apply32(a, v);
+	default:
+		return v;
+	}
 }
 
 void GbaBus::write8(u32 addr, u8 value)
 {
 	if (isEepromRegion(addr) && eepromActive()) {
 		eepromDmaWrite(value, 1);
+		return;
+	}
+	if (isMgbaDebug(addr)) {
+		writeMgbaDebug(addr, value);
 		return;
 	}
 	switch (decode(addr)) {
@@ -484,7 +620,10 @@ void GbaBus::write16(u32 addr, u16 value)
 // port does.
 u16 GbaBus::readSerialIdle(u32 addr) const
 {
-	noteSerialUse(addr);
+	// Idle reads are silent: a game checking whether a cable is attached
+	// reads SIOMLT/SIOCNT on every boot (Pokemon Emerald, Golden Sun), and a
+	// notice about a port we deliberately answer is just noise.
+	(void) addr;
 	return 0;
 }
 
@@ -542,7 +681,12 @@ bool GbaBus::dispatchIo16(u32 addr, u16 value)
 	// io shadow is the point - a game that polls its own status word must
 	// not see its own values come back.
 	if (addr >= 0x04000120u && addr < 0x0400012Cu) {
-		noteSerialUse(addr);
+		// Only an actual transfer is worth reporting: games probe the port
+		// (read SIOMULTI0, write SIOCNT with SI mode) to see whether a cable
+		// is attached, which is normal and answered by the idle reads above.
+		// SIOCNT bit 7 starts a shift, bit 2 selects SI (link) mode.
+		if (addr == 0x04000128u && (value & 0x80u) != 0 && (value & 0x04u) != 0)
+			noteSerialUse(addr);
 		return true;
 	}
 	// Video memory 16-bit writes are native (byte semantics differ:
@@ -572,27 +716,29 @@ bool GbaBus::dispatchIo16(u32 addr, u16 value)
 
 void GbaBus::write32(u32 addr, u32 value)
 {
-	// 32-bit accesses ignore A1-0 (GBATEK "Memory Alignments"); the CPU
-	// layer rounds the address down before calling, and DMA does the same.
-	addr &= ~3u;
 	// SRAM sits on an 8-bit bus: a 32-bit write must update exactly ONE
 	// byte, taking the LSB of `value ROR (addr*8)` (GBATEK "Accessing SRAM
 	// Area by 16bit/32bit"). Splitting into two write16() calls would write
 	// a second byte at addr+2 - corrupting a neighbouring save location and
-	// sending Flash a phantom command byte.
+	// sending Flash a phantom command byte. This branch needs the raw
+	// address, so the alignment below only applies past it.
 	if (decode(addr) == Region::Sram && cartridge_ != nullptr) {
 		const u32 rot = (addr & 3u) * 8u;
 		const u32 src = (rot == 0) ? value : ((value >> rot) | (value << (32u - rot)));
 		cartridge_->writeSave(sramOffset(addr), static_cast<u8>(src & 0xFFu));
 		return;
 	}
+	// 32-bit accesses ignore A1-0 (GBATEK "Memory Alignments"); the CPU
+	// layer passes the address through and DMA aligns the same way.
+	addr &= ~3u;
 	write16(addr, static_cast<u16>(value & 0xFFFF));
 	write16(addr + 2, static_cast<u16>(value >> 16));
 }
 
 // ---- WAITCNT decoders (GBATEK "System Control") ----
 // Reset default WAITCNT = 0x0000: SRAM 4, WS0 N=4/S=2, WS1 N=4/S=4,
-// WS2 N=4/S=8, prefetch off (prefetch not modeled yet — Phase 5+).
+// WS2 N=4/S=8, prefetch off (GbaBus::fetchCycles models the 16-byte buffer
+// when bit 14 is set; a full mGBA-style overlap model wants per-cycle CPU).
 
 unsigned GbaBus::romWaitN(unsigned slot) const
 {
@@ -621,7 +767,23 @@ unsigned GbaBus::sramWait() const
 	return kTable[waitcnt_ & 3];
 }
 
-u32 GbaBus::accessCycles(u32 addr, unsigned width_bytes, bool sequential) const
+u32 GbaBus::accessCycles(u32 addr, unsigned width_bytes, bool sequential)
+{
+	const unsigned cost = accessCyclesUnticked(addr, width_bytes, sequential);
+	tickClock(cost);
+	return cost;
+}
+
+void GbaBus::tickClock(unsigned cost)
+{
+	// Mid-instruction event delivery: whoever drives execution opted in,
+	// and the scheduler fires everything due up to the new clock.
+	if (!tick_clock_ || scheduler_ == nullptr || cost == 0)
+		return;
+	scheduler_->step(scheduler_->now() + cost);
+}
+
+u32 GbaBus::accessCyclesUnticked(u32 addr, unsigned width_bytes, bool sequential) const
 {
 	if (width_bytes != 1 && width_bytes != 2 && width_bytes != 4)
 		return 1;
@@ -637,25 +799,58 @@ u32 GbaBus::accessCycles(u32 addr, unsigned width_bytes, bool sequential) const
 		// 16-bit video bus: 8/16-bit cost one, 32-bit costs two.
 		return width_bytes == 4 ? 2 : 1;
 	case Region::Ewram:
-		// 16-bit bus, 2 waitstates (WAITCNT 4000800h default 0Dh):
-		// 8/16-bit cost two cycles, 32-bit costs four (GBATEK).
-		return width_bytes == 4 ? 4 : 2;
+		// 16-bit bus, 2 waitstates: each half costs 2 waits + 1 base cycle,
+		// so 8/16-bit cost three cycles and 32-bit costs six (GBATEK
+		// "Address Bus Width and CPU Read/Write Access Widths", mGBA's
+		// GBA_WAITSTATES regions).
+		return width_bytes == 4 ? 6 : 3;
 	case Region::Rom: {
-		// 16-bit bus with N/S waitstates; 32-bit splits N+S.
-		// Slots are 32 MB each: WS0 08-09, WS1 0A-0B, WS2 0C-0D.
+		// 16-bit bus with N/S waitstates; a 32-bit access splits into two
+		// halves. GBATEK's waitstate table lists ROM as "5/2" at the default
+		// WS0 (N=4, S=2): the *nonsequential* half pays N waits plus the
+		// access cycle, the sequential one pays S alone - adding a base cycle
+		// to both (as EWRAM's fixed 3/6 does) costs every instruction two
+		// extra cycles and desynchronises timing-sensitive games (Pokemon
+		// Emerald's VCOUNT waits). Slots are 32 MB each: WS0 08-09, WS1
+		// 0A-0B, WS2 0C-0D.
 		const unsigned slot = (addr >> 25) & 3; // 0 WS0, 1 WS1, 2 WS2.
-		const unsigned first = sequential ? romWaitS(slot) : romWaitN(slot);
+		const unsigned n = romWaitN(slot) + 1;
+		const unsigned s = romWaitS(slot);
+		const unsigned first = sequential ? s : n;
 		if (width_bytes == 4)
-			return first + romWaitS(slot);
+			return first + s;
 		return first;
 	}
 	case Region::Sram:
-		// 8-bit bus: one SRAM wait per byte transferred.
-		return sramWait() * width_bytes;
+		// 8-bit bus: every access moves a single byte (16/32-bit accesses
+		// replicate it, GBATEK "Accessing SRAM Area"), each costing the SRAM
+		// waits + 1 base cycle; 32-bit doubles that (mGBA 2*waits+1 waits).
+		if (width_bytes == 4)
+			return 2 * sramWait() + 2;
+		return sramWait() + 1;
 	case Region::Open:
 		return 1;
 	}
 	return 1;
+}
+
+u32 GbaBus::fetchCycles(u32 addr, unsigned width_bytes, bool sequential)
+{
+	if (!prefetchEnabled() || decode(addr) != Region::Rom || isEepromRegion(addr) ||
+		isGpioRegion(addr)) {
+		return accessCycles(addr, width_bytes, sequential);
+	}
+	// Buffer hit: the bytes are already here from an earlier fetch, so even
+	// a branch target costs the sequential rate. Either way the buffer now
+	// covers this fetch's 16-byte block (sequential streams stay hot; a
+	// distant branch refills).
+	if (prefetch_valid_ && addr >= prefetch_base_ && addr < prefetch_base_ + 16) {
+		prefetch_base_ = addr & ~15u;
+		return accessCycles(addr, width_bytes, true);
+	}
+	prefetch_valid_ = true;
+	prefetch_base_ = addr & ~15u;
+	return accessCycles(addr, width_bytes, sequential);
 }
 
 void GbaBus::save(StateBuffer &out) const
@@ -666,6 +861,11 @@ void GbaBus::save(StateBuffer &out) const
 	out.writeBytes(bios_.data(), bios_.size());
 	out.write(bios_active_);
 	out.write(waitcnt_);
+	out.write(prefetch_valid_);
+	out.write(prefetch_base_);
+	out.write(mgba_debug_on_);
+	out.writeBytes(mgba_dbg_.data(), mgba_dbg_.size());
+	out.write(mgba_flags_);
 }
 
 void GbaBus::load(const StateBuffer &in)
@@ -676,6 +876,18 @@ void GbaBus::load(const StateBuffer &in)
 	in.readBytes(bios_.data(), bios_.size());
 	in.read(bios_active_);
 	in.read(waitcnt_);
+	// New fields: absent in older states, which resume with a cold buffer
+	// and a disabled debug channel.
+	if (!in.read(prefetch_valid_))
+		prefetch_valid_ = false;
+	if (!in.read(prefetch_base_))
+		prefetch_base_ = 0;
+	if (!in.read(mgba_debug_on_))
+		mgba_debug_on_ = false;
+	if (!in.readBytes(mgba_dbg_.data(), mgba_dbg_.size()))
+		mgba_dbg_.fill(0);
+	if (!in.read(mgba_flags_))
+		mgba_flags_ = 0;
 }
 
 } // namespace gba

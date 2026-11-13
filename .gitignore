@@ -1,5 +1,6 @@
 # === Build ===
 build/
+build-*/
 bin/
 out/
 dist/
@@ -41,6 +42,17 @@ dump*.txt
 *.log
 *.wav
 *.pcap
+# Savestate slots + auto/menu thumbnails (generated beside the ROM)
+*.gb4s0
+*.gb4s1
+*.gb4s2
+*.gb4s3
+*.gb4s4
+*.gb4s5
+*.gb4s6
+*.gb4s7
+*.thumb.ppm
+*.gb4s?.ppm
 
 # ROMs - uncomment to ignore copyrighted dumps (currently tracked for dev)
 *.gb

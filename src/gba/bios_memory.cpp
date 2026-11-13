@@ -3,6 +3,7 @@
 // WAITCNT timing accrues naturally. BIOS-area sources are refused (GBATEK).
 
 #include "gba/bios.h"
+
 #include "gba/bus.h"
 #include "gba/cpu.h"
 

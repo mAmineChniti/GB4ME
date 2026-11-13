@@ -3,6 +3,7 @@
 #include "gba/dma.h"
 #include "gba/bus.h"
 #include "gba/irq.h"
+#include "gba/scheduler.h"
 #include <cstdio>
 #include <cstdlib>
 
@@ -19,6 +20,11 @@ void GbaDma::reset()
 	for (auto &ch : channels_)
 		ch = Channel{};
 	pending_cycles_ = 0;
+	for (unsigned i = 0; i < kChannels; i++) {
+		pending_[i] = false;
+		deadline_[i] = 0;
+		gen_[i] = 0;
+	}
 }
 
 u32 GbaDma::maskAddr(unsigned ch, u32 addr, bool dest)
@@ -47,11 +53,17 @@ void GbaDma::latch(unsigned ch)
 	c.armed = true;
 }
 
-u16 GbaDma::read(u32 addr) const
+u16 GbaDma::read(u32 addr)
 {
 	const unsigned ch = (addr - kIoBase) / 12;
 	if (ch >= kChannels)
 		return 0xFFFF;
+	// Same reasoning as write(): the CPU only reaches a register once the
+	// block is over, so a completion still in flight has to settle first.
+	// Pokemon Emerald polls CNT_H right after its init DMA and expects
+	// Enable to read back CLEARED (hardware clears it on completion).
+	if (pending_[ch])
+		onCompletion(ch, gen_[ch]);
 	const Channel &c = channels_[ch];
 	switch ((addr - kIoBase) % 12) {
 	case 0:
@@ -77,6 +89,16 @@ void GbaDma::write(u32 addr, u16 value)
 	if (ch >= kChannels)
 		return;
 	Channel &c = channels_[ch];
+	// A DMA transfer occupies the bus for its whole block, so the CPU cannot
+	// touch the channel until the block is over: settle a completion that is
+	// still in flight before applying the write. Without this the visible
+	// channel state lags hardware - Golden Sun reprograms DMA3 immediately
+	// after a transfer, and because Enable was still set (the deferred
+	// completion had not cleared it yet) the new block was dropped, leaving
+	// its 5 KiB IWRAM payload zeroed and the CPU sliding through 0x00000000
+	// as if it were code.
+	if (pending_[ch])
+		onCompletion(ch, gen_[ch]);
 	switch ((addr - kIoBase) % 12) {
 	case 0:
 		c.sad = (c.sad & 0xFFFF0000u) | value;
@@ -101,6 +123,7 @@ void GbaDma::write(u32 addr, u16 value)
 		const bool now = (c.control & kEnable) != 0;
 		if (!now) {
 			c.armed = false; // Manual stop (only meaningful pre-fire).
+			cancelPending(ch);
 			return;
 		}
 		if (!was) {
@@ -121,6 +144,13 @@ void GbaDma::transfer(unsigned ch, bool fifo)
 	Channel &c = channels_[ch];
 	if (bus_ == nullptr || !c.armed)
 		return;
+	// No pending-completion guard: a channel re-armed before its completion
+	// fired transfers again (that is what hardware does), and the completion
+	// of a superseded transfer is voided by the generation counter.
+	if (pending_[ch]) {
+		pending_[ch] = false;
+		++gen_[ch];
+	}
 #ifndef GB4ME_RELEASE
 	if (const char *env = std::getenv("GB4ME_GBA_DMA_TRACE")) {
 		(void) env;
@@ -134,6 +164,7 @@ void GbaDma::transfer(unsigned ch, bool fifo)
 	const unsigned src_ctl = (c.control & kSrcMask) >> 7;
 	u32 units = fifo ? 4 : c.remaining;
 	bool seq = false;
+	const u64 cycle_base = pending_cycles_;
 	// EEPROM serial port (0x0D000000, DMA3): one halfword per bit, bit 0
 	// significant (GBATEK "Using DMA"). SRAM transfers run through the
 	// bus like any other region (slow 8-bit timing via accessCycles).
@@ -218,6 +249,19 @@ void GbaDma::transfer(unsigned ch, bool fifo)
 	// for non-repeat channels after the 4-word block; repeat channels
 	// stay armed — remaining/dst-reload in finish() are no-ops on the
 	// FIFO path since it ignores remaining and sound DMA uses fixed dst).
+	//
+	// A transfer owns the bus for its whole block, so the time is charged to
+	// the clock HERE - at the end of the instruction that started it - and the
+	// completion side effects follow immediately. Deferring them to a
+	// scheduler event instead leaves the CPU running through cycles the
+	// hardware spends stalled: the PPU/timers advance, but the game keeps
+	// executing and writing video state the DMA was supposed to overwrite
+	// (Pokemon Emerald's opening DMA3 loses its 5 KiB IWRAM payload that
+	// way). Charging the block here also means the completion IRQ lands at
+	// the same emulated instant it did when it ran inline.
+	const u64 latency = pending_cycles_ - cycle_base;
+	if (scheduler_ != nullptr && latency != 0)
+		scheduler_->step(scheduler_->now() + latency);
 	finish(ch);
 }
 
@@ -243,6 +287,42 @@ void GbaDma::finish(unsigned ch)
 	}
 }
 
+void GbaDma::scheduleCompletion(unsigned ch, u64 latency)
+{
+	pending_[ch] = true;
+	const u32 gen = ++gen_[ch];
+	deadline_[ch] = scheduler_->now() + latency;
+	scheduler_->schedule(latency, [this, ch, gen] { onCompletion(ch, gen); });
+}
+
+void GbaDma::onCompletion(unsigned ch, u32 gen)
+{
+	if (gen != gen_[ch])
+		return; // Stopped or reprogrammed under this event.
+	pending_[ch] = false;
+	finish(ch);
+}
+
+void GbaDma::cancelPending(unsigned ch)
+{
+	// Bump the generation so a scheduled completion becomes a no-op.
+	++gen_[ch];
+	pending_[ch] = false;
+}
+
+void GbaDma::rearmEvents()
+{
+	if (scheduler_ == nullptr)
+		return;
+	for (unsigned ch = 0; ch < kChannels; ch++) {
+		if (!pending_[ch])
+			continue;
+		const u64 now = scheduler_->now();
+		const u64 delay = deadline_[ch] > now ? deadline_[ch] - now : 0;
+		const u32 gen = gen_[ch];
+		scheduler_->schedule(delay, [this, ch, gen] { onCompletion(ch, gen); });
+	}
+}
 void GbaDma::trigger(Timing t)
 {
 	for (unsigned ch = 0; ch < kChannels; ch++) {
@@ -289,6 +369,9 @@ void GbaDma::save(StateBuffer &out) const
 		out.write(c.dst);
 		out.write(c.remaining);
 		out.write(c.armed);
+		out.write(pending_[i]);
+		out.write(deadline_[i]);
+		out.write(gen_[i]);
 	}
 	out.write(pending_cycles_);
 }
@@ -305,6 +388,12 @@ void GbaDma::load(const StateBuffer &in)
 		in.read(c.dst);
 		in.read(c.remaining);
 		in.read(c.armed);
+		if (!in.read(pending_[i]))
+			pending_[i] = false;
+		if (!in.read(deadline_[i]))
+			deadline_[i] = 0;
+		if (!in.read(gen_[i]))
+			gen_[i] = 0;
 	}
 	in.read(pending_cycles_);
 }

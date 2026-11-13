@@ -5,6 +5,7 @@
 #include "gba/bios.h"
 #include "gba/bus.h"
 #include "gba/cartridge.h"
+#include "gba/cheats.h"
 #include "gba/cpu.h"
 #include "gba/dma.h"
 #include "gba/irq.h"
@@ -33,6 +34,18 @@ class GameBoyAdvance
 	void reset();
 	bool saveState(const std::string &path) const;
 	bool loadState(const std::string &path);
+	// In-memory snapshot for the rewind ring (same bytes as the file shell,
+	// no disk I/O so it can run every N frames).
+	bool saveMemory(std::vector<u8> &out) const;
+	bool loadMemory(const std::vector<u8> &data);
+	Cheats &cheats()
+	{
+		return cheats_;
+	}
+	const Cheats &cheats() const
+	{
+		return cheats_;
+	}
 	void setRomPath(const std::string &path)
 	{
 		rom_path_ = path;
@@ -114,6 +127,11 @@ class GameBoyAdvance
 	}
 
   private:
+	// Parse into the live components without rollback. loadMemory() keeps a
+	// snapshot so a corrupt state cannot leave half the machine restored.
+	bool loadMemoryInPlace(const std::vector<u8> &data);
+	// Re-arm scheduler-backed producers after a successful state restore.
+	void rearmAfterLoad();
 	Cartridge cartridge_;
 	GbaBus bus_;
 	GbaScheduler scheduler_;
@@ -125,6 +143,7 @@ class GameBoyAdvance
 	GbaPpu ppu_;
 	GbaKeypad keypad_;
 	GbaAudio audio_;
+	Cheats cheats_;
 	bool loaded_ = false;
 	std::array<u64, 0x2B> swi_histogram_{};
 	std::string rom_path_;

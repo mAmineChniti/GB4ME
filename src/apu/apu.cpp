@@ -28,7 +28,18 @@ constexpr u32 kOneTcycleFx = 1u << 16;
 constexpr float kMixScale = 68.0f;
 // Cycles before a wave RAM fetch in which the bus is owned by the DAC and
 // CPU wave RAM accesses conflict (mGBA src/gb/io.c: 4 cycles).
-constexpr u32 kWaveBusCycles = 4;
+// Width of the wave-RAM bus-conflict window, in T-cycles. The DAC fetches one
+// byte on a 16-bit bus, so the fetch owns the bus for two cycles; Blargg's
+// dmg_sound 09/10/12 sweep the read phase across the sample period and expect
+// open bus everywhere except the fetch itself.
+// Width of the conflict window in T-cycles, measured back from the fetch.
+// mGBA blanks accesses in the last few cycles before the next sample.
+// SameBoy models the DMG wave-RAM bus window as a *single* cycle
+// (`wave_form_just_read`: set when the APU update ended exactly on a sample
+// fetch, cleared if it ended anywhere else), not as a window around the fetch.
+// A four-cycle window makes every access in a period succeed; hardware lets
+// through one, which is what Blargg dmg_sound 09/10/12 measure with their CRC
+// over the printed bytes.
 
 constexpr u8 kWaveShifts[4] = {4, 0, 1, 2}; // NR32 volume code -> shift.
 constexpr u8 kDutyTable[4][8] = {
@@ -154,6 +165,7 @@ void APU::step(u32 mcycles)
 	// GBC: T-cycle rate scales with double_speed; M-cycle counts unchanged.
 	const u32 tcycles = mcycles * 4;
 	for (u32 i = 0; i < tcycles; i++) {
+		const bool last_cycle = i + 1 == tcycles;
 		// Frame sequencer.
 		if (++frame_clock_ >= kFrameStepTcycles) {
 			frame_clock_ = 0;
@@ -168,7 +180,11 @@ void APU::step(u32 mcycles)
 			ch2_.freq_timer = (2048 - ch2_.freq) * 4;
 			ch2_.duty_pos = (ch2_.duty_pos + 1) & 7;
 		}
-		if (ch3_.enabled && --ch3_.freq_timer == 0) {
+		const bool wave_fetched = ch3_.enabled && --ch3_.freq_timer == 0;
+		// The wave RAM only answers on the cycle the DAC actually fetched, so
+		// the flag survives exactly when the step ended on that fetch.
+		wave_just_read_ = wave_fetched && last_cycle;
+		if (wave_fetched) {
 			ch3_.freq_timer = (2048 - ch3_.freq) * 2;
 			ch3_.pos = (ch3_.pos + 1) & 31;
 			const u8 byte = ch3_.ram[ch3_.pos / 2];
@@ -223,28 +239,37 @@ void APU::disable_channel(unsigned index)
 
 void APU::clock_length()
 {
+	// Only a channel with its DAC on is clocked. That is invisible in normal
+	// play (a channel with the DAC off is silent anyway) but it is what makes
+	// a power cycle non-destructive: the counters survive with their DACs
+	// cleared, so they sit frozen until the game turns a DAC back on and
+	// retriggers. Blargg dmg_sound 08 measures exactly this - after 250ms
+	// powered off it still reads back the four lengths it loaded before the
+	// cycle (17/34/68/51). It is consistent with dmg_sound 02 #11, "Disabled
+	// channel should still clock length", where the channel is off but its DAC
+	// is still on.
 	// A length expiry is a DAC power-down: fade, do not step (see
 	// kFadeMixSamples). The channel's own level is sampled first so the
 	// fade starts from whatever it was emitting.
-	if (ch1_.length_enabled && ch1_.length_timer > 0) {
+	if (ch1_.dac && ch1_.length_enabled && ch1_.length_timer > 0) {
 		if (--ch1_.length_timer == 0) {
 			disable_channel(0);
 			ch1_.enabled = false;
 		}
 	}
-	if (ch2_.length_enabled && ch2_.length_timer > 0) {
+	if (ch2_.dac && ch2_.length_enabled && ch2_.length_timer > 0) {
 		if (--ch2_.length_timer == 0) {
 			disable_channel(1);
 			ch2_.enabled = false;
 		}
 	}
-	if (ch3_.length_enabled && ch3_.length_timer > 0) {
+	if (ch3_.dac && ch3_.length_enabled && ch3_.length_timer > 0) {
 		if (--ch3_.length_timer == 0) {
 			disable_channel(2);
 			ch3_.enabled = false;
 		}
 	}
-	if (ch4_.length_enabled && ch4_.length_timer > 0) {
+	if (ch4_.dac && ch4_.length_enabled && ch4_.length_timer > 0) {
 		if (--ch4_.length_timer == 0) {
 			disable_channel(3);
 			ch4_.enabled = false;
@@ -366,7 +391,13 @@ void APU::trigger_wave()
 	if (ch3_.length_timer == 0) {
 		ch3_.length_timer = (ch3_.length_enabled && (frame_step_ % 2 == 0)) ? 255 : 256;
 	}
-	ch3_.freq_timer = (2048 - ch3_.freq) * 2;
+	// SameBoy reloads the sample countdown on trigger with a +3 offset
+	// (Core/apu.c: `sample_countdown = (sample_length ^ 0x7FF) + 3`) and counts
+	// the wave channel in units of 2 T, so its trigger period is 4 T longer than
+	// a bare `(2048 - n) * 2`. Those 4 T decide whether the first DAC fetch lands
+	// just before or just after the ROM's `$FF30` access - the difference between
+	// `dmg_sound` 09 reading one wave byte ahead and matching the hardware.
+	ch3_.freq_timer = (2048 - ch3_.freq) * 2 + 4;
 	ch3_.pos = 0;
 	// NOTE: the output buffer is intentionally NOT refreshed; the previously
 	// latched nibble keeps playing until the first tick reads sample 1.
@@ -449,50 +480,58 @@ void APU::power_off_channels()
 
 void APU::power_on_channels()
 {
-	// Power-on restores the post-boot register defaults (a power cycle is
-	// not a cold boot), resets the frame sequencer phase, and reinstates
-	// the length counters saved at power-off.
+	// A power cycle is not a cold boot: the registers stay CLEARED (Blargg
+	// dmg_sound 01-registers #5 fills every register with $FF, powers the APU
+	// off and on again, and expects every one to read back cleared, and 11
+	// "regs after power" expects NR12/NR14 to read 0). Restoring the
+	// post-boot defaults here ($BF/$F3/$77/$F3) is what made both fail.
 	ch1_ = Pulse{};
 	ch2_ = Pulse{};
 	ch3_ = Wave{};
 	ch4_ = Noise{};
-	nr10_ = 0x00;
-	nr11_ = 0xBF;
-	nr12_ = 0xF3;
-	nr14_ = 0x40;
-	nr21_ = 0x00;
-	nr22_ = 0x00;
-	nr24_ = 0x40;
-	nr30_ = 0x00;
-	nr31_ = 0xFF;
-	nr32_ = 0x00;
-	nr34_ = 0x40;
-	nr41_ = 0xFF;
-	nr42_ = 0x00;
-	nr43_ = 0x00;
-	nr44_ = 0x40;
-	nr50_ = 0x77;
-	nr51_ = 0xF3;
-	ch1_.duty = nr11_ >> 6;
-	ch1_.length_timer = length_shadow_[0];
-	ch1_.length_enabled = true;
-	ch1_.dac = (nr12_ & 0xF8) != 0;
-	ch1_.env_initial = nr12_ >> 4;
-	ch1_.env_period = nr12_ & 7;
-	ch2_.duty = nr21_ >> 6;
-	ch2_.length_timer = length_shadow_[1];
-	ch2_.length_enabled = true;
-	ch2_.dac = (nr22_ & 0xF8) != 0;
-	ch3_.length_timer = length_shadow_[2];
-	ch3_.length_enabled = true;
-	ch3_.dac = (nr30_ & 0x80) != 0;
-	ch3_.volume_code = (nr32_ >> 5) & 3;
-	ch4_.length_timer = length_shadow_[3];
-	ch4_.length_enabled = true;
-	ch4_.dac = (nr42_ & 0xF8) != 0;
-	frame_step_ = 0;
-	frame_clock_ = 0;
-	ch3_.out_buffer = 0;
+	// Powering on resets the frame sequencer, divider included, so the first
+	// step lands one full step period after the power-on (GBATEK "APU": the
+	// sequencer restarts on power-up). Neutral against the current ROM set -
+	// dmg_sound 08/11 pass either way - but it is what the hardware does, and
+	// 07 "len sweep period sync" #5/#6 measure exactly this phase.
+	// ...but only on the DMG. The CGB leaves the sequencer running across the
+	// cycle, and that is observable: a trigger on a zero length counter reloads
+	// 63 or 64 depending on whether the next step clocks length (GBATEK
+	// "Obscure behavior"), so the sequencer's phase decides it. cgb_sound 08
+	// prints `40 00 40 40` on the CGB and only gets that with the phase kept -
+	// resetting it gives 63 and a CRC of $D92C0407 instead of $3CF589B4.
+	if (!is_cgb_mode(hardware_mode_)) {
+		frame_step_ = 0;
+		frame_clock_ = 0;
+	}
+	// The four length counters survive the cycle on the DMG (see
+	// power_off_channels) - but *not* on the CGB, where powering up resets
+	// them (Blargg cgb_sound 08's own header: "On CGB, length counters are
+	// reset when powered up. On DMG, they are unaffected, and not clocked").
+	// The same split is why the wave channel's length reads 0 there.
+	if (is_cgb_mode(hardware_mode_)) {
+		ch1_.length_timer = 0;
+		ch2_.length_timer = 0;
+		ch3_.length_timer = 0;
+		ch4_.length_timer = 0;
+	} else {
+		ch1_.length_timer = length_shadow_[0];
+		ch2_.length_timer = length_shadow_[1];
+		ch3_.length_timer = length_shadow_[2];
+		ch4_.length_timer = length_shadow_[3];
+	}
+	// ...and so do their enable flags, so the next trigger sees no enable edge
+	// (and therefore no "enabling clocks it once" quirk). What stops them from
+	// counting down is the DAC: a power cycle clears it, and clock_length only
+	// clocks a channel whose DAC is on (see there). Blargg dmg_sound 08 pins
+	// this down: after a 250ms power-off it reads the four counters back ~34
+	// length periods later and they are still exactly the loaded lengths
+	// (51/68/17/34 for its NR41=$CD/NR31=$BC/NR11=$EF/NR21=$DE setup).
+	ch1_.length_enabled = length_shadow_[0] != 0;
+	ch2_.length_enabled = length_shadow_[1] != 0;
+	ch3_.length_enabled = length_shadow_[2] != 0;
+	ch4_.length_enabled = length_shadow_[3] != 0;
+	power_ = true;
 }
 
 void APU::generate_sample()
@@ -539,7 +578,14 @@ void APU::generate_sample()
 		sample_buffer_.push_back(out_l);
 		sample_buffer_.push_back(out_r);
 		++frames_emitted_;
-		if (sample_buffer_.size() >= kSampleRate / 10 * 2)
+		// Hand the device audio about one video frame at a time. This used to
+		// batch 100 ms (kSampleRate/10), which is not a throughput problem -
+		// it is a latency one: the device got one big chunk ten times a
+		// second, so it underran in between (audible crackle) and, because
+		// video is paced off the audio queue, the picture stuttered with it.
+		// The GBA path already used a frame here (src/gba/audio.cpp); this
+		// brings the GB path in line with it.
+		if (sample_buffer_.size() >= kSampleRate / 60 * 2)
 			flush_samples();
 	}
 }
@@ -634,17 +680,61 @@ void APU::write_reg(u16 addr, u8 value)
 		write_wave_ram(addr, value);
 		return;
 	}
-	// Length timers stay writable while powered off (Pan Docs "NR52").
+	// Power gates most writes while off (Pan Docs "NR52"), with two
+	// documented exceptions Blargg's dmg_sound pins down:
+	//  * the four length registers keep loading their counters (dmg_sound 02
+	//    "len ctr"), and
+	//  * the noise channel's own registers NR41-NR44 are NOT ignored - it is
+	//    the one channel that keeps running across a power cycle on DMG, so a
+	//    write there still triggers it and NR52 bit 3 still reports it
+	//    (dmg_sound 11 "regs after power" #4).
+	// The counters live in `length_shadow_` across a power cycle, so a length
+	// written while off has to land there too - otherwise the power-on restore
+	// would resurrect the value from *before* the write (dmg_sound 11 writes
+	// NR41 while powered off and expects it to survive the cycle).
 	if (!power_ && addr != 0xFF26) {
-		if (addr == 0xFF11)
-			ch1_.length_timer = 64 - (value & 0x3F);
-		if (addr == 0xFF16)
-			ch2_.length_timer = 64 - (value & 0x3F);
-		if (addr == 0xFF1B)
-			ch3_.length_timer = 256 - value;
-		if (addr == 0xFF20)
-			ch4_.length_timer = 64 - (value & 0x3F);
-		return;
+		switch (addr) {
+		case 0xFF11:
+			ch1_.length_timer = length_shadow_[0] = 64 - (value & 0x3F);
+			return;
+		case 0xFF16:
+			ch2_.length_timer = length_shadow_[1] = 64 - (value & 0x3F);
+			return;
+		case 0xFF1B:
+			ch3_.length_timer = length_shadow_[2] = 256 - value;
+			return;
+		case 0xFF20:
+			ch4_.length_timer = length_shadow_[3] = 64 - (value & 0x3F);
+			return;
+		// NR42-NR44 drive the channel but leave the register shadows alone:
+		// 11 "regs after power" #4 needs the trigger to work, while
+		// 01-registers #6 needs the registers to still read cleared after the
+		// same writes.
+		case 0xFF21:
+			ch4_.dac = (value & 0xF8) != 0;
+			ch4_.env_initial = value >> 4;
+			ch4_.env_up = (value & 0x08) != 0;
+			ch4_.env_period = value & 7;
+			if (!ch4_.dac)
+				ch4_.enabled = false;
+			return;
+		case 0xFF22:
+			ch4_.clock_shift = value >> 4;
+			ch4_.width_7bit = (value & 0x08) != 0;
+			ch4_.divisor = value & 7;
+			return;
+		case 0xFF23:
+			// No frame-sequencer quirk here: the sequencer's coupling to the
+			// enable edge is what dmg_sound 08 measures, and while the APU is
+			// off nothing may clock (its counters come back untouched - the
+			// test reads 51 for a NR41=$CD load).
+			ch4_.length_enabled = (value & 0x40) != 0;
+			if (value & 0x80)
+				trigger_noise();
+			return;
+		default:
+			return;
+		}
 	}
 	switch (addr) {
 	case 0xFF10:
@@ -790,20 +880,21 @@ void APU::write_wave_ram(u16 addr, u8 value)
 	if (addr < 0xFF30 || addr > 0xFF3F)
 		return;
 	const u8 index = static_cast<u8>(addr - 0xFF30);
-	// DMG bus conflict: while the channel is playing, the wave RAM sits
-	// behind the same bus the DAC fetches on, so a CPU access lands on the
-	// byte currently being played instead of the addressed one, and it is
-	// dropped entirely in the few cycles before a fetch (mGBA src/gb/io.c
-	// redirects to wavedata8[window >> 1] and returns $FF when the RAM is
-	// not "readable"; SameBoy Core/apu.c does the same via
+	// DMG bus conflict: while the channel is playing, the wave RAM shares
+	// the bus the DAC fetches on. A CPU access inside the fetch window lands
+	// on the byte currently being played instead of the addressed one;
+	// outside the window the RAM is unreachable and the access is dropped
+	// (mGBA src/gb/io.c redirects to wavedata8[window >> 1] and returns $FF
+	// when the RAM is not "readable"; SameBoy Core/apu.c does the same via
 	// wave_form_just_read). Stopping the channel (or the DAC) first takes
 	// the conflict-free path every real game uses.
 	// https://gbdev.io/pandocs/Audio_Registers.html#ff30ff3f--wave-pattern-ram
-	// GBC: no conflict (both banks reachable) - revisit with GBC support.
-	if (!ch3_.enabled)
+	// CGB: no conflict at all - the addressed byte is written whatever the DAC
+	// is doing (GBATEK "Wave Pattern RAM": the conflict is a DMG artefact).
+	if (!ch3_.enabled || is_cgb_mode(hardware_mode_))
 		ch3_.ram[index] = value;
-	else if (!wave_bus_busy())
-		ch3_.ram[ch3_.pos / 2] = value;
+	else if (wave_bus_busy())
+		ch3_.ram[ch3_.pos / 2] = value; // Conflicts with the fetch.
 }
 
 u8 APU::read_wave_ram(u16 addr) const
@@ -813,17 +904,233 @@ u8 APU::read_wave_ram(u16 addr) const
 	const u8 index = static_cast<u8>(addr - 0xFF30);
 	if (!ch3_.enabled)
 		return ch3_.ram[index];
+	// GBATEK "Wave Pattern RAM": on the DMG, while the channel is on the RAM
+	// shares the bus the DAC fetches on - on the fetch cycle the access lands
+	// on the byte being played, on every other cycle the RAM is unreachable
+	// (open bus on read, dropped on write; see write_wave_ram). On the CGB the
+	// conflict does not exist and the address is simply read.
 	if (wave_bus_busy())
-		return 0xFF;
-	return ch3_.ram[ch3_.pos / 2];
+		return ch3_.ram[ch3_.pos / 2];
+	if (is_cgb_mode(hardware_mode_))
+		return ch3_.ram[index];
+	return 0xFF;
 }
 
 bool APU::wave_bus_busy() const
 {
-	// A fetch is imminent (or in flight) within this window, so the bus
-	// belongs to the DAC. mGBA blanks accesses in the last 4 cycles before
-	// the next sample; SameBoy uses the "just read" cycle instead.
-	return ch3_.freq_timer <= kWaveBusCycles;
+	// The conflict is a DMG bus artefact: on the CGB the wave RAM is CPU-
+	// readable at any time while the channel plays.
+	if (is_cgb_mode(hardware_mode_))
+		return false;
+	// On the DMG the bus belongs to the DAC on the cycle it fetched, and only
+	// then: the access lands on the byte being played. Any other cycle the RAM
+	// is unreachable (open bus on read, dropped on write).
+	return ch3_.enabled && wave_just_read_;
+}
+
+namespace dsp
+{
+
+void OutputStage::save(StateBuffer &buf) const
+{
+	buf.writeArray(ring_l_);
+	buf.writeArray(ring_r_);
+	buf.write(pos_);
+	buf.write(ratio_acc_);
+	buf.write(ratio_fixed_);
+	buf.write(ratio_);
+	buf.write(dc_l_);
+	buf.write(dc_prev_l_);
+	buf.write(dc_r_);
+	buf.write(dc_prev_r_);
+	buf.write(volume_);
+}
+
+void OutputStage::load(StateBuffer &buf)
+{
+	buf.readArray(ring_l_);
+	buf.readArray(ring_r_);
+	buf.read(pos_);
+	buf.read(ratio_acc_);
+	buf.read(ratio_fixed_);
+	buf.read(ratio_);
+	buf.read(dc_l_);
+	buf.read(dc_prev_l_);
+	buf.read(dc_r_);
+	buf.read(dc_prev_r_);
+	buf.read(volume_);
+}
+
+} // namespace dsp
+
+void APU::save(StateBuffer &buf) const
+{
+	// A shared writer for the two pulse channels: they are the same struct
+	// and every field of it is audible state (duty position and the
+	// frequency/envelope/sweep timers decide the next sample).
+	const auto pulse = [&buf](const Pulse &c) {
+		buf.write(c.enabled);
+		buf.write(c.dac);
+		buf.write(c.duty);
+		buf.write(c.duty_pos);
+		buf.write(c.freq);
+		buf.write(c.freq_timer);
+		buf.write(c.length_timer);
+		buf.write(c.length_enabled);
+		buf.write(c.volume);
+		buf.write(c.env_initial);
+		buf.write(c.env_up);
+		buf.write(c.env_period);
+		buf.write(c.env_timer);
+		buf.write(c.sweep_pace);
+		buf.write(c.sweep_down);
+		buf.write(c.sweep_slope);
+		buf.write(c.sweep_timer);
+		buf.write(c.sweep_enabled);
+		buf.write(c.sweep_sub_done);
+		buf.write(c.shadow_freq);
+	};
+	pulse(ch1_);
+	pulse(ch2_);
+	buf.write(ch3_.enabled);
+	buf.write(ch3_.dac);
+	buf.write(ch3_.length_timer);
+	buf.write(ch3_.length_enabled);
+	buf.write(ch3_.volume_code);
+	buf.write(ch3_.freq);
+	buf.write(ch3_.freq_timer);
+	buf.write(ch3_.pos);
+	buf.write(ch3_.out_buffer);
+	buf.writeArray(ch3_.ram);
+	buf.write(ch4_.enabled);
+	buf.write(ch4_.dac);
+	buf.write(ch4_.length_timer);
+	buf.write(ch4_.length_enabled);
+	buf.write(ch4_.volume);
+	buf.write(ch4_.env_initial);
+	buf.write(ch4_.env_up);
+	buf.write(ch4_.env_period);
+	buf.write(ch4_.env_timer);
+	buf.write(ch4_.lfsr);
+	buf.write(ch4_.freq_timer);
+	buf.write(ch4_.clock_shift);
+	buf.write(ch4_.width_7bit);
+	buf.write(ch4_.divisor);
+	buf.writeArray(fade_left_);
+	buf.writeArray(fade_level_);
+	buf.writeArray(last_level_);
+	buf.write(nr50_);
+	buf.write(nr51_);
+	buf.write(power_);
+	buf.write(frame_step_);
+	buf.write(frame_clock_);
+	buf.write(static_cast<u8>(wave_just_read_ ? 1 : 0));
+	buf.write(mix_phase_);
+	buf.writeArray(length_shadow_);
+	buf.write(nr10_);
+	buf.write(nr11_);
+	buf.write(nr12_);
+	buf.write(nr14_);
+	buf.write(nr21_);
+	buf.write(nr22_);
+	buf.write(nr24_);
+	buf.write(nr30_);
+	buf.write(nr31_);
+	buf.write(nr32_);
+	buf.write(nr34_);
+	buf.write(nr41_);
+	buf.write(nr42_);
+	buf.write(nr43_);
+	buf.write(nr44_);
+	buf.writeVector(sample_buffer_);
+	buf.write(frames_emitted_);
+	buf.write(dropouts_);
+	output_.save(buf);
+	// stream_ is the live SDL handle and is never restored from a file.
+}
+
+void APU::load(StateBuffer &buf)
+{
+	const auto pulse = [&buf](Pulse &c) {
+		buf.read(c.enabled);
+		buf.read(c.dac);
+		buf.read(c.duty);
+		buf.read(c.duty_pos);
+		buf.read(c.freq);
+		buf.read(c.freq_timer);
+		buf.read(c.length_timer);
+		buf.read(c.length_enabled);
+		buf.read(c.volume);
+		buf.read(c.env_initial);
+		buf.read(c.env_up);
+		buf.read(c.env_period);
+		buf.read(c.env_timer);
+		buf.read(c.sweep_pace);
+		buf.read(c.sweep_down);
+		buf.read(c.sweep_slope);
+		buf.read(c.sweep_timer);
+		buf.read(c.sweep_enabled);
+		buf.read(c.sweep_sub_done);
+		buf.read(c.shadow_freq);
+	};
+	pulse(ch1_);
+	pulse(ch2_);
+	buf.read(ch3_.enabled);
+	buf.read(ch3_.dac);
+	buf.read(ch3_.length_timer);
+	buf.read(ch3_.length_enabled);
+	buf.read(ch3_.volume_code);
+	buf.read(ch3_.freq);
+	buf.read(ch3_.freq_timer);
+	buf.read(ch3_.pos);
+	buf.read(ch3_.out_buffer);
+	buf.readArray(ch3_.ram);
+	buf.read(ch4_.enabled);
+	buf.read(ch4_.dac);
+	buf.read(ch4_.length_timer);
+	buf.read(ch4_.length_enabled);
+	buf.read(ch4_.volume);
+	buf.read(ch4_.env_initial);
+	buf.read(ch4_.env_up);
+	buf.read(ch4_.env_period);
+	buf.read(ch4_.env_timer);
+	buf.read(ch4_.lfsr);
+	buf.read(ch4_.freq_timer);
+	buf.read(ch4_.clock_shift);
+	buf.read(ch4_.width_7bit);
+	buf.read(ch4_.divisor);
+	buf.readArray(fade_left_);
+	buf.readArray(fade_level_);
+	buf.readArray(last_level_);
+	buf.read(nr50_);
+	buf.read(nr51_);
+	buf.read(power_);
+	buf.read(frame_step_);
+	buf.read(frame_clock_);
+	u8 wave_flag = 0;
+	buf.read(wave_flag);
+	wave_just_read_ = wave_flag != 0;
+	buf.read(mix_phase_);
+	buf.readArray(length_shadow_);
+	buf.read(nr10_);
+	buf.read(nr11_);
+	buf.read(nr12_);
+	buf.read(nr14_);
+	buf.read(nr21_);
+	buf.read(nr22_);
+	buf.read(nr24_);
+	buf.read(nr30_);
+	buf.read(nr31_);
+	buf.read(nr32_);
+	buf.read(nr34_);
+	buf.read(nr41_);
+	buf.read(nr42_);
+	buf.read(nr43_);
+	buf.read(nr44_);
+	buf.readVector(sample_buffer_);
+	buf.read(frames_emitted_);
+	buf.read(dropouts_);
+	output_.load(buf);
 }
 
 } // namespace gb

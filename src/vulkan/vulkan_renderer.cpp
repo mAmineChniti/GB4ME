@@ -130,6 +130,7 @@ void VulkanRenderer::shutdown()
 	vkFreeMemory(device, body_image_memory, nullptr);
 	vkDestroyDescriptorPool(device, body_descriptor_pool, nullptr);
 	vkDestroyDescriptorSetLayout(device, body_descriptor_set_layout, nullptr);
+	destroy_thumbs();
 	destroy_gui_buffers();
 	destroy_font();
 	vkDestroyBuffer(device, vertex_buffer, nullptr);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "state.h"
 #include "types.h"
 #include <array>
 #include <string>
@@ -13,6 +14,7 @@ class APU;
 class Timer;
 class Joypad;
 class CPU;
+class Cheats;
 
 // Bus: the ONLY path between components and memory.
 // https://gbdev.io/pandocs/Memory_Map.html
@@ -29,6 +31,12 @@ class MMU
 	MMU &operator=(const MMU &) = delete;
 
 	void reset();
+	// The CPU is notified about OAM DMA stalls; optional (tests that only poke
+	// registers can leave it unset).
+	void set_cpu(CPU *c)
+	{
+		cpu_ = c;
+	}
 	void set_cartridge(Cartridge *cart)
 	{
 		cartridge_ = cart;
@@ -50,6 +58,10 @@ class MMU
 	{
 		joypad_ = joypad;
 	}
+	void set_cheats(Cheats *c)
+	{
+		cheats_ = c;
+	}
 
 	u8 read(u16 addr);
 	void write(u16 addr, u8 value);
@@ -60,13 +72,21 @@ class MMU
 	{
 		return 0xE0 | if_register_;
 	}
+	// IF is written like an ordinary register (SameBoy
+	// `gb->io_registers[GB_IO_IF] = value`, grouped with SCX/SCY/BGP in
+	// Core/memory.c), NOT "write 1 to clear" as Pan Docs' prose suggests.
+	// Blargg halt_bug settles it: the ROM's expected CRC only matches when a
+	// write assigns, because it writes IF=$10 to *set* the joypad flag and
+	// reads it back before halting. See agents.md.
 	void write_if(u8 value)
 	{
 		if_register_ = value & 0x1F;
 	}
 	u8 read_ie() const
 	{
-		return ie_register_;
+		// The upper three bits are unused and read back as 1 (Pan Docs
+		// "Interrupts": IE is $FFFF, bits 7-5 not used).
+		return 0xE0 | ie_register_;
 	}
 	void write_ie(u8 value)
 	{
@@ -81,6 +101,20 @@ class MMU
 	// https://gbdev.io/pandocs/Serial_Data_Transfer_Link_Cable.html
 	u8 serial_sb = 0;
 	u8 serial_sc = 0;
+	// A transfer is *clocked by the divider*, not instant: the internal clock
+	// bit (7, or bit 2 in CGB fast mode) toggles every 128 (or 4) divider
+	// ticks and each full period shifts one bit, so 8 bits take 8192 T-cycles
+	// (fast: 128). Modelled like SameBoy's serial_master_clock/serial_count
+	// (Core/timing.c GB_serial_master_edge), driven from Timer::step via
+	// serial_clock_edge().
+	void serial_clock_edge();
+	u8 serial_count_ = 0; // Bits shifted so far (8 = done).
+	bool serial_master_clock_ = false;
+	u16 serial_mask_ = 0x80; // Divider bit that clocks the transfer.
+	u16 serial_mask() const
+	{
+		return serial_mask_;
+	}
 	// Bytes shifted out while SC has the transfer-clock bit set. Blargg
 	// test ROMs print "Passed"/"Failed" here; the headless runner dumps it.
 	std::string serial_log;
@@ -112,6 +146,12 @@ class MMU
 	u8 read_key1() const;
 	void write_key1(u8 v);
 
+	// DMG OAM corruption hook for the CPU's *internal* 16-bit bus writes
+	// (INC/DEC rp, PUSH, POP, CALL, RST, JR, LD SP,HL, LD A,(HL+/-)), which
+	// the OAM block swallows exactly like an explicit write would - see
+	// PPU::trigger_oam_bug. A no-op on the CGB, which has no such bug.
+	void trigger_oam_bug(u16 addr);
+
 	// HDMA
 	void step_hdma(u32 cycles); // called from update loop
 	bool hdma_active() const
@@ -120,8 +160,18 @@ class MMU
 	}
 	void hdma_step_hblank();
 
+	// Savestate. WRAM/HRAM ride along (a reload has to bring back whatever
+	// the game had computed), as do the HDMA registers - a half-finished
+	// transfer is mid-instruction state, not a setting. `serial_log` is
+	// deliberately NOT saved: it is the headless Blargg runner's output
+	// buffer, and a reloaded state should not replay old test output.
+	void save(StateBuffer &buf) const;
+	void load(StateBuffer &buf);
+
   private:
+	Cheats *cheats_ = nullptr;
 	Cartridge *cartridge_ = nullptr;
+	CPU *cpu_ = nullptr;
 	PPU *ppu_ = nullptr;
 	APU *apu_ = nullptr;
 	Timer *timer_ = nullptr;

@@ -14,6 +14,48 @@ namespace gb
 {
 using namespace vulkan_detail;
 
+u32 VulkanRenderer::ghostBlend(u32 prev, u32 curr, f32 amt)
+{
+	if (amt <= 0.0f)
+		return curr;
+	if (amt >= 1.0f)
+		return (prev & 0x00FFFFFFu) | 0xFF000000u;
+	const f32 b = amt, a = 1.0f - amt;
+	const auto ch = [&](u32 v, unsigned shift) { return static_cast<f32>((v >> shift) & 0xFFu); };
+	const u32 r = static_cast<u32>(ch(prev, 16) * b + ch(curr, 16) * a + 0.5f);
+	const u32 g = static_cast<u32>(ch(prev, 8) * b + ch(curr, 8) * a + 0.5f);
+	const u32 bl = static_cast<u32>(ch(prev, 0) * b + ch(curr, 0) * a + 0.5f);
+	return 0xFF000000u | (r << 16) | (g << 8) | bl;
+}
+
+void VulkanRenderer::upload_frame(void *dst, const u32 *src)
+{
+	const size_t count = static_cast<size_t>(tex_w_) * tex_h_;
+	if (ghosting_ <= 0.0f || count == 0) {
+		std::memcpy(dst, src, count * sizeof(u32));
+		// Keep the history warm so enabling mid-game does not smear a stale
+		// timeline's last frame across the screen for one frame.
+		if (count > 0) {
+			ghost_prev_.assign(src, src + count);
+		} else {
+			ghost_prev_.clear();
+		}
+		return;
+	}
+	if (ghost_prev_.size() != count) {
+		// New timeline (first frame, resize, ROM switch): seed the history
+		// and upload unblended rather than trailing a foreign frame.
+		ghost_prev_.assign(src, src + count);
+		std::memcpy(dst, src, count * sizeof(u32));
+		return;
+	}
+	u32 *out = static_cast<u32 *>(dst);
+	for (size_t i = 0; i < count; i++) {
+		out[i] = ghostBlend(ghost_prev_[i], src[i], ghosting_);
+		ghost_prev_[i] = out[i]; // IIR feedback: exponential trail decay.
+	}
+}
+
 bool VulkanRenderer::create_texture(u32 w, u32 h)
 {
 	const VkDeviceSize size = static_cast<VkDeviceSize>(w) * h * 4;
@@ -139,18 +181,27 @@ bool VulkanRenderer::ensure_texture(u32 w, u32 h)
 
 bool VulkanRenderer::create_body_texture()
 {
-	// Load the GBC body texture — try installed share first, then dev assets
+	// Load the body photo for the active skin - try installed share first,
+	// then dev assets. Unknown skin files fall back to the GBC photo so a
+	// typo in settings.cfg can never leave the shell textureless.
+	const std::string wanted = body_asset_.empty() ? "gbc_body.png" : body_asset_;
+	const std::string files[2] = {wanted, "gbc_body.png"};
 	int tex_width = 0, tex_height = 0, tex_channels = 0;
 	unsigned char *pixels = nullptr;
 	const char *base = SDL_GetBasePath();
 	std::string base_dir = base ? base : "";
-	const std::string candidates[4] = {base_dir + "../share/GB4ME/assets/gbc_body.png",
-									   "/usr/share/GB4ME/assets/gbc_body.png",
-									   base_dir + "assets/gbc_body.png", "assets/gbc_body.png"};
-	for (auto &p : candidates) {
-		pixels = stbi_load(p.c_str(), &tex_width, &tex_height, &tex_channels, 4);
+	for (const auto &file : files) {
+		const std::string candidates[4] = {base_dir + "../share/GB4ME/assets/" + file,
+										   "/usr/share/GB4ME/assets/" + file,
+										   base_dir + "assets/" + file, "assets/" + file};
+		for (auto &p : candidates) {
+			pixels = stbi_load(p.c_str(), &tex_width, &tex_height, &tex_channels, 4);
+			if (pixels)
+				break;
+		}
 		if (pixels)
 			break;
+		tex_width = tex_height = tex_channels = 0;
 	}
 	if (!pixels) {
 		SDL_Log("Failed to load body texture: %s", stbi_failure_reason());

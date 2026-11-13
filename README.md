@@ -57,12 +57,16 @@ cmake --preset dev-strict                            # release + selftest kept
 ./bin/GB4ME --selftest              # run the built-in hardware self-test
 ./bin/GB4ME --selftest game.gba     # include a GBA boot smoke test
 ./bin/GB4ME --blargg cpu.gb [frames] # headless Blargg test ROM (serial verdict)
+./bin/GB4ME --gba-suite suite.gba [suite] [frames] # headless mgba-emu/suite ROM
+./bin/GB4ME --gba-tests tests.gba [frames] # headless jsmolka/gba-tests ROM
 ./bin/GB4ME --help
 ```
 
 Use `O` to open a file, `S` for settings, and `R` to rescan the configured
 ROM folder. In the menu, use the arrow keys to select a ROM and `Enter` to
-play it. Press `E` in a game to return to the menu. ROM entries show their
+play it. Press `/` to search (typing follows your keyboard layout, shortcuts
+stay quiet while searching, `Esc` clears). Press `E` in a game to return to
+the menu. ROM entries show their
 DMG, CGB, or GBA type. Recently played ROMs pin to the top with a `*` and
 launch with `1`-`8`.
 
@@ -81,11 +85,32 @@ frame images. See `./bin/GB4ME --help` for its key names and options.
 Arrows = D-pad, `X` = A, `Z` = B, `Enter` = Start, and `Right Shift` =
 Select. In GBA games, `A` and `D` are the default L and R shoulder buttons;
 all controls can be remapped in Settings. `P` pauses, `F` or `F11` toggles
-fullscreen, `F3` toggles the debug overlay, hold `Tab` for fast-forward,
+fullscreen, `F3` toggles the debug overlay (clickable Vol/Filter/Grid/Ghost/
+Turbo/Pause buttons plus a Settings window with palette, hardware mode,
+console color and ROM folder controls; clicks on it never reach the game),
+hold `Tab` for fast-forward (`T`
+latches turbo on/off), hold `U` to rewind ~60s (a snapshot every 30 frames),
 and `Esc` returns to the menu (use the window close button to
-quit). `-` and `=` adjust volume, with an on-screen readout. Battery-backed
+quit). `-` and `=` adjust volume, with an on-screen readout. While a game
+runs, `1`-`8` selects savestate slot 1-8, `F5` saves and `F8` loads, `C` toggles cheats, with a
+confirmation pill on screen. Battery-backed
 saves are stored beside the ROM as `<rom>.sav`; cartridge clocks (MBC3 and the
 GBA GPIO RTC) keep their state in `<rom>.rtc`.
+
+`GB4S` savestates cover all three systems (GB, GBC and GBA) and carry the
+whole machine, not just the CPU: the timer, the PPU's mid-frame dot position
+and rendered frame, all four APU channels with their pending samples, the
+joypad, the cartridge bank registers and RAM, and the MBC3 clock. A reload
+mid-scanline resumes with the same picture and the same audio, verified by
+comparing frames and samples against an uninterrupted run. Eight slots per
+game sit beside the ROM as `<rom>.gb4s0` … `<rom>.gb4s7` with a PPM
+thumbnail each (`<rom>.gb4sN.ppm`), in both GB/CGB and GBA mode.
+
+GameShark/raw cheats live beside the ROM as `<rom>.cheats` (one per line,
+`#` comments). GB/CGB: `C000=FF` raw or `01YYXXXX` GameShark type 01 only.
+GBA: `02000000=FF` / `=1234` / `=12345678` raw 8/16/32-bit (address 5-8 hex
+digits; encrypted AR/CB codes unsupported). They patch bus reads (never IO
+registers) and toggle with `C`.
 
 ## Video filters
 
@@ -94,7 +119,9 @@ emulated screen: `Nearest`, `Bilinear`, `Smooth Bilinear`, `Scale2x` (EPX), `xBR
 `Slot Mask` (rounded subpixel slots) and `Grille` (Trinitron-style RGB
 triads). The `LCD Grid` slider darkens the pixel borders for every filter and
 sets the mask/triad depth for the last two (0 = off, so those two behave like
-`Smooth Bilinear`). Rumble-capable controllers are driven from the MBC5
+`Smooth Bilinear`). The `Ghosting` setting (also Off/Light/Medium/Strong)
+blends each frame with the previous one for the slow-response GB panel look.
+Rumble-capable controllers are driven from the MBC5
 rumble bit when a cartridge has a motor.
 
 ## Cartridge support
@@ -139,7 +166,7 @@ CMake presets cover the verification builds: `dev` (release, `-Werror`),
 
 ## Verification status
 
-- The built-in hardware self-test passes all 654 checks.
+- The built-in hardware self-test passes all 1,355 checks.
 - Blargg `cpu_instrs` passes 11/11 (headless `--blargg <rom>`, also in CI).
 - GB/GBC boot smoke tests pass 286/286 checks.
 - GBA boot smoke tests pass 287/287 checks.

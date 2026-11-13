@@ -4,6 +4,7 @@
 #include "gba/state.h"
 #include <array>
 #include <functional>
+#include <string>
 
 namespace gba
 {
@@ -199,7 +200,6 @@ class Arm7Tdmi
 
 	// ARM condition field evaluation (cond == 0xF never executes, ARMv4).
 	bool condition(u8 cond) const;
-
 	// ---- Exceptions (GBATEK "Actions performed by CPU when entering...") ----
 	// LR offsets use $ = faulting instruction address, N = next fetch:
 	// SWI/Undef: $+4 (ARM) / $+2 (Thumb), return MOVS. PAbt: $+4, return
@@ -218,6 +218,12 @@ class Arm7Tdmi
 	void restoreCpsrFromSpsr();
 	// Change ARM/THUMB state without touching mode (BX semantics).
 	void setState(CpuState s);
+	// Drops the value-prefetch queue (fresh code was planted). The next
+	// fetch refills from the bus.
+	void invalidatePrefetch()
+	{
+		pf_valid_ = false;
+	}
 
 	// PSR transfer helpers shared by ARM (MRS/MSR) and later debugger.
 	u32 readPsr(bool spsr) const;
@@ -283,6 +289,17 @@ class Arm7Tdmi
 	// Opcode fetches are sequential (S-cycle) except after a branch,
 	// exception, or state change, which refetches non-sequentially.
 	bool fetch_seq_ = false;
+	// Value-prefetch queue (per-cycle slice 2): the executing fetch plus
+	// the next one, fetched ahead, so stores cannot rewrite already-fetched
+	// instructions (jsmolka nes test 1). Timing is unchanged: fetch costs
+	// still charge once per executed instruction in fetchArm/fetchThumb;
+	// the refill reads below are value-only (no cost, no clock). Data
+	// writes never invalidate (real hardware doesn't either); whoever
+	// plants fresh code must invalidate explicitly (the selftest harness
+	// does in runArm/runThumb; reset/load clear it).
+	u32 pf_addr_[2] = {0, 0};
+	u32 pf_val_[2] = {0, 0};
+	bool pf_valid_ = false;
 	CpuState state_ = CpuState::Arm;
 	bool irq_pending_ = false;
 	bool halted_ = false;
@@ -306,5 +323,11 @@ class Arm7Tdmi
 
 u32 executeArm(Arm7Tdmi &cpu, u32 instr, u32 instr_addr);
 u32 executeThumb(Arm7Tdmi &cpu, u16 instr, u32 instr_addr);
+
+// Minimal ARMv4T disassembler for the debugger trace viewer (src/gba/cpu.cpp).
+// Common forms render as text; anything else falls back to `.word`/`.hword`.
+// `addr` is the fetch address, used only for branch-target computation.
+std::string disasmArm(u32 addr, u32 instr);
+std::string disasmThumb(u32 addr, u16 instr);
 
 } // namespace gba

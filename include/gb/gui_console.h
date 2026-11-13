@@ -34,6 +34,70 @@ enum class ConsoleColor : u8 {
 	ClearPurple,
 };
 
+// Photo body skin: one console photo plus the geometry measured from its
+// pixels (all rects are fractions of the body rect). Only the GBC photo
+// ships so far; a second photo needs its own entry here (plus asset +
+// screenshot QA) and everything below follows without code changes.
+// Interface theme: panel + menu + list colors. The photo-sited chrome
+// (gear/OPEN/shoulder pills, badges, cart art) and the transient OSD pills
+// stay fixed - they sit on photos and game content, where a dark treatment
+// reads on anything. Accent/ok greens keep their semantic meaning.
+struct UiTheme {
+	u32 panel_outer = 0;
+	u32 panel_inner = 0;
+	u32 row_bg = 0;
+	u32 pill_bg = 0;
+	u32 text = 0;
+	u32 text_mute = 0;
+	u32 ok = 0;
+	u32 menu_bg = 0;
+	u32 menu_row = 0;
+	u32 menu_row_sel = 0;
+	u32 menu_row_sel_edge = 0;
+	u32 menu_text = 0;
+	u32 menu_text_dim = 0;
+	u32 menu_hint = 0;
+};
+const UiTheme &ui_theme_dark();
+const UiTheme &ui_theme_light();
+// Settings value 0 = Dark (default, legacy look), 1 = Light.
+inline const UiTheme &ui_theme_for(int theme)
+{
+	return theme == 1 ? ui_theme_light() : ui_theme_dark();
+}
+inline const char *ui_theme_name(int theme)
+{
+	return theme == 1 ? "Light" : "Dark";
+}
+
+struct BodySkinRect {
+	float x = 0, y = 0, w = 0, h = 0;
+};
+struct BodySkin {
+	const char *id = "";    // settings value ("gbc")
+	const char *name = "";  // display name ("Game Boy Color")
+	const char *asset = ""; // file under assets/ ("gbc_body.png")
+	float aspect = 0;       // width / height of the photo
+	BodySkinRect bezel;     // LCD glass
+	BodySkinRect dpad;      // D-pad enclosing area (cross + well)
+	BodySkinRect settings;  // gear button corner
+	BodySkinRect open;      // OPEN button corner
+	// Pad buttons in fixed order: Up Down Left Right A B Select Start.
+	BodySkinRect buttons[8];
+	bool button_circle[8] = {};
+	BodySkinRect shoulders[2]; // GBA L/R overlay pills
+};
+static constexpr int kBodySkins = 1;
+const BodySkin *body_skin_by_id(const char *id); // nullptr when unknown
+const BodySkin *body_skin_at(int index);         // table order, nullptr out of range
+// Resolves a settings value ("Auto" follows the running core) to a bundled
+// skin, falling back to GBC for unknown values.
+const BodySkin *resolve_body_skin(const char *setting, bool gba_mode);
+inline const BodySkin *resolve_body_skin(const std::string &setting, bool gba_mode)
+{
+	return resolve_body_skin(setting.c_str(), gba_mode);
+}
+
 // A named, self-contained input mapping the user can switch between. The
 // three tables mirror Settings' own key_map/pad_map* exactly, so activating a
 // profile is a copy into those fields and every existing caller keeps working.
@@ -102,11 +166,13 @@ struct Settings {
 		int video_scale = 0;
 		int video_filter = 0;
 		int lcd_grid = 0;
+		int ghosting = 0;
 		int palette = 0;
 		int console_color = 0;
 		std::string hardware_mode;
 		bool has_volume = false, has_video_scale = false, has_video_filter = false;
-		bool has_lcd_grid = false, has_palette = false, has_console_color = false;
+		bool has_lcd_grid = false, has_ghosting = false, has_palette = false,
+			 has_console_color = false;
 		bool has_hardware_mode = false;
 	};
 	GameOverride game;
@@ -194,9 +260,26 @@ struct Settings {
 	{
 		return kLcdGridDepth[lcd_grid < 0 ? 0 : (lcd_grid > kLcdGridMax ? kLcdGridMax : lcd_grid)];
 	}
+	// LCD ghosting (frame persistence): blends each frame with the previous
+	// one on the CPU before upload, for the slow-response GB panel look.
+	// Same 0..3 Off/Light/Medium/Strong steps as the grid; strictly opt-in.
+	int ghosting = 0;
+	static constexpr int kGhostMax = 3;
+	static constexpr float kGhostDepth[kGhostMax + 1] = {0.0f, 0.30f, 0.50f, 0.70f};
+	float ghostDepth() const
+	{
+		return kGhostDepth[ghosting < 0 ? 0 : (ghosting > kGhostMax ? kGhostMax : ghosting)];
+	}
 	int palette = 0;                    // DMG palette or CGB palette index
 	std::string hardware_mode = "Auto"; // DMG / CGB / Auto
 	ConsoleColor console_color = ConsoleColor::Purple;
+	// Photo body skin: "Auto" follows the running core (GBA -> gba photo,
+	// otherwise gbc), or an explicit skin id. Applies on next launch (the
+	// body texture loads once at startup); unknown values fall back to GBC.
+	std::string body_skin = "Auto";
+	// Interface theme: 0 = Dark (legacy look), 1 = Light. Applies live to
+	// the panel, menu and debug overlay; the photo chrome is theme-free.
+	int theme = 0;
 	// Recently played ROMs, most-recent-first (serialised recent0..7).
 	// Pinned to the top of the ROM menu with 1-8 quick-launch.
 	static constexpr size_t kMaxRecent = 8;
@@ -245,6 +328,10 @@ struct Settings {
 	void set_mapping(Joypad::Key k, SDL_Scancode code);
 };
 
+// DMG palette display name ("Original", "Pocket", ...). Free function shared
+// by the custom settings panel and the overlay.
+const char *palette_name(int p);
+
 class GUIConsole
 {
   public:
@@ -265,8 +352,14 @@ class GUIConsole
 		std::string title;
 		std::string path;
 		bool cgb = false;
-		bool gba = false;    // GBA image (routed to the GBA core, Phases 2+ execute)
-		bool recent = false; // pinned recent: shown first, 1-8 quick-launch
+		bool gba = false;       // GBA image (routed to the GBA core, Phases 2+ execute)
+		bool recent = false;    // pinned recent: shown first, 1-8 quick-launch
+		int save_slots = 0;     // populated by refresh_save_counts (0..8)
+		bool has_thumb = false; // a menu tile image exists (see thumb_path)
+		// Best image for the menu tile, picked by refresh_save_counts:
+		// `<rom>.png` boxart wins, then `<rom>.thumb.ppm`, then the first
+		// `<rom>.gb4sN.ppm` slot shot. Empty when there is nothing to show.
+		std::string thumb_path;
 	};
 
 	enum class SettingsTab : u8 { General = 0, Inputs = 1 };
@@ -278,10 +371,15 @@ class GUIConsole
 		TabInputs,
 		RomFolder,
 		Volume,
+		WindowScale, // cycle 1x..6x and resize the window live
 		Palette,
 		HwMode,
 		Filter,      // cycle VideoFilter (Nearest / Bilinear / Smooth / Scale2x)
 		LcdGrid,     // cycle the LCD grid strength (Off .. Strong)
+		Ghosting,    // cycle LCD ghosting / persistence (Off .. Strong)
+		Console,     // cycle the console accent color (Purple .. Clear)
+		BodySkin,    // cycle the photo body skin (Auto .. explicit ids)
+		Theme,       // cycle the interface theme (Dark / Light)
 		PadButton,   // index = logical button on the GBA diagram
 		AutoMap,     // one-click layout: pad defaults, or keyboard defaults
 		ProfileBox,  // open the profile dropdown (or the name prompt)
@@ -310,6 +408,9 @@ class GUIConsole
 		std::string id; // "folder","volume",...,"bind<i>","automap","profsel"
 		std::string label;
 		std::string value;
+		// Secondary caption drawn under the label when the row is tall
+		// enough. Empty for headers and compact layouts.
+		std::string description;
 		Rect label_rect{};
 		Rect value_rect{};
 		RowStyle style = RowStyle::Value;
@@ -531,6 +632,30 @@ class GUIConsole
 		return gba_pad_;
 	}
 
+	// ---- Inputs page: parallel binding list ----
+	// One row per logical button, laid out beside the diagram (or alone on
+	// narrow panels). Clicking either this list or the diagram arms a remap.
+	static constexpr int kInputBindings = 10;
+	struct BindingRow {
+		Rect rect{};
+		std::string label;
+		std::string value;
+		PadButton button = PadButton::A;
+		bool selected = false;
+		bool unbound = false;
+	};
+	const std::array<Rect, kInputBindings> &binding_rects() const
+	{
+		return binding_rects_;
+	}
+	std::vector<BindingRow> binding_rows() const;
+	// False when the panel is too narrow to spare room for the GBA outline;
+	// the clickable binding list still covers every button.
+	bool inputs_diagram_visible() const
+	{
+		return inputs_diagram_visible_;
+	}
+
 	// Input mapping modal
 	bool awaiting_input() const
 	{
@@ -645,6 +770,9 @@ class GUIConsole
 	}
 	// Value cell of the volume slider (for drag handling).
 	Rect settings_volume_rect() const;
+	// Typography for the custom settings panel, derived from panel width so
+	// narrow windows do not fall back to an unreadable fixed 0.6 scale.
+	float settings_text_scale() const;
 	SettingsTab settings_tab() const
 	{
 		return settings_tab_;
@@ -670,6 +798,44 @@ class GUIConsole
 	{
 		return rom_list_;
 	}
+	// Menu search/filter: '/' activates, layout-aware text appends (SDL text
+	// input, so AZERTY/IME layouts work - scancodes are physical positions and
+	// cannot), Backspace deletes, Esc clears. While active only matching ROMs
+	// (case-insensitive substring of title or path) are shown; menu_selected_
+	// is a position in the filtered view. Empty+inactive is identity (all ROMs).
+	void set_menu_filter(const std::string &f);
+	// Feeds one SDL text-input chunk into the search: "/" with no active
+	// filter starts one; Space is ignored (the Space key loads the selected
+	// ROM through the scancode path); anything else appends while active.
+	// Returns true when consumed. Pure logic, headless-testable.
+	bool menu_filter_type(const std::string &utf8);
+	void clear_menu_filter();
+	const std::string &menu_filter() const
+	{
+		return menu_filter_;
+	}
+	bool menu_filter_active() const
+	{
+		return filter_active_;
+	}
+	void set_menu_filter_active(bool v);
+	const std::vector<int> &filtered_indices() const
+	{
+		return filtered_;
+	}
+	// Real rom_list_ index for a filtered position, or -1.
+	int filtered_to_rom(int filtered_pos) const;
+	// Currently selected ROM respecting the filter, or nullopt.
+	std::optional<RomEntry> selected_rom() const;
+	// Counts existing `<rom>.gb4s0..7` files per menu entry (0..8).
+	// Called after set_rom_list/rescan and after slot saves; headless-safe.
+	void refresh_save_counts();
+	// Slot-file helper shared by the menu badge and GameBoy slots.
+	static std::string slot_path_for(const std::string &rom_path, int slot);
+	static int count_save_slots(const std::string &rom_path);
+	// Menu tile image for a ROM: `<rom>.png`, else `<rom>.thumb.ppm`, else
+	// the first `<rom>.gb4sN.ppm`, else "". Headless-safe, testable.
+	static std::string thumb_path_for(const std::string &rom_path);
 	void set_menu_selected(int i);
 	int menu_selected() const
 	{
@@ -697,6 +863,29 @@ class GUIConsole
 	{
 		return settings_ ? settings_->console_color : ConsoleColor::Purple;
 	}
+	// Active photo body skin for layout and hit-testing, resolved from the
+	// setting ("Auto" follows the running core) with GBC fallback.
+	const BodySkin *active_skin() const
+	{
+		const std::string setting = settings_ ? settings_->body_skin : "Auto";
+		return resolve_body_skin(setting, gba_mode_);
+	}
+	// Settings-row/debug-button display value for the skin: the resolved
+	// name, with Auto naming its target ("Auto (Game Boy Color)").
+	std::string body_skin_value() const;
+	// Active interface theme for panel/menu drawing.
+	const UiTheme &ui_theme() const
+	{
+		const int t = settings_ ? settings_->theme : 0;
+		return ui_theme_for(t != 1 ? 0 : 1);
+	}
+	// Accent palette for the settings panel (Purple by default). Public so
+	// the renderer can theme from the live setting; the dim variant fills
+	// selected rows, the name feeds the settings row value.
+	static u32 color_for_console(ConsoleColor c);
+	static u32 color_for_console_dim(ConsoleColor c);
+	static const char *console_color_name(ConsoleColor c);
+	static constexpr int kConsoleColors = 5;
 	HardwareMode hardware_mode() const
 	{
 		return hardware_mode_;
@@ -769,24 +958,31 @@ class GUIConsole
 	Rect settings_close_{};
 	// Value-cell rects per row id, rebuilt in update_layout() for both tabs
 	// (value strings are produced live in settings_rows()).
-	std::vector<Rect> settings_general_cells_;
-	std::vector<Rect> settings_inputs_cells_;
-	std::vector<Rect> settings_general_labels_;
-	std::vector<Rect> settings_inputs_labels_;
-
 	bool menu_active_ = true;
 	std::vector<RomEntry> rom_list_;
 	int menu_selected_ = 0;
+	// Search state: filter text + precomputed matching indices.
+	std::string menu_filter_;
+	bool filter_active_ = false;
+	std::vector<int> filtered_;
+	void rebuild_filter();
 	bool fullscreen_game_ = false;
 	std::array<bool, 8> pressed_{};
 	std::array<bool, 10> gba_pressed_{};
 
 	void rebuild_buttons();
-	// Inputs tab rows: 10 keyboard bindings, 10 controller bindings for the
-	// same logical buttons, then the one-click auto-map row. The 8 shared
-	// slots drive GB/GBC and GBA alike; R/L are GBA-only.
-	static constexpr int kGeneralRows = 6;
-	static constexpr int kInputButtons = 10;
+	// Inputs tab button list and the GBA outline. The 8 shared slots drive
+	// GB/GBC and GBA alike; R/L are GBA-only.
+	static constexpr int kInputButtons = kInputBindings;
+	// Visual layout is driven by the descriptor list in gui_console.cpp;
+	// these arrays are filled for every entry (headers included) in the
+	// same order settings_rows() reports them.
+	std::vector<Rect> settings_general_cells_;
+	std::vector<Rect> settings_general_labels_;
+	std::vector<Rect> settings_inputs_cells_;
+	std::vector<Rect> settings_inputs_labels_;
+	std::array<Rect, kInputButtons> binding_rects_{};
+	bool inputs_diagram_visible_ = false;
 	// Inputs tab: profile selector, 10 button rows, then 4 action rows
 	// (auto-map, new, rename, delete). Header rows share the geometry of a
 	// following row but occupy no slot of their own.
@@ -795,7 +991,6 @@ class GUIConsole
 	{
 		return 1 + kInputButtons + 1 + kInputActions; // profile + buttons + stick + actions
 	}
-	static u32 color_for_console(ConsoleColor c);
 };
 
 } // namespace gb

@@ -21,13 +21,26 @@ void GbaPpu::reset()
 	pal_.fill(0);
 	vram_.fill(0);
 	oam_.fill(0);
+	scroll_log_.clear();
+	for (int i = 0; i < 4; i++)
+		scroll_snap_h_[i] = scroll_snap_v_[i] = 0;
+	line_start_ = 0;
+	has_line_clock_ = false; // First endLine stamps it exact.
+	scroll_overflow_ = false;
 	dispcnt_ = 0;
 	dispstat_ = 0;
 	greenswap_ = 0;
 	for (int i = 0; i < 4; i++)
 		bgcnt_[i] = bghofs_[i] = bgvofs_[i] = 0;
 	for (int i = 0; i < 2; i++) {
-		bgpa_[i] = bgpb_[i] = bgpc_[i] = bgpd_[i] = 0;
+		// Affine identity at boot (PA=PD=0x100): the BIOS logo effect ends
+		// at 1:1, so post-boot software (which our direct boot replicates)
+		// sees identity mapping. Zero would collapse every bitmap/affine
+		// layer to column 0 - jsmolka/gba-tests text relies on the reset.
+		bgpa_[i] = 0x100;
+		bgpb_[i] = 0;
+		bgpc_[i] = 0;
+		bgpd_[i] = 0x100;
 		bgx_latch_[i] = bgy_latch_[i] = 0;
 		bgx_[i] = bgy_[i] = 0;
 	}
@@ -227,27 +240,35 @@ void GbaPpu::writeIo(u32 addr, u16 value)
 		return;
 	case 0x04000010u:
 		bghofs_[0] = value & 0x1FFu;
+		logScroll(0, bghofs_[0]);
 		return;
 	case 0x04000012u:
 		bgvofs_[0] = value & 0x1FFu;
+		logScroll(4, bgvofs_[0]);
 		return;
 	case 0x04000014u:
 		bghofs_[1] = value & 0x1FFu;
+		logScroll(1, bghofs_[1]);
 		return;
 	case 0x04000016u:
 		bgvofs_[1] = value & 0x1FFu;
+		logScroll(5, bgvofs_[1]);
 		return;
 	case 0x04000018u:
 		bghofs_[2] = value & 0x1FFu;
+		logScroll(2, bghofs_[2]);
 		return;
 	case 0x0400001Au:
 		bgvofs_[2] = value & 0x1FFu;
+		logScroll(6, bgvofs_[2]);
 		return;
 	case 0x0400001Cu:
 		bghofs_[3] = value & 0x1FFu;
+		logScroll(3, bghofs_[3]);
 		return;
 	case 0x0400001Eu:
 		bgvofs_[3] = value & 0x1FFu;
+		logScroll(7, bgvofs_[3]);
 		return;
 	case 0x04000020u:
 		bgpa_[0] = value;
@@ -353,6 +374,29 @@ void GbaPpu::writeIo(u32 addr, u16 value)
 
 // ---- Timing ----
 
+u32 GbaPpu::liveDot() const
+{
+	if (scheduler_ == nullptr)
+		return 0;
+	const u64 now = scheduler_->now();
+	return now >= line_start_ ? static_cast<u32>(now - line_start_) : 0;
+}
+
+void GbaPpu::logScroll(u8 reg, u16 value)
+{
+	// Only visible lines draw pixels, and only with an exact clock; the
+	// rest renders live. Overflow falls back to live for the line rather
+	// than replaying a partial log.
+	if (!has_line_clock_ || line_ >= kHeight || scroll_overflow_)
+		return;
+	if (scroll_log_.size() >= 512) {
+		scroll_log_.clear();
+		scroll_overflow_ = true;
+		return;
+	}
+	scroll_log_.push_back({liveDot(), reg, value});
+}
+
 void GbaPpu::updateVCountFlag(bool raise_irq)
 {
 	const unsigned lyc = (dispstat_ >> 8) & 0xFFu;
@@ -394,6 +438,18 @@ void GbaPpu::endLine()
 	line_++;
 	if (line_ >= kLines)
 		line_ = 0;
+	// A new line starts here: timestamp it and snapshot the scroll
+	// registers, clearing the mid-line write log for the line ahead. This
+	// also stamps the line clock exact, which rearmEvents() relies on.
+	if (scheduler_ != nullptr)
+		line_start_ = scheduler_->now();
+	has_line_clock_ = true;
+	scroll_overflow_ = false;
+	for (int i = 0; i < 4; i++) {
+		scroll_snap_h_[i] = bghofs_[i];
+		scroll_snap_v_[i] = bgvofs_[i];
+	}
+	scroll_log_.clear();
 	updateVCountFlag(true);
 	if (line_ == kVBlankLine) {
 		// VBlank start: reload internal affine reference points from
@@ -457,7 +513,27 @@ void GbaPpu::rearmEvents()
 	// callbacks are type-erased), so the next point has to be re-scheduled
 	// from the restored line/hblank position.
 	event_armed_ = false;
-	armNextEvent();
+	if (scheduler_ == nullptr || !has_line_clock_) {
+		armNextEvent(); // Legacy: full periods (old states, unit runs).
+		return;
+	}
+	// Exact resume: the restored line clock tells how far into the line the
+	// save happened, so the next boundary keeps its tick instead of
+	// shifting by the remainder (the old full-period arm moved every later
+	// line, VBlank and frame boundary after a mid-line load).
+	const u64 now = scheduler_->now();
+	u32 dot = now >= line_start_ ? static_cast<u32>(now - line_start_) : 0;
+	if (dot >= kDotsPerLine)
+		dot = 0; // Corrupt clock: full periods from here (legacy).
+	event_armed_ = true;
+	if (line_ >= kHeight || hblank_) {
+		scheduler_->schedule(kDotsPerLine - dot, [this] { onLineEndEvent(); });
+	} else if (dot >= kDrawEnd) {
+		// HBlank overdue (shouldn't happen with a valid clock): fire now.
+		scheduler_->schedule(0, [this] { onHBlankEvent(); });
+	} else {
+		scheduler_->schedule(kDrawEnd - dot, [this] { onHBlankEvent(); });
+	}
 }
 
 void GbaPpu::onHBlankEvent()
@@ -542,6 +618,20 @@ void GbaPpu::save(StateBuffer &out) const
 	out.writeBytes(pal_.data(), pal_.size());
 	out.writeBytes(vram_.data(), vram_.size());
 	out.writeBytes(oam_.data(), oam_.size());
+	// Mid-line scroll state (newer states only): the line clock, the
+	// line-start snapshot and the pending write log.
+	out.write(line_start_);
+	for (int i = 0; i < 4; i++) {
+		out.write(scroll_snap_h_[i]);
+		out.write(scroll_snap_v_[i]);
+	}
+	const u32 log_n = scroll_log_.size() > 512 ? 512 : static_cast<u32>(scroll_log_.size());
+	out.write(log_n);
+	for (u32 i = 0; i < log_n; i++) {
+		out.write(scroll_log_[i].dot);
+		out.write(scroll_log_[i].reg);
+		out.write(scroll_log_[i].value);
+	}
 }
 
 void GbaPpu::load(const StateBuffer &in)
@@ -585,6 +675,42 @@ void GbaPpu::load(const StateBuffer &in)
 	in.readBytes(pal_.data(), pal_.size());
 	in.readBytes(vram_.data(), vram_.size());
 	in.readBytes(oam_.data(), oam_.size());
+	// Newer states only; absent fields keep the reset/endLine values, and
+	// an empty log replays exactly today's single-segment behavior. A
+	// missing clock leaves the flag off (live rendering + legacy rearm
+	// until the next line boundary stamps it exact).
+	u64 start = 0;
+	has_line_clock_ = in.read(start);
+	if (has_line_clock_)
+		line_start_ = start;
+	else
+		line_start_ = 0;
+	scroll_overflow_ = false;
+	for (int i = 0; i < 4; i++) {
+		u16 h = 0, v = 0;
+		if (in.read(h))
+			scroll_snap_h_[i] = h;
+		if (in.read(v))
+			scroll_snap_v_[i] = v;
+	}
+	u32 log_n = 0;
+	if (in.read(log_n)) {
+		scroll_log_.clear();
+		for (u32 i = 0; i < log_n && i < 512; i++) {
+			ScrollWrite e;
+			u8 reg = 0;
+			u16 value = 0;
+			if (!in.read(e.dot))
+				break;
+			if (!in.read(reg))
+				break;
+			if (!in.read(value))
+				break;
+			e.reg = reg > 7 ? 7 : reg;
+			e.value = value;
+			scroll_log_.push_back(e);
+		}
+	}
 }
 
 } // namespace gba

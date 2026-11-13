@@ -163,6 +163,7 @@ class Cartridge
 	// Per-title forced save type (mGBA overrides.c), checked before markers.
 	static SaveType forcedSaveType(const std::string &game_code);
 	bool detectGpio() const;
+	bool detectGyro() const;
 };
 
 } // namespace gba

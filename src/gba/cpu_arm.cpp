@@ -221,6 +221,10 @@ static u32 executeGroup00(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 			addr = up ? (base + offset) : (base - offset);
 		u32 cycles = 1; // I-cycle; the bus access accumulates itself.
 		if (load) {
+			// Writeback precedes the load (same rule as word transfers:
+			// the loaded value wins when Rn == Rd; arm tests 412/413).
+			if (pre && wb)
+				cpu.setReg(rn, addr);
 			u32 val = 0;
 			if (h == 1)
 				val = cpu.loadHalf(addr, false);
@@ -252,14 +256,15 @@ static u32 executeGroup00(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 			}
 			// Storing R15 supplies PC+12 (the architectural value), not the
 			// internal PC+8 that reg(15) holds (GBATEK "Using R15 (PC)").
+			// The address goes through raw: SRAM decodes the low bits.
 			const u32 sv = (rd == 15) ? (cpu.reg(15) + 4) : cpu.reg(rd);
-			cpu.storeHalf(addr & ~1u, static_cast<u16>(sv & 0xFFFFu));
+			cpu.storeHalf(addr, static_cast<u16>(sv & 0xFFFFu));
 			cycles = 0;
 		}
-		// Writeback (ARM ARM A3.2.1): post-indexed and unregister/scaled
-		// offset forms are suppressed when a load targets Rn itself, but the
-		// pre-indexed+writeback form always writes the computed address.
-		if (pre ? wb : (!load || rn != rd)) {
+		// Writeback: pre-indexed+writeback loads already wrote back above
+		// (so the load wins Rn == Rd ties); post-indexed loads targeting
+		// Rn itself suppress it. Stores always write back afterwards.
+		if (pre ? (wb && !load) : (!load || rn != rd)) {
 			const u32 new_base = pre ? addr : (up ? (base + offset) : (base - offset));
 			cpu.setReg(rn, new_base);
 		}
@@ -411,6 +416,11 @@ static u32 executeGroup00(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 			return 4; // Pipeline refill (2S+1N + margin, S=N=1).
 		}
 		cpu.setReg(rd, res);
+	} else if (rd == 15) {
+		// TST/TEQ/CMP/CMN with Rd=PC: on ARM7TDMI this still restores
+		// CPSR from SPSR (the "bad CMP" quirk), with no PC write and no
+		// pipeline flush (jsmolka arm tests 234/235).
+		cpu.restoreCpsrFromSpsr();
 	}
 	(void) instr_addr;
 	return 1;
@@ -447,6 +457,10 @@ static u32 executeSingle(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 	// stores issue back-to-back (S=N model: no extra).
 	u32 cycles = load ? 1 : 0;
 	if (load) {
+		// Writeback precedes the load: the loaded value wins when
+		// Rn == Rd (mGBA order; jsmolka arm test 360).
+		if (pre && wb)
+			cpu.setReg(rn, addr);
 		u32 val = byte ? cpu.loadByte(addr) : cpu.loadWord(addr);
 		if (rd == 15) {
 			cpu.setPc(val);
@@ -463,7 +477,7 @@ static u32 executeSingle(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 		else
 			cpu.storeWord(addr, val);
 	}
-	if (pre ? wb : (!load || rn != rd)) {
+	if (pre ? (wb && !load) : (!load || rn != rd)) {
 		const u32 new_base = pre ? addr : (up ? (base + offset) : (base - offset));
 		cpu.setReg(rn, new_base);
 	}
@@ -480,9 +494,11 @@ static u32 executeBlock(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 	const bool load = ((instr >> 20) & 1) != 0;
 	const u8 rn = (instr >> 16) & 0xF;
 	u32 rlist = instr & 0xFFFFu;
-	if (rlist == 0)
+	const bool empty = (rlist == 0);
+	if (empty)
 		rlist = 0x8000u; // Empty list: R15-only (documented).
-	const unsigned n = popcount16(rlist);
+	// Writeback spans the full 16-word block for an empty list (mGBA).
+	const unsigned n = empty ? 16 : popcount16(rlist);
 	const u32 base = cpu.reg(rn);
 	u32 addr = 0;
 	if (!pre && up)
@@ -493,11 +509,16 @@ static u32 executeBlock(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 		addr = base - n * 4 + 4; // DA
 	else
 		addr = base - n * 4; // DB
+	// Unaligned transfer addresses align down; the low bits survive in the
+	// writeback (exact base arithmetic below), matching mGBA and hardware
+	// (jsmolka arm test 508). SRAM stays byte-exact.
+	if ((addr >> 24) < 0x0Eu)
+		addr &= ~3u;
 	const u32 orig_base = base;
-	// S without PC: user-bank transfer. Resolve accessors up front.
-	// S without PC: user-bank transfer, unless this is an LDR (bit 4 of
-	// rlist is the "user" flag; the classic GBATEK table lists bit 4 = 0).
-	const bool user_transfer = psr && (!load || (rlist & 0x8000u) != 0);
+	// S without PC: user-bank transfer. For loads, S with PC in the list
+	// is the exception return instead (handled after the loop), so only
+	// S-without-PC takes the user bank; stores always do (jsmolka arm 512).
+	const bool user_transfer = psr && (load ? ((rlist & 0x8000u) == 0) : true);
 	auto getReg = [&](u8 i) -> u32 {
 		if (user_transfer) {
 			if (i < 8)
@@ -539,6 +560,10 @@ static u32 executeBlock(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 	bool wrote_pc = false;
 	u32 pc_val = 0;
 	bool seq = false; // First transfer N-cycle, rest sequential.
+	// STM base slot: the original value only if the base is the lowest
+	// register in the list; otherwise the writeback value (hardware).
+	const u32 stm_wb = up ? (orig_base + n * 4) : (orig_base - n * 4);
+	const bool base_first = (rlist & ((1u << rn) - 1u)) == 0;
 	for (u8 i = 0; i < 15; i++) {
 		if ((rlist & (1u << i)) == 0)
 			continue;
@@ -547,9 +572,7 @@ static u32 executeBlock(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 		} else {
 			u32 v = getReg(i);
 			if (i == static_cast<u8>(rn))
-				v = orig_base; // STM base slot.
-			else if (i == 15)
-				v = getReg(15) + 4; // PC+12, not the internal PC+8.
+				v = base_first ? orig_base : stm_wb;
 			cpu.storeWord(addr, v, seq);
 		}
 		addr += 4;
@@ -561,13 +584,14 @@ static u32 executeBlock(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 			wrote_pc = true;
 			addr += 4;
 		} else {
-			// R15 in the list stores PC+12 unless it is also the base.
-			u32 v = (rn == 15) ? orig_base : (getReg(15) + 4);
+			// R15 in the list stores PC+12 unless it is also the base,
+			// which follows the base-slot rule.
+			u32 v = (rn == 15) ? (base_first ? orig_base : stm_wb) : (getReg(15) + 4);
 			cpu.storeWord(addr, v, seq);
 			addr += 4;
 		}
 	}
-	if (load && wb && (rlist & (1u << rn)) == 0) {
+	if (load && wb && (((rlist & (1u << rn)) == 0) || empty)) {
 		const u32 new_base = up ? (orig_base + n * 4) : (orig_base - n * 4);
 		cpu.setReg(rn, new_base); // Writeback always hits the current bank.
 	} else if (!load && wb) {

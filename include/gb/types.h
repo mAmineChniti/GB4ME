@@ -48,6 +48,7 @@ enum class VideoFilter : u8 {
 	SlotMask,       // Rounded subpixel slot mask (LCD Grid slider = depth).
 	Grille,         // Vertical RGB stripe grille (LCD Grid slider = depth).
 	XBRZ,           // xBRZ upscale (4x then resample; keeps diagonals).
+	NTSC,           // Composite approximation: chroma blur + edge rainbow.
 	Count,
 };
 
@@ -88,6 +89,8 @@ inline const char *video_filter_name(VideoFilter f)
 		return "Grille";
 	case VideoFilter::XBRZ:
 		return "xBRZ";
+	case VideoFilter::NTSC:
+		return "NTSC";
 	case VideoFilter::Count:
 		break;
 	}

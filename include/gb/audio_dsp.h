@@ -14,6 +14,7 @@
 //   oversampled mix -> FIR decimate -> DC blocker (the DMG/GBA output
 //   capacitor) -> master volume -> 16-bit clamp.
 
+#include "state.h"
 #include "types.h"
 #include <algorithm>
 #include <array>
@@ -132,6 +133,12 @@ class OutputStage
 			return -32767;
 		return static_cast<i16>(v);
 	}
+
+	// Savestate: the FIR ring and the DC blocker's previous sample are the
+	// difference between a resumed note and a click. The kernel is derived
+	// from constants in the constructor, so it is not written.
+	void save(StateBuffer &buf) const;
+	void load(StateBuffer &buf);
 
 	// ~22Hz corner: below anything the PSG produces, above any DC.
 	static constexpr float kDcPole = 0.996f;

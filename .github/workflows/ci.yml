@@ -55,6 +55,128 @@ jobs:
           done
           exit $fail
 
+      # Screen-only verdicts: halt_bug and interrupt_time report over neither
+      # the serial port nor cartridge RAM - they draw "Passed"/"Failed" with
+      # Blargg's console, whose font makes a BG tile index the ASCII code, so
+      # PPU::console_shows() reads the text out of the tile map. interrupt_time
+      # is a CGB-built ROM (.define REQUIRE_CGB), halt_bug is a DMG one, so
+      # they have to run in the matching mode.
+      - name: Run halt_bug (DMG) + interrupt_time (CGB)
+        run: |
+          fail=0
+          GB4ME_FORCE_DMG=1 ./bin/GB4ME --blargg test-roms/halt_bug.gb || fail=1
+          ./bin/GB4ME --blargg test-roms/interrupt_time/interrupt_time.gb || fail=1
+          exit $fail
+
+      # Memory-access timing: every instruction's read/write has to land on
+      # the M-cycle the CPU's per-cycle hook puts it on (CPU::set_cycle_hook).
+      # These six report through cartridge RAM, not the serial port.
+      - name: Run mem_timing + mem_timing-2 + instr_timing
+        run: |
+          fail=0
+          for rom in test-roms/mem_timing/individual/*.gb \
+                    test-roms/mem_timing-2/rom_singles/*.gb \
+                    test-roms/instr_timing/instr_timing.gb; do
+            ./bin/GB4ME --blargg "$rom" || fail=1
+          done
+          exit $fail
+
+  # The rest of the conformance picture, split into "gates" and "known
+  # failures" on purpose. A suite whose verdict is already correct (or already
+  # known-wrong) should not be able to rot silently, and a new failure has to
+  # be obvious rather than lost in a wall of expected red.
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libsdl3-dev \
+            libvulkan-dev vulkan-validationlayers glslc git
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Fetch test ROMs
+        run: |
+          git clone --depth 1 https://github.com/retrio/gb-test-roms.git test-roms
+          git clone --depth 1 https://github.com/mgba-emu/gba-tests.git gba-tests
+
+      # GBA: every jsmolka/gba-tests ROM that reports a verdict on screen.
+      # ppu/*, bios/bios and unsafe/unsafe are visual/crash tests with no
+      # verdict text, so they cannot gate anything here.
+      - name: Run jsmolka gba-tests
+        run: |
+          fail=0
+          for rom in gba-tests/arm/arm.gba gba-tests/thumb/thumb.gba \
+                    gba-tests/memory/memory.gba gba-tests/nes/nes.gba \
+                    gba-tests/save/none.gba gba-tests/save/sram.gba \
+                    gba-tests/save/flash64.gba gba-tests/save/flash128.gba; do
+            ./bin/GB4ME --gba-tests "$rom" || fail=1
+          done
+          exit $fail
+
+      # DMG-only Blargg ROMs (they carry a CGB flag but describe DMG hardware),
+      # so they need GB4ME_FORCE_DMG. oam_bug: 2/3/4/5/6 pass; 1-lcd_sync,
+      # 7-timing_effect and 8-instr_effect are known failures and are listed
+      # here so a *new* failure stands out.
+      - name: Run oam_bug (known failures enumerated)
+        run: |
+          fail=0
+          for rom in 2-causes 3-non_causes 4-scanline_timing 5-timing_bug \
+                      6-timing_no_bug; do
+            GB4ME_FORCE_DMG=1 ./bin/GB4ME --blargg \
+              "test-roms/oam_bug/rom_singles/$rom.gb" || fail=1
+          done
+          for rom in 1-lcd_sync 7-timing_effect 8-instr_effect; do
+            echo "::group::known failure: $rom"
+            GB4ME_FORCE_DMG=1 ./bin/GB4ME --blargg \
+              "test-roms/oam_bug/rom_singles/$rom.gb" || echo "(still failing, as documented)"
+            echo "::endgroup::"
+          done
+          exit $fail
+
+      # CGB variants of the same suite: 01-06, 08 and 11 pass, 07 (#5), 09, 10
+      # and 12 do not (agents.md has each one). These run *without*
+      # GB4ME_FORCE_DMG - the point is that they exercise the CGB model.
+      - name: Run cgb_sound (known failures enumerated)
+        run: |
+          fail=0
+          for rom in test-roms/cgb_sound/rom_singles/*.gb; do
+            case "$(basename "$rom")" in
+              01-*|02-*|03-*|04-*|05-*|06-*|08-*|11-*) ;;
+              *) echo "::group::known failure: $(basename "$rom")"
+                 ./bin/GB4ME --blargg "$rom" || echo "(still failing, as documented)"
+                 echo "::endgroup::"
+                 continue ;;
+            esac
+            ./bin/GB4ME --blargg "$rom" || fail=1
+          done
+          exit $fail
+
+      # dmg_sound: 01-06, 08 and 11 pass; 07 (#5), 09, 10 and 12 need the
+      # T-cycle CPU/APU coupling documented in agents.md.
+      - name: Run dmg_sound (known failures enumerated)
+        run: |
+          fail=0
+          for rom in test-roms/dmg_sound/rom_singles/*.gb; do
+            case "$(basename "$rom")" in
+              01-*|02-*|03-*|04-*|05-*|06-*|08-*|11-*) ;;
+              *) echo "::group::known failure: $(basename "$rom")"
+                 GB4ME_FORCE_DMG=1 ./bin/GB4ME --blargg "$rom" \
+                   || echo "(still failing, as documented)"
+                 echo "::endgroup::"
+                 continue ;;
+            esac
+            GB4ME_FORCE_DMG=1 ./bin/GB4ME --blargg "$rom" || fail=1
+          done
+          exit $fail
+
   # clang-format gate. The tree is formatted to .clang-format; this keeps it
   # that way. The version is pinned to the PyPI mirror of the LLVM release so
   # the result does not drift with the runner image (22.1.8 = the version the

@@ -165,12 +165,16 @@ void FlashSave::write(u32 offset, u8 value)
 	case State::EraseConfirm: {
 		// Sector erase is the unlock pair repeated after 0x80, then 0x30
 		// at the sector address (GBATEK "Flash Memory"): AA 55 80 AA 55
-		// 30. The 0x55@0x2AAA byte must not consume the command, so stay
-		// in this state until the sector address shows up.
+		// 30. Chip erase is the same prefix with 0x10@0x5555 instead
+		// (jsmolka save test 10). The 0x55@0x2AAA byte must not consume
+		// the command, so stay in this state until the final address
+		// shows up.
 		if (addr == 0x2AAA && value == 0x55)
 			break;
-		if (value == 0x30) {
-			handleCommand(addr, value);
+		if (value == 0x10 && addr == 0x5555) {
+			handleCommand(addr, value); // Chip erase.
+		} else if (value == 0x30) {
+			handleCommand(addr, value); // Sector erase.
 		}
 		state_ = State::ReadArray;
 		break;

@@ -290,7 +290,7 @@ u32 executeThumb(Arm7Tdmi &cpu, u16 instr, u32 instr_addr)
 				// 1 LDSB, 2 LDRH, 3 LDSH).
 				const u8 op8 = (instr >> 10) & 3;
 				if (op8 == 0) {
-					cpu.storeHalf(addr & ~1u, static_cast<u16>(cpu.reg(rt) & 0xFFFFu));
+					cpu.storeHalf(addr, static_cast<u16>(cpu.reg(rt) & 0xFFFFu));
 					return 0;
 				}
 				if (op8 == 1) {
@@ -344,7 +344,7 @@ u32 executeThumb(Arm7Tdmi &cpu, u16 instr, u32 instr_addr)
 			cpu.setReg(rt, cpu.loadHalf(addr, false));
 			return 1;
 		}
-		cpu.storeHalf(addr & ~1u, static_cast<u16>(cpu.reg(rt) & 0xFFFFu));
+		cpu.storeHalf(addr, static_cast<u16>(cpu.reg(rt) & 0xFFFFu));
 		return 0;
 	}
 	case 0x9: {
@@ -425,9 +425,25 @@ u32 executeThumb(Arm7Tdmi &cpu, u16 instr, u32 instr_addr)
 		const bool load = ((instr >> 11) & 1) != 0;
 		const u8 rb = (instr >> 8) & 7;
 		const u32 rlist = instr & 0xFFu;
-		if (rlist == 0)
-			return 1; // UNPREDICTABLE: benign no-op (documented).
 		u32 addr = cpu.reg(rb);
+		// Unaligned transfer addresses align down; the low bits survive in
+		// the writeback (mGBA; jsmolka arm test 508, thumb test 233).
+		u32 misalign = 0;
+		if ((addr >> 24) < 0x0Eu) {
+			misalign = addr & 3u;
+			addr &= ~3u;
+		}
+		if (rlist == 0) {
+			// Empty list: PC transfer with 0x40 writeback (mGBA
+			// LDM/STM_LOOP; jsmolka thumb tests 227/229). A store sees
+			// PC+2 (Thumb pipeline PC is instr+4).
+			if (load)
+				cpu.setPc(cpu.loadWord(addr, false));
+			else
+				cpu.storeWord(addr, cpu.reg(15) + 2, false);
+			cpu.setReg(rb, (addr + 0x40) | misalign);
+			return load ? 2 : 1;
+		}
 		bool seq = false; // First transfer N-cycle, rest sequential.
 		if (load) {
 			for (u8 i = 0; i < 8; i++) {
@@ -438,17 +454,28 @@ u32 executeThumb(Arm7Tdmi &cpu, u16 instr, u32 instr_addr)
 				seq = true;
 			}
 			if ((rlist & (1u << rb)) == 0)
-				cpu.setReg(rb, addr);
+				cpu.setReg(rb, addr | misalign);
 			return 2;
 		}
+		// Transfers run lowest-register-first, so the first stored slot is
+		// the lowest in the list.
+		const u32 wb_val = (addr + 4 * static_cast<u32>(__builtin_popcount(rlist))) | misalign;
+		bool first = true;
 		for (u8 i = 0; i < 8; i++) {
 			if ((rlist & (1u << i)) == 0)
 				continue;
-			cpu.storeWord(addr, cpu.reg(i), seq);
+			// Base slot: the original value only if the base is the lowest
+			// register in the list; otherwise the writeback value
+			// (hardware; jsmolka thumb tests 230-232).
+			u32 v = cpu.reg(i);
+			if (i == rb && !first)
+				v = wb_val;
+			cpu.storeWord(addr, v, seq);
 			addr += 4;
 			seq = true;
+			first = false;
 		}
-		cpu.setReg(rb, addr);
+		cpu.setReg(rb, addr | misalign);
 		return 1;
 	}
 	case 0xD: {

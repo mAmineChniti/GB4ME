@@ -1,5 +1,6 @@
 #pragma once
 
+#include "state.h"
 #include "types.h"
 
 namespace gb
@@ -123,6 +124,29 @@ class CPU
 	// Execute one instruction (including interrupt service). Returns
 	// M-cycles elapsed (1 M-cycle = 4 T-cycles).
 	u32 step();
+	// Called by the MMU when a write to $FF46 starts an OAM DMA.
+	void add_dma_stall(u32 mcycles)
+	{
+		dma_stall_ += mcycles;
+	}
+	u32 dma_stall() const
+	{
+		return dma_stall_;
+	}
+
+	// Per-M-cycle hook. The emulator installs a callback that advances the
+	// timer/PPU/APU by one M-cycle; the CPU then drives them from the
+	// instruction's own shape - one M-cycle per byte fetched (so the operand
+	// reads and the IO writes land on the M-cycle hardware uses) plus the
+	// read/write split of read-modify-write instructions. Without a hook the
+	// core behaves exactly as before (callers bill step()'s return value).
+	// Blargg mem_timing measures this placement against TIMA.
+	using CycleHook = void (*)(void *ctx);
+	void set_cycle_hook(CycleHook hook, void *ctx)
+	{
+		cycle_hook_ = hook;
+		cycle_ctx_ = ctx;
+	}
 
 	Registers regs;
 	bool ime = false;
@@ -140,6 +164,10 @@ class CPU
 	// CGB speed-switch stall: M-cycles remaining of the 2050 M-cycle freeze
 	// after STOP (Pan Docs KEY1). Test-visible; drained by step().
 	u32 speed_stall_ = 0;
+	// OAM DMA: the CPU is off the bus for 160 M-cycles from the $FF46 write
+	// (Pan Docs "OAM DMA Transfer": 160 reads x 4 T-cycles). Unlike the STOP
+	// speed switch this does *not* freeze DIV - the timer and PPU keep running.
+	u32 dma_stall_ = 0;
 	u64 cycles = 0; // Total M-cycles executed.
 	u32 cycles_last_instruction = 0;
 
@@ -156,6 +184,13 @@ class CPU
 		ime = false;
 	}
 
+	// Savestate. `ei_delay_` and `halt_bug_` are not registers but change
+	// what the NEXT instruction does, so leaving them out of a state turns
+	// a reload into a subtly different machine; they are saved with the
+	// visible registers for that reason.
+	void save(StateBuffer &buf) const;
+	void load(StateBuffer &buf);
+
   private:
 	MMU *mmu_ = nullptr;
 	bool ei_delay_ = false; // EI takes effect after the following instruction.
@@ -168,13 +203,41 @@ class CPU
 	u16 fetch16();
 	u8 read8(u16 addr);
 	void write8(u16 addr, u8 value);
+	// Read-modify-write write-back: hardware reads on the second-to-last
+	// M-cycle and writes on the last, and a register target (TIMA, an LCD
+	// register) can change in between, so the write-back needs its own
+	// M-cycle rather than sharing the read's.
+	void rmw_write8(u16 addr, u8 value);
+	void tick(u32 mcycles = 1);
+	void bill_remaining();
 
+	CycleHook cycle_hook_ = nullptr;
+	void *cycle_ctx_ = nullptr;
+	u32 billed_ = 0; // M-cycles already pushed through the hook this step.
+	// CGB double speed (KEY1): the CPU runs at 2x while the PPU/APU stay on
+	// the original clock, so the hook only sees every other M-cycle. The timer
+	// keeps the full CPU rate and compensates internally
+	// (Timer::set_double_speed). Serialized with the rest.
+	u8 double_speed_phase_ = 0;
+
+	void bios_swi(u8 n);
 	void execute(u8 opcode);
 	void execute_cb(u8 opcode);
 	void service_interrupts();
 
 	void push16(u16 value);
-	u16 pop16();
+	// POP rp is one of the instructions that triggers the DMG OAM bug, with SP
+	// after the first increment (Blargg's `LD SP,$FDFF : POP BC` case only
+	// fires if the address is the post-increment $FE00). RET/RETI must not.
+	u16 pop16(bool oam_bug = false);
+	// DMG OAM corruption (Blargg "oam_bug"): an instruction whose internal
+	// 16-bit increment/decrement performs a bus write can land in the PPU's
+	// OAM window with a register's value as the address. `addr` is the value on
+	// the bus *before* the change, which is what the readme's examples need
+	// (`DEC DE` with DE=$FE00 triggers, so it cannot be the decremented value).
+	// The write happens at the same point in the instruction as the real
+	// accesses around it, so the trigger goes exactly there.
+	void oam_bug_write(u16 addr);
 
 	// ---- Opcode groups (kept separate for readability, one group per set) ----
 	// Load group
