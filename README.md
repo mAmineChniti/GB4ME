@@ -189,6 +189,6 @@ CMake presets cover the verification builds: `dev` (release, `-Werror`),
 
 ## License
 
-GB4ME is released under the MIT License; see `LICENSE`. Third-party
+GB4ME is released under the [MIT License](LICENSE). Third-party
 components keep their own licenses, listed above and in their source
 headers.
