@@ -11,9 +11,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        uses: ./.github/actions/install-deps
-        with:
-          packages: cmake ninja-build pkg-config libsdl3-dev libvulkan-dev vulkan-validationlayers glslc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libsdl3-dev \
+            libvulkan-dev vulkan-validationlayers glslc
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -32,9 +33,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        uses: ./.github/actions/install-deps
-        with:
-          packages: cmake ninja-build pkg-config libsdl3-dev libvulkan-dev vulkan-validationlayers glslc git
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libsdl3-dev \
+            libvulkan-dev vulkan-validationlayers glslc git
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -89,9 +91,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        uses: ./.github/actions/install-deps
-        with:
-          packages: cmake ninja-build pkg-config libsdl3-dev libvulkan-dev vulkan-validationlayers glslc git
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libsdl3-dev \
+            libvulkan-dev vulkan-validationlayers glslc git
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -205,9 +208,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        uses: ./.github/actions/install-deps
-        with:
-          packages: cmake ninja-build pkg-config libsdl3-dev libvulkan-dev vulkan-validationlayers glslc clang-tidy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libsdl3-dev \
+            libvulkan-dev vulkan-validationlayers glslc clang-tidy
 
       - name: Configure
         run: cmake --preset dev -DCMAKE_CXX_SCAN_FOR_MODULES=OFF
@@ -233,9 +237,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        uses: ./.github/actions/install-deps
-        with:
-          packages: cmake ninja-build pkg-config libsdl3-dev libvulkan-dev vulkan-validationlayers glslc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libsdl3-dev \
+            libvulkan-dev vulkan-validationlayers glslc
 
       - name: find_package path (default)
         run: cmake -S . -B build/pkgconfig-default -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -265,9 +270,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        uses: ./.github/actions/install-deps
-        with:
-          packages: cmake ninja-build pkg-config libsdl3-dev libvulkan-dev vulkan-validationlayers glslc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libsdl3-dev \
+            libvulkan-dev vulkan-validationlayers glslc
 
       - name: Configure (ASan + UBSan)
         run: cmake --preset dev-asan
