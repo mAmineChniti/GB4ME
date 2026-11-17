@@ -171,11 +171,10 @@ void FlashSave::write(u32 offset, u8 value)
 		// shows up.
 		if (addr == 0x2AAA && value == 0x55)
 			break;
-		if (value == 0x10 && addr == 0x5555) {
-			handleCommand(addr, value); // Chip erase.
-		} else if (value == 0x30) {
-			handleCommand(addr, value); // Sector erase.
-		}
+		const bool chip = value == 0x10 && addr == 0x5555;
+		const bool sector = value == 0x30;
+		if (chip || sector)
+			handleCommand(addr, value); // Chip or sector erase.
 		state_ = State::ReadArray;
 		break;
 	}
@@ -441,7 +440,7 @@ EepromSave::EepromSave(Size sz) : size_(sz)
 		break;
 	}
 	data_.assign(bytes, 0xFF);
-	reset();
+	EepromSave::reset(); // Explicit: virtual dispatch does not reach the override here.
 }
 
 u8 EepromSave::read(u32 offset) const

@@ -53,8 +53,6 @@ u16 oam16(const GbaPpu &p, u32 off)
 
 } // namespace
 
-void renderScanline(GbaPpu &ppu, unsigned y);
-
 // Full-line render into `line` (no green swap, no frame write): BG layers,
 // sprites, windows, compose + blend. Split out so the mid-scanline scroll
 // replay below can run it per segment with overridden scroll registers.

@@ -629,7 +629,7 @@ bool check_cc(u8 cc, const Registers &regs)
 // self-contained and verified - is the only part modelled.
 void CPU::bios_swi(u8 n)
 {
-	u16 base;
+	u16 base = 0;
 	switch (n) {
 	case 0x1A:
 		base = 0xFF10;

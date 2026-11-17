@@ -582,13 +582,11 @@ static u32 executeBlock(Arm7Tdmi &cpu, u32 instr, u32 instr_addr)
 		if (load) {
 			pc_val = cpu.loadWord(addr, seq);
 			wrote_pc = true;
-			addr += 4;
 		} else {
 			// R15 in the list stores PC+12 unless it is also the base,
 			// which follows the base-slot rule.
 			u32 v = (rn == 15) ? (base_first ? orig_base : stm_wb) : (getReg(15) + 4);
 			cpu.storeWord(addr, v, seq);
-			addr += 4;
 		}
 	}
 	if (load && wb && (((rlist & (1u << rn)) == 0) || empty)) {

@@ -2058,24 +2058,20 @@ void GameBoy::handle_events()
 			// remap modal is armed, gameplay keys stay on the keyboard.
 			// Anything else dismisses an armed remap modal (clicking away).
 			// Shoulders arm GBA remap in any mode (global table).
-			bool rearmed = false;
 			if (auto sh = gui_console.hit_shoulder(mx, my); sh) {
 				GB4ME_ITRACE("input: shoulder %d -> arm GBA remap\n", (int) *sh);
 				gui_console.set_gba_pressed(*sh, true);
 				gui_console.start_binding(static_cast<PadButton>(*sh));
-				rearmed = true;
 				continue;
 			}
 			if (auto hit = gui_console.hit_test(mx, my); hit) {
 				GB4ME_ITRACE("input: button %d -> arm remap\n", (int) *hit);
 				gui_console.set_button_pressed(*hit, true);
 				gui_console.start_binding(static_cast<PadButton>(Settings::shared_key_index(*hit)));
-				rearmed = true;
 				continue;
 			}
 			GB4ME_ITRACE("input: mousedown hit nothing\n");
-			if (!rearmed)
-				gui_console.cancel_mapping();
+			gui_console.cancel_mapping();
 		}
 		if (ev.type == SDL_EVENT_MOUSE_BUTTON_UP && ev.button.button == SDL_BUTTON_LEFT) {
 			// Release anything the mouse is holding (single pointer: one

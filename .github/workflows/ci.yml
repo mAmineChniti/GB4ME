@@ -105,7 +105,7 @@ jobs:
       - name: Fetch test ROMs
         run: |
           git clone --depth 1 https://github.com/retrio/gb-test-roms.git test-roms
-          git clone --depth 1 https://github.com/mgba-emu/gba-tests.git gba-tests
+          git clone --depth 1 https://github.com/jsmolka/gba-tests.git gba-tests
 
       # GBA: every jsmolka/gba-tests ROM that reports a verdict on screen.
       # ppu/*, bios/bios and unsafe/unsafe are visual/crash tests with no
@@ -214,7 +214,7 @@ jobs:
             libvulkan-dev vulkan-validationlayers glslc clang-tidy
 
       - name: Configure
-        run: cmake --preset dev
+        run: cmake --preset dev -DCMAKE_CXX_SCAN_FOR_MODULES=OFF
 
       - name: Build (compiles everything, so clang-tidy sees every header)
         run: cmake --build --preset dev

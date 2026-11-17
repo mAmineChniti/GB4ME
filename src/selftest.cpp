@@ -7301,6 +7301,12 @@ int run_selftest(const std::string &rom_path)
 {
 	g_checks = 0;
 	g_failed = 0;
+	// The save/state tests use fixed scratch paths under /tmp/opencode.
+	// CI runs in a fresh container where that directory does not exist, which
+	// made every file-backed state test fail before the first mkdir deep in
+	// the suite. Create it up front.
+	std::error_code tmp_ec;
+	std::filesystem::create_directories("/tmp/opencode", tmp_ec);
 	std::printf("GB4ME self test\n");
 	std::printf(
 		"Core checks for the GB/GBC core and the GBA core (HLE BIOS, no external firmware)\n");

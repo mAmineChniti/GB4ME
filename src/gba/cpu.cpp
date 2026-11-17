@@ -631,7 +631,7 @@ u32 Arm7Tdmi::fetchArm()
 {
 	cycles_ += bus_->fetchCycles(instr_addr_ & ~3u, 4, fetch_seq_);
 	fetch_seq_ = true;
-	if (!(pf_valid_ && pf_addr_[0] == instr_addr_)) {
+	if (!pf_valid_ || pf_addr_[0] != instr_addr_) {
 		// Flush (branch, exception, reset, load, fresh code): this fetch
 		// plus the next, straight from the bus.
 		pf_addr_[0] = instr_addr_;
@@ -654,7 +654,7 @@ u16 Arm7Tdmi::fetchThumb()
 {
 	cycles_ += bus_->fetchCycles(instr_addr_ & ~1u, 2, fetch_seq_);
 	fetch_seq_ = true;
-	if (!(pf_valid_ && pf_addr_[0] == instr_addr_)) {
+	if (!pf_valid_ || pf_addr_[0] != instr_addr_) {
 		pf_addr_[0] = instr_addr_;
 		pf_val_[0] = bus_->read16(instr_addr_ & ~1u);
 		pf_addr_[1] = instr_addr_ + 2;
@@ -1084,7 +1084,7 @@ std::string disasmArm(u32 addr, u32 instr)
 												 wb ? "!" : ""));
 		appendRlist(out, sizeof out, len, instr & 0xFFFFu);
 		if (psr)
-			len += static_cast<size_t>(std::snprintf(out + len, sizeof out - len, "^"));
+			std::snprintf(out + len, sizeof out - len, "^");
 		return out;
 	}
 	// Top == 3: SWI or coprocessor/undefined.
