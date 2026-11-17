@@ -186,3 +186,9 @@ CMake presets cover the verification builds: `dev` (release, `-Werror`),
 - UI typeface: Cousine (monospace, Apache-2.0) staged to `bin/fonts/` at
   build time from the pinned Dear ImGui source; system DejaVu/Noto fonts
   are used as fallback, then the built-in 8x8 bitmap.
+
+## License
+
+GB4ME is released under the MIT License; see `LICENSE`. Third-party
+components keep their own licenses, listed above and in their source
+headers.
